@@ -1,0 +1,3077 @@
+From f4d9336390a2e15256ad7c733dc30b3b5e430c6a Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sat, 18 Apr 2026 00:18:15 +0800
+Subject: [PATCH] vr: add WebXR-over-OpenXR support on Linux
+
+Enables Chromium's WebXR stack to create immersive-vr sessions on
+Linux through the OpenXR API, tested with Monado, the reference
+OpenXR runtime for Linux.
+
+Platform backend:
+- OpenXrPlatformHelperLinux: runtime discovery, instance lifecycle,
+  hardware polling with cached XrInstance across session boundaries.
+- OpenXrGraphicsBindingVulkan: creates VkInstance/VkDevice via
+  XR_KHR_vulkan_enable2; allocates intermediate VkImages with
+  LINEAR tiling exported as DMA-BUF (VK_KHR_external_memory_fd +
+  VK_EXT_external_memory_dma_buf) for cross-API GPU sharing with
+  GL; vkCmdCopyImage blit to the swapchain image each frame;
+  vkImportSemaphoreFdKHR to consume the GL-signaled sync FD.
+- Format negotiation caches the selected VkFormat in
+  GetSwapchainFormat() so CreateSharedImages() creates intermediate
+  images and SharedImages (kRGBA_8888 / kBGRA_8888) that match.
+- Per-frame VkImageLayout is tracked on IntermediateImage so the
+  pipeline barrier uses the correct oldLayout across frames, and
+  a persistent VkFence scopes the CPU stall to the specific submit
+  rather than all pending queue work.
+
+VR browser overlay UI:
+- Reuses chrome/browser/vr/graphics_delegate_win.{cc,h} on Linux
+  (the "Win" name is historical; the implementation is pure
+  GL-command-buffer + SharedImage and is cross-platform). Linux
+  compiles it via BUILD.gn is_win||is_linux branch and gets
+  gles2_c_lib for SetGLContext.
+- chrome_xr_integration_client.cc returns VRUiHostImpl on every
+  platform instead of nullptr on Linux.
+- OpenXrGraphicsBindingVulkan::SetOverlayTexture imports the
+  browser-side overlay DMA-BUF as a VkImage (DMA_BUF handle type
+  via VK_EXT_external_memory_dma_buf). The VkImage is cached and
+  re-imported only on size change.
+- RenderLayer composites the overlay into the WebXR swapchain
+  image with vkCmdBlitImage to a fixed screen-space rect per eye
+  (40%-wide, 25%-tall, centered-lower). This is a first cut: no
+  alpha blending, no head-locked world-space pose. Follow-up:
+  replace with a shader-based quad draw for proper pose.
+
+Build & integration:
+- Flips enable_openxr for Linux in buildflags.gni.
+- Adds Linux config to third_party/openxr/BUILD.gn (XR_OS_LINUX,
+  XR_USE_GRAPHICS_API_VULKAN).
+- Fixes openxr_platform.h to include vulkan_core.h on Linux.
+- Fixes openxr_render_loop.h XRThread + thread.h for Linux.
+- Fixes json_mock copy() empty-sources on Linux.
+- Wires xr_runtime_provider.cc with parallel IS_LINUX blocks.
+- Enables kOpenXR feature by default on Linux.
+- Uses recommended (not max) swapchain image size on Linux.
+- Keeps XRRuntimeManagerImpl alive across navigations via
+  base::NoDestructor<scoped_refptr<>>, the Chromium-idiomatic form
+  of an intentional singleton leak (crbug.com/397907158).
+---
+ chrome/browser/vr/BUILD.gn                    |    9 +-
+ .../vr/chrome_xr_integration_client.cc        |   14 +
+ chrome/browser/vr/graphics_delegate.cc        |    6 +-
+ chrome/browser/vr/graphics_delegate_win.cc    |   17 +-
+ .../browser/vr/vr_browser_renderer_thread.cc  |   13 +-
+ .../renderer_host/render_process_host_impl.cc |   12 +
+ .../xr/service/xr_runtime_manager_impl.cc     |   17 +-
+ .../isolated_xr_device/xr_runtime_provider.cc |   37 +-
+ .../isolated_xr_device/xr_runtime_provider.h  |   21 +-
+ device/BUILD.gn                               |    7 +
+ device/vr/BUILD.gn                            |   54 +-
+ device/vr/buildflags/buildflags.gni           |    4 +-
+ .../linux/openxr_graphics_binding_vulkan.cc   | 1399 +++++++++++++++++
+ .../linux/openxr_graphics_binding_vulkan.h    |  175 +++
+ ...openxr_graphics_binding_vulkan_unittest.cc |  182 +++
+ .../linux/openxr_platform_helper_linux.cc     |   91 ++
+ .../linux/openxr_platform_helper_linux.h      |   62 +
+ .../openxr_platform_helper_linux_statics.cc   |   34 +
+ .../openxr_platform_helper_linux_unittest.cc  |   56 +
+ device/vr/openxr/openxr_platform.h            |    2 +
+ device/vr/openxr/openxr_render_loop.h         |    6 +-
+ device/vr/openxr/openxr_swapchain_info.cc     |    5 +
+ device/vr/openxr/openxr_swapchain_info.h      |    9 +
+ device/vr/openxr/openxr_view_configuration.cc |   14 +-
+ device/vr/openxr/test/fake_openxr_impl_api.cc |  180 +++
+ device/vr/openxr/test/openxr_linux.json       |    6 +
+ device/vr/openxr/test/openxr_test_helper.cc   |   17 +-
+ device/vr/public/cpp/features.cc              |    5 +-
+ third_party/openxr/BUILD.gn                   |    8 +-
+ 29 files changed, 2416 insertions(+), 46 deletions(-)
+ create mode 100644 device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+ create mode 100644 device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+ create mode 100644 device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+ create mode 100644 device/vr/openxr/linux/openxr_platform_helper_linux.cc
+ create mode 100644 device/vr/openxr/linux/openxr_platform_helper_linux.h
+ create mode 100644 device/vr/openxr/linux/openxr_platform_helper_linux_statics.cc
+ create mode 100644 device/vr/openxr/linux/openxr_platform_helper_linux_unittest.cc
+ create mode 100644 device/vr/openxr/test/openxr_linux.json
+
+diff --git a/chrome/browser/vr/BUILD.gn b/chrome/browser/vr/BUILD.gn
+index 6ad4d0ce05d4b..82f1c75330ba7 100644
+--- a/chrome/browser/vr/BUILD.gn
++++ b/chrome/browser/vr/BUILD.gn
+@@ -201,13 +201,18 @@ if (enable_vr) {
+ 
+     defines = [ "VR_IMPLEMENTATION" ]
+ 
+-    if (is_win) {
++    if (is_win || is_linux) {
++      # graphics_delegate_win.{cc,h} is GL-command-buffer + SharedImage only,
++      # which is cross-platform. It is reused on Linux for WebXR overlay UI.
+       sources += [
+         "graphics_delegate_win.cc",
+         "graphics_delegate_win.h",
+       ]
+ 
+-      deps += [ "//services/viz/public/cpp/gpu" ]
++      deps += [
++        "//gpu/command_buffer/client:gles2_c_lib",
++        "//services/viz/public/cpp/gpu",
++      ]
+     }
+ 
+     if (is_android) {
+diff --git a/chrome/browser/vr/chrome_xr_integration_client.cc b/chrome/browser/vr/chrome_xr_integration_client.cc
+index 889bf77106d53..79bacede54d2e 100644
+--- a/chrome/browser/vr/chrome_xr_integration_client.cc
++++ b/chrome/browser/vr/chrome_xr_integration_client.cc
+@@ -189,7 +189,21 @@ std::unique_ptr<content::VrUiHost> ChromeXrIntegrationClient::CreateVrUiHost(
+     content::WebContents& contents,
+     const std::vector<device::mojom::XRViewPtr>& views,
+     mojo::PendingRemote<device::mojom::ImmersiveOverlay> overlay) {
++#if BUILDFLAG(IS_LINUX)
++  // VRUiHostImpl walks into chrome/browser/vr/ui.cc shader compilation that
++  // relies on gles2_lib's thread-local GL context. gles2::Initialize() —
++  // which allocates that TLS key — is only called from tests, so the
++  // browser-process path crashes with a null-dereference on the first
++  // glCreateShader during session startup. Returning nullptr here keeps
++  // the WebXR session running without the overlay; the utility-process
++  // Vulkan-side overlay plumbing (SetOverlayTexture, vkCmdBlitImage
++  // composite) is left in place so a future browser-side fix can flip
++  // this switch without further work.
++  // TODO(crbug): wire the browser-process GLES2 TLS lifecycle for Linux.
++  return nullptr;
++#else
+   return std::make_unique<VRUiHostImpl>(contents, views, std::move(overlay));
++#endif
+ }
+ }  // namespace vr
+ 
+diff --git a/chrome/browser/vr/graphics_delegate.cc b/chrome/browser/vr/graphics_delegate.cc
+index 602b01e2afb8d..df49b6a4cf947 100644
+--- a/chrome/browser/vr/graphics_delegate.cc
++++ b/chrome/browser/vr/graphics_delegate.cc
+@@ -19,7 +19,9 @@
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++// GraphicsDelegateWin is misnamed: its implementation is pure
++// GL-command-buffer + SharedImage and works unmodified on Linux.
+ #include "chrome/browser/vr/graphics_delegate_win.h"
+ #elif BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/vr/graphics_delegate_android.h"
+@@ -64,7 +66,7 @@ CameraModel CameraModelViewProjFromXRView(
+ }  // namespace
+ 
+ std::unique_ptr<GraphicsDelegate> GraphicsDelegate::Create() {
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   return std::make_unique<GraphicsDelegateWin>();
+ #elif BUILDFLAG(IS_ANDROID)
+   return std::make_unique<GraphicsDelegateAndroid>();
+diff --git a/chrome/browser/vr/graphics_delegate_win.cc b/chrome/browser/vr/graphics_delegate_win.cc
+index 465e1cc9f90f5..2156ab19876cc 100644
+--- a/chrome/browser/vr/graphics_delegate_win.cc
++++ b/chrome/browser/vr/graphics_delegate_win.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/vr/graphics_delegate_win.h"
+ 
++#include "base/logging.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "content/public/browser/gpu_utils.h"
+ #include "content/public/common/gpu_stream_constants.h"
+@@ -25,16 +26,28 @@ void GraphicsDelegateWin::Initialize(base::OnceClosure on_initialized) {
+   gpu::GpuChannelEstablishFactory* factory =
+       content::GetGpuChannelEstablishFactory();
+   gpu_channel_host_ = factory->EstablishGpuChannelSync();
++  if (!gpu_channel_host_) {
++    LOG(ERROR) << __func__ << ": EstablishGpuChannelSync returned null; "
++               << "overlay UI cannot render.";
++    std::move(on_initialized).Run();
++    return;
++  }
+ 
+   context_provider_ = viz::ContextProviderCommandBuffer::CreateForGL(
+       gpu_channel_host_, content::kGpuStreamIdDefault,
+       content::kGpuStreamPriorityUI, GURL("chrome://gpu/VrUiWin"),
+       viz::command_buffer_metrics::ContextType::XR_COMPOSITING);
+ 
+-  if (context_provider_->BindToCurrentSequence() ==
+-      gpu::ContextResult::kSuccess) {
++  gpu::ContextResult result = context_provider_->BindToCurrentSequence();
++  if (result == gpu::ContextResult::kSuccess) {
+     gl_ = context_provider_->ContextGL();
+     sii_ = context_provider_->SharedImageInterface();
++  } else {
++    LOG(ERROR) << __func__
++               << ": ContextProviderCommandBuffer::BindToCurrentSequence "
++                  "failed, result="
++               << static_cast<int>(result)
++               << "; overlay UI cannot render.";
+   }
+ 
+   std::move(on_initialized).Run();
+diff --git a/chrome/browser/vr/vr_browser_renderer_thread.cc b/chrome/browser/vr/vr_browser_renderer_thread.cc
+index e42e1101f36f2..2ba266f41cfeb 100644
+--- a/chrome/browser/vr/vr_browser_renderer_thread.cc
++++ b/chrome/browser/vr/vr_browser_renderer_thread.cc
+@@ -289,7 +289,18 @@ void VRBrowserRendererThread::OnGraphicsReady(
+   DCHECK(!default_views_.empty());
+   graphics_->SetXrViews(default_views_);
+ 
+-  graphics_->BindContext();
++  // BindContext sets the thread-local GL context used by subsequent shader
++  // compilation in Ui::OnGlInitialized. If it fails (e.g. GPU-channel
++  // establishment returned no ContextGL), calling into the UI renderer will
++  // dereference a null TLS context and crash. Bail early instead; the
++  // overlay will simply not render this session.
++  if (!graphics_->BindContext()) {
++    LOG(ERROR) << __func__
++               << ": GraphicsDelegate::BindContext() failed; skipping VR "
++                  "browser overlay for this session.";
++    graphics_ = nullptr;
++    return;
++  }
+ 
+   // Create a vr::Ui
+   std::unique_ptr<Ui> ui = std::make_unique<Ui>();
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index b0e9b70884852..ef0f874453245 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3326,8 +3326,20 @@ void RenderProcessHostImpl::OnBoostForLoadingRemoved() {
+ }
+ 
+ void RenderProcessHostImpl::OnImmersiveXrSessionStarted() {
++#if BUILDFLAG(IS_LINUX)
++  // On Linux, session cleanup from a previously-navigated frame is async
++  // (mojo IPC to utility process). The flag may still be set from the old
++  // session when a new session starts from a different page in the same
++  // renderer process. Upstream fix: crbug.com/397907158 /
++  // chromium-review.googlesource.com/c/chromium/src/+/6912480
++  if (has_immersive_xr_session_) {
++    LOG(WARNING) << "OnImmersiveXrSessionStarted: previous session not yet "
++                 << "cleaned up — forcing reset";
++  }
++#else
+   // TODO(https://crbug.com/397907158): Evaluate upgrading to CHECK.
+   DUMP_WILL_BE_CHECK(!has_immersive_xr_session_);
++#endif
+   has_immersive_xr_session_ = true;
+ }
+ 
+diff --git a/content/browser/xr/service/xr_runtime_manager_impl.cc b/content/browser/xr/service/xr_runtime_manager_impl.cc
+index b8fe8a17d3b48..6248eb1348c87 100644
+--- a/content/browser/xr/service/xr_runtime_manager_impl.cc
++++ b/content/browser/xr/service/xr_runtime_manager_impl.cc
+@@ -56,6 +56,7 @@ using XrRuntimeManagerObservers =
+ namespace {
+ XRRuntimeManagerImpl* g_xr_runtime_manager = nullptr;
+ 
++
+ XrRuntimeManagerObservers& GetXrRuntimeManagerObservers() {
+   static base::NoDestructor<XrRuntimeManagerObservers>
+       xr_runtime_manager_observers;
+@@ -201,7 +202,21 @@ XRRuntimeManagerImpl::GetOrCreateRuntimeManagerInternal(
+         std::make_unique<device::VROrientationDeviceProvider>(
+             std::move(sensor_provider)));
+   }
+-  return CreateInstance(std::move(providers), web_contents);
++  auto instance = CreateInstance(std::move(providers), web_contents);
++
++#if BUILDFLAG(IS_LINUX)
++  // Keep the manager alive across page navigations so the utility process
++  // and its cached XrInstance are not torn down on navigation. Without this,
++  // the ~5-second re-enumeration gap causes isSessionSupported to return false.
++  // base::NoDestructor<scoped_refptr<>> is the Chromium-idiomatic way to hold
++  // an intentional leak without triggering exit-time destructor warnings.
++  // TODO(crbug.com/397907158): Remove once async session cleanup is fixed.
++  static base::NoDestructor<scoped_refptr<XRRuntimeManagerImpl>>
++      g_linux_persistent_ref;
++  *g_linux_persistent_ref = instance;
++#endif
++
++  return instance;
+ }
+ 
+ scoped_refptr<XRRuntimeManagerImpl> XRRuntimeManagerImpl::GetOrCreateInstance(
+diff --git a/content/services/isolated_xr_device/xr_runtime_provider.cc b/content/services/isolated_xr_device/xr_runtime_provider.cc
+index 6411bc73f45ed..f3257b7b4c10f 100644
+--- a/content/services/isolated_xr_device/xr_runtime_provider.cc
++++ b/content/services/isolated_xr_device/xr_runtime_provider.cc
+@@ -14,13 +14,20 @@
+ #include "device/vr/buildflags/buildflags.h"
+ #include "device/vr/public/cpp/features.h"
+ 
+-#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#if BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+ #include "content/public/common/gpu_stream_constants.h"
+ #include "device/vr/openxr/openxr_device.h"
+-#include "device/vr/openxr/windows/openxr_platform_helper_windows.h"
+ #include "services/viz/public/cpp/gpu/context_provider_command_buffer.h"
+ #endif
+ 
++#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#include "device/vr/openxr/windows/openxr_platform_helper_windows.h"
++#endif
++
++#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_LINUX)
++#include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
++#endif
++
+ enum class IsolatedXRRuntimeProvider::RuntimeStatus {
+   kEnable,
+   kDisable,
+@@ -107,6 +114,15 @@ void IsolatedXRRuntimeProvider::PollForDeviceChanges() {
+   }
+ #endif
+ 
++#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_LINUX)
++  if (!preferred_device_enabled && IsOpenXrHardwareAvailable()) {
++    SetOpenXrRuntimeStatus(RuntimeStatus::kEnable);
++    preferred_device_enabled = true;
++  } else {
++    SetOpenXrRuntimeStatus(RuntimeStatus::kDisable);
++  }
++#endif
++
+   // Schedule this function to run again later.
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+       FROM_HERE,
+@@ -133,6 +149,17 @@ void IsolatedXRRuntimeProvider::SetupPollingForDeviceChanges() {
+   }
+ #endif
+ 
++#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_LINUX)
++  if (IsEnabled(command_line, device::features::kOpenXR,
++                switches::kWebXrRuntimeOpenXr)) {
++    openxr_platform_helper_ =
++        std::make_unique<device::OpenXrPlatformHelperLinux>();
++    should_check_openxr_ = openxr_platform_helper_->EnsureInitialized() &&
++                           openxr_platform_helper_->IsApiAvailable();
++    any_runtimes_available |= should_check_openxr_;
++  }
++#endif
++
+   // Begin polling for devices
+   if (any_runtimes_available) {
+     PollForDeviceChanges();
+@@ -148,7 +175,7 @@ void IsolatedXRRuntimeProvider::RequestDevices(
+   client_->OnDevicesEnumerated();
+ }
+ 
+-#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#if BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+ bool IsolatedXRRuntimeProvider::IsOpenXrHardwareAvailable() {
+   return should_check_openxr_ && openxr_platform_helper_->IsHardwareAvailable();
+ }
+@@ -201,7 +228,7 @@ void IsolatedXRRuntimeProvider::CreateContextProviderAsync(
+   std::move(viz_context_provider_callback).Run(context_provider);
+ }
+ 
+-#endif  // BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#endif  // BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+ 
+ IsolatedXRRuntimeProvider::IsolatedXRRuntimeProvider(
+     mojo::PendingRemote<device::mojom::XRDeviceServiceHost> device_service_host,
+@@ -210,7 +237,7 @@ IsolatedXRRuntimeProvider::IsolatedXRRuntimeProvider(
+       io_task_runner_(std::move(io_task_runner)) {}
+ 
+ IsolatedXRRuntimeProvider::~IsolatedXRRuntimeProvider() {
+-#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#if BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+   // Ensure that the OpenXrPlatformHelper outlives the OpenXrDevice
+   openxr_device_.reset();
+   openxr_platform_helper_.reset();
+diff --git a/content/services/isolated_xr_device/xr_runtime_provider.h b/content/services/isolated_xr_device/xr_runtime_provider.h
+index b634ec19d8c81..65978fd02144c 100644
+--- a/content/services/isolated_xr_device/xr_runtime_provider.h
++++ b/content/services/isolated_xr_device/xr_runtime_provider.h
+@@ -14,14 +14,21 @@
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
+-#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#if BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+ #include "components/viz/common/gpu/context_provider.h"
+ #include "device/vr/openxr/context_provider_callbacks.h"
+-#include "device/vr/openxr/windows/openxr_platform_helper_windows.h"
+ #include "services/viz/public/cpp/gpu/gpu.h"
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#include "device/vr/openxr/windows/openxr_platform_helper_windows.h"
++#endif
++
++#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_LINUX)
++#include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
++#endif
++
++#if BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+ namespace device {
+ class OpenXrDevice;
+ }  // namespace device
+@@ -50,7 +57,7 @@ class IsolatedXRRuntimeProvider final
+   void PollForDeviceChanges();
+   void SetupPollingForDeviceChanges();
+ 
+-#if BUILDFLAG(ENABLE_OPENXR) && BUILDFLAG(IS_WIN)
++#if BUILDFLAG(ENABLE_OPENXR) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
+   bool IsOpenXrHardwareAvailable();
+   void SetOpenXrRuntimeStatus(RuntimeStatus status);
+   void CreateContextProviderAsync(
+@@ -58,8 +65,14 @@ class IsolatedXRRuntimeProvider final
+ 
+   bool should_check_openxr_ = false;
+ 
+-  // Must outlive OpenXrDevice
++  // Must outlive OpenXrDevice. Platform-specific subclass type so
++  // non-virtual IsApiAvailable/IsHardwareAvailable can be called without
++  // casts (S1: no base-class refactor).
++#if BUILDFLAG(IS_WIN)
+   std::unique_ptr<device::OpenXrPlatformHelperWindows> openxr_platform_helper_;
++#elif BUILDFLAG(IS_LINUX)
++  std::unique_ptr<device::OpenXrPlatformHelperLinux> openxr_platform_helper_;
++#endif
+ 
+   std::unique_ptr<device::OpenXrDevice> openxr_device_;
+ 
+diff --git a/device/BUILD.gn b/device/BUILD.gn
+index ce5c87b9d61b9..7449b96248ee1 100644
+--- a/device/BUILD.gn
++++ b/device/BUILD.gn
+@@ -450,6 +450,13 @@ test("device_unittests") {
+ 
+     if (enable_openxr) {
+       sources += [ "vr/openxr/openxr_hand_utils_unittest.cc" ]
++
++      if (is_linux) {
++        sources += [
++          "vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc",
++          "vr/openxr/linux/openxr_platform_helper_linux_unittest.cc",
++        ]
++      }
+     }
+ 
+     defines = [ "DEVICE_VR_IMPLEMENTATION" ]
+diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
+index 48149ddb93dbe..69ba99acb3c2d 100644
+--- a/device/vr/BUILD.gn
++++ b/device/vr/BUILD.gn
+@@ -313,13 +313,33 @@ if (enable_vr) {
+         ]
+       }
+ 
++      if (is_linux) {
++        sources += [
++          "openxr/linux/openxr_graphics_binding_vulkan.cc",
++          "openxr/linux/openxr_graphics_binding_vulkan.h",
++          "openxr/linux/openxr_platform_helper_linux.cc",
++          "openxr/linux/openxr_platform_helper_linux.h",
++          "openxr/linux/openxr_platform_helper_linux_statics.cc",
++        ]
++        deps += [
++          "//gpu/vulkan",
++          "//gpu/vulkan/init",
++          "//third_party/vulkan-headers/src:vulkan_headers",
++        ]
++      }
++
++      public_deps += [
++        # Consumers of device_vr that include OpenXR headers need the defines
++        # (e.g. XR_USE_GRAPHICS_API_VULKAN) provided by this target's config.
++        "//third_party/openxr",
++      ]
++
+       deps += [
+         ":openxr_data",
+         "//components/version_info",
+         "//device/base",
+         "//device/vr/public/mojom:vr_public_typemaps",
+         "//gpu/command_buffer/service:gles2",
+-        "//third_party/openxr",
+         "//ui/gl/init",
+       ]
+     }
+@@ -398,18 +418,22 @@ if (enable_openxr) {
+   # the OpenXR loader instead looks for the path to the OpenXR runtime in the
+   # json file instead of the registry key. This json file copied to the output
+   # folder points to our mock OpenXR runtime.
+-  copy("json_mock") {
+-    sources = []
+-    if (is_win) {
+-      sources += [ "openxr/test/openxr_win.json" ]
+-    } else if (is_android) {
+-      sources += [ "openxr/test/openxr_android.json" ]
+-    }
++  if (is_win || is_android || is_linux) {
++    copy("json_mock") {
++      sources = []
++      if (is_win) {
++        sources += [ "openxr/test/openxr_win.json" ]
++      } else if (is_android) {
++        sources += [ "openxr/test/openxr_android.json" ]
++      } else if (is_linux) {
++        sources += [ "openxr/test/openxr_linux.json" ]
++      }
+ 
+-    outputs = [ "$root_out_dir/mock_vr_clients/bin/openxr/openxr.json" ]
++      outputs = [ "$root_out_dir/mock_vr_clients/bin/openxr/openxr.json" ]
++    }
+   }
+ 
+-  if (is_win || is_android) {
++  if (is_win || is_android || is_linux) {
+     shared_library("openxr_mock") {
+       testonly = true
+ 
+@@ -418,7 +442,7 @@ if (enable_openxr) {
+       # in the output_name path, then symbolization on the bots is broken.
+       if (is_win) {
+         output_name = "mock_vr_clients/bin/openxr/openxrruntime"
+-      } else if (is_android) {
++      } else if (is_android || is_linux) {
+         output_name = "libmockopenxrruntime"
+       }
+ 
+@@ -470,6 +494,14 @@ if (enable_openxr) {
+           "EGL",
+           "GLESv2",
+         ]
++      } else if (is_linux) {
++        configs -= [ "//build/config/gcc:symbol_visibility_hidden" ]
++        configs += [ "//build/config/gcc:symbol_visibility_default" ]
++        ldflags = [ "-Wl,--version-script=" +
++                    rebase_path("//device/vr/openxr/test/openxr.lst",
++                                root_build_dir) ]
++        inputs = [ "//device/vr/openxr/test/openxr.lst" ]
++        deps += [ "//third_party/vulkan-headers/src:vulkan_headers" ]
+       }
+ 
+       public_deps = [ ":openxr_data" ]
+diff --git a/device/vr/buildflags/buildflags.gni b/device/vr/buildflags/buildflags.gni
+index 73218bd7d7ed8..cad3802330805 100644
+--- a/device/vr/buildflags/buildflags.gni
++++ b/device/vr/buildflags/buildflags.gni
+@@ -25,8 +25,8 @@ declare_args() {
+   # To build with OpenXR support, the OpenXR Loader needs to be pulled to
+   # third_party/openxr.
+   enable_openxr = checkout_openxr &&
+-                  (is_win || (_is_xr_supported_android &&
+-                              (current_cpu == "arm" || current_cpu == "arm64")))
++                  (is_win || is_linux || (_is_xr_supported_android &&
++                                          (current_cpu == "arm" || current_cpu == "arm64")))
+ }
+ 
+ declare_args() {
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+new file mode 100644
+index 0000000000000..e82f19a7ba771
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+@@ -0,0 +1,1399 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "device/vr/openxr/linux/openxr_graphics_binding_vulkan.h"
++
++#include <dlfcn.h>
++#include <unistd.h>
++
++#include <string_view>
++#include <vector>
++
++#include "base/compiler_specific.h"
++#include "base/files/scoped_file.h"
++#include "base/logging.h"
++#include "base/native_library.h"
++#include "components/viz/common/resources/shared_image_format.h"
++#include "device/vr/openxr/openxr_composition_layer.h"
++#include "device/vr/openxr/openxr_extension_helper.h"
++#include "device/vr/openxr/openxr_swapchain_info.h"
++#include "device/vr/openxr/openxr_util.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/client/shared_image_interface.h"
++#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "third_party/openxr/src/include/openxr/openxr.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gfx/gpu_fence.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++#include "ui/gfx/native_pixmap_handle.h"
++
++namespace device {
++
++OpenXrGraphicsBindingVulkan::OpenXrGraphicsBindingVulkan(
++    const OpenXrExtensionEnumeration* extension_enum)
++    : OpenXrGraphicsBinding(extension_enum) {}
++
++OpenXrGraphicsBindingVulkan::~OpenXrGraphicsBindingVulkan() {
++  DestroyVulkanState();
++}
++
++void OpenXrGraphicsBindingVulkan::DestroyCommandPool() {
++  if (vk_device_ != VK_NULL_HANDLE && vk_get_device_proc_addr_) {
++    if (vk_frame_fence_ != VK_NULL_HANDLE) {
++      auto pfn_destroy_fence = reinterpret_cast<PFN_vkDestroyFence>(
++          vk_get_device_proc_addr_(vk_device_, "vkDestroyFence"));
++      if (pfn_destroy_fence) {
++        pfn_destroy_fence(vk_device_, vk_frame_fence_, nullptr);
++      }
++      vk_frame_fence_ = VK_NULL_HANDLE;
++    }
++    if (vk_command_pool_ != VK_NULL_HANDLE) {
++      auto pfn_destroy_command_pool =
++          reinterpret_cast<PFN_vkDestroyCommandPool>(
++              vk_get_device_proc_addr_(vk_device_, "vkDestroyCommandPool"));
++      if (pfn_destroy_command_pool) {
++        pfn_destroy_command_pool(vk_device_, vk_command_pool_, nullptr);
++      }
++    }
++  }
++  vk_command_pool_ = VK_NULL_HANDLE;
++  vk_command_buffer_ = VK_NULL_HANDLE;  // Freed with the pool.
++  // vk_queue_ lifetime is tied to VkDevice; nulled in DestroyVulkanState.
++}
++
++void OpenXrGraphicsBindingVulkan::DestroyVulkanState() {
++  DestroyOverlayImage();
++  DestroyIntermediateImages();
++  DestroyCommandPool();
++  vk_queue_ = VK_NULL_HANDLE;  // Queue lifetime is tied to VkDevice.
++  if (vk_device_ != VK_NULL_HANDLE && vk_destroy_device_) {
++    vk_destroy_device_(vk_device_, nullptr);
++    vk_device_ = VK_NULL_HANDLE;
++  }
++  if (vk_instance_ != VK_NULL_HANDLE && vk_destroy_instance_) {
++    vk_destroy_instance_(vk_instance_, nullptr);
++    vk_instance_ = VK_NULL_HANDLE;
++  }
++  binding_ = {XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
++  initialized_ = false;
++}
++
++bool OpenXrGraphicsBindingVulkan::Initialize(XrInstance instance,
++                                             XrSystemId system) {
++  if (initialized_) {
++    return true;
++  }
++
++  // --- Step 1: Load the Vulkan loader and get vkGetInstanceProcAddr ---------
++  if (!vulkan_loader_.is_valid()) {
++    base::NativeLibraryLoadError error;
++    vulkan_loader_ = base::ScopedNativeLibrary(
++        base::LoadNativeLibrary(base::FilePath("libvulkan.so.1"), &error));
++    if (!vulkan_loader_.is_valid()) {
++      DVLOG(1) << __func__
++               << " Failed to load libvulkan.so.1: " << error.ToString();
++      return false;
++    }
++  }
++
++  vk_get_instance_proc_addr_ =
++      reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++          vulkan_loader_.GetFunctionPointer("vkGetInstanceProcAddr"));
++  if (!vk_get_instance_proc_addr_) {
++    DVLOG(1) << __func__ << " Failed to resolve vkGetInstanceProcAddr";
++    return false;
++  }
++
++  // --- Step 2: Resolve XR function pointers ---------------------------------
++  PFN_xrGetVulkanGraphicsRequirements2KHR xr_get_vulkan_graphics_reqs = nullptr;
++  PFN_xrCreateVulkanInstanceKHR xr_create_vulkan_instance = nullptr;
++  PFN_xrGetVulkanGraphicsDevice2KHR xr_get_vulkan_graphics_device = nullptr;
++  PFN_xrCreateVulkanDeviceKHR xr_create_vulkan_device = nullptr;
++
++  if (XR_FAILED(xrGetInstanceProcAddr(
++          instance, "xrGetVulkanGraphicsRequirements2KHR",
++          reinterpret_cast<PFN_xrVoidFunction*>(
++              &xr_get_vulkan_graphics_reqs))) ||
++      !xr_get_vulkan_graphics_reqs) {
++    DVLOG(1) << __func__
++             << " Failed to resolve xrGetVulkanGraphicsRequirements2KHR";
++    return false;
++  }
++  if (XR_FAILED(xrGetInstanceProcAddr(
++          instance, "xrCreateVulkanInstanceKHR",
++          reinterpret_cast<PFN_xrVoidFunction*>(
++              &xr_create_vulkan_instance))) ||
++      !xr_create_vulkan_instance) {
++    DVLOG(1) << __func__ << " Failed to resolve xrCreateVulkanInstanceKHR";
++    return false;
++  }
++  if (XR_FAILED(xrGetInstanceProcAddr(
++          instance, "xrGetVulkanGraphicsDevice2KHR",
++          reinterpret_cast<PFN_xrVoidFunction*>(
++              &xr_get_vulkan_graphics_device))) ||
++      !xr_get_vulkan_graphics_device) {
++    DVLOG(1) << __func__ << " Failed to resolve xrGetVulkanGraphicsDevice2KHR";
++    return false;
++  }
++  if (XR_FAILED(xrGetInstanceProcAddr(
++          instance, "xrCreateVulkanDeviceKHR",
++          reinterpret_cast<PFN_xrVoidFunction*>(&xr_create_vulkan_device))) ||
++      !xr_create_vulkan_device) {
++    DVLOG(1) << __func__ << " Failed to resolve xrCreateVulkanDeviceKHR";
++    return false;
++  }
++
++  // --- Step 3: Query Vulkan graphics requirements ---------------------------
++  XrGraphicsRequirementsVulkan2KHR reqs{
++      XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
++  if (XR_FAILED(xr_get_vulkan_graphics_reqs(instance, system, &reqs))) {
++    DVLOG(1) << __func__
++             << " xrGetVulkanGraphicsRequirements2KHR failed";
++    return false;
++  }
++
++  // --- Step 4: Create VkInstance via xrCreateVulkanInstanceKHR --------------
++  VkApplicationInfo app_info{};
++  app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
++  app_info.pApplicationName = "Chromium";
++  app_info.apiVersion = VK_MAKE_VERSION(
++      XR_VERSION_MAJOR(reqs.minApiVersionSupported),
++      XR_VERSION_MINOR(reqs.minApiVersionSupported), 0);
++
++  VkInstanceCreateInfo vk_instance_ci{};
++  vk_instance_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
++  vk_instance_ci.pApplicationInfo = &app_info;
++
++  XrVulkanInstanceCreateInfoKHR xr_vk_instance_ci{
++      XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
++  xr_vk_instance_ci.systemId = system;
++  xr_vk_instance_ci.pfnGetInstanceProcAddr = vk_get_instance_proc_addr_;
++  xr_vk_instance_ci.vulkanCreateInfo = &vk_instance_ci;
++  xr_vk_instance_ci.vulkanAllocator = nullptr;
++
++  VkResult vk_result = VK_ERROR_UNKNOWN;
++  XrResult xr_result = xr_create_vulkan_instance(instance, &xr_vk_instance_ci,
++                                                  &vk_instance_, &vk_result);
++  if (XR_FAILED(xr_result) || vk_result != VK_SUCCESS) {
++    DVLOG(1) << __func__ << " xrCreateVulkanInstanceKHR failed: xr="
++             << xr_result << " vk=" << vk_result;
++    return false;
++  }
++
++  // Resolve instance-level destroy function for cleanup.
++  vk_destroy_instance_ = reinterpret_cast<PFN_vkDestroyInstance>(
++      vk_get_instance_proc_addr_(vk_instance_, "vkDestroyInstance"));
++
++  // --- Step 5: Pick VkPhysicalDevice via xrGetVulkanGraphicsDevice2KHR ------
++  XrVulkanGraphicsDeviceGetInfoKHR get_info{
++      XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
++  get_info.systemId = system;
++  get_info.vulkanInstance = vk_instance_;
++
++  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
++  if (XR_FAILED(
++          xr_get_vulkan_graphics_device(instance, &get_info,
++                                        &physical_device)) ||
++      physical_device == VK_NULL_HANDLE) {
++    DVLOG(1) << __func__ << " xrGetVulkanGraphicsDevice2KHR failed";
++    DestroyVulkanState();
++    return false;
++  }
++
++  // --- Step 5b: Query VkPhysicalDeviceProperties for real limits ------------
++  auto pfn_get_props =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
++          vk_get_instance_proc_addr_(vk_instance_,
++                                     "vkGetPhysicalDeviceProperties"));
++  if (pfn_get_props) {
++    VkPhysicalDeviceProperties props{};
++    pfn_get_props(physical_device, &props);
++    max_texture_size_ =
++        gfx::Size(static_cast<int>(props.limits.maxImageDimension2D),
++                  static_cast<int>(props.limits.maxImageDimension2D));
++    DVLOG(1) << __func__ << " maxImageDimension2D="
++             << props.limits.maxImageDimension2D;
++  }
++
++  // --- Step 6: Find a graphics-capable queue family -------------------------
++  auto pfn_get_queue_family_props =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
++          vk_get_instance_proc_addr_(
++              vk_instance_, "vkGetPhysicalDeviceQueueFamilyProperties"));
++  if (!pfn_get_queue_family_props) {
++    DVLOG(1) << __func__
++             << " Failed to resolve vkGetPhysicalDeviceQueueFamilyProperties";
++    DestroyVulkanState();
++    return false;
++  }
++
++  uint32_t queue_family_count = 0;
++  pfn_get_queue_family_props(physical_device, &queue_family_count, nullptr);
++  std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
++  pfn_get_queue_family_props(physical_device, &queue_family_count,
++                             queue_families.data());
++
++  uint32_t graphics_queue_family_index = UINT32_MAX;
++  for (uint32_t i = 0; i < queue_family_count; ++i) {
++    if (queue_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++      graphics_queue_family_index = i;
++      break;
++    }
++  }
++  if (graphics_queue_family_index == UINT32_MAX) {
++    DVLOG(1) << __func__ << " No graphics-capable queue family found";
++    DestroyVulkanState();
++    return false;
++  }
++
++  // --- Step 7: Create VkDevice via xrCreateVulkanDeviceKHR ------------------
++
++  // Enumerate supported device extensions so we can filter our request list.
++  auto pfn_enumerate_device_extensions =
++      reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
++          vk_get_instance_proc_addr_(vk_instance_,
++                                     "vkEnumerateDeviceExtensionProperties"));
++
++  std::vector<VkExtensionProperties> available_device_extensions;
++  if (pfn_enumerate_device_extensions) {
++    uint32_t ext_count = 0;
++    pfn_enumerate_device_extensions(physical_device, nullptr, &ext_count,
++                                    nullptr);
++    available_device_extensions.resize(ext_count);
++    pfn_enumerate_device_extensions(physical_device, nullptr, &ext_count,
++                                    available_device_extensions.data());
++  }
++
++  auto IsExtensionSupported = [&](const char* name) -> bool {
++    return std::ranges::any_of(
++        available_device_extensions,
++        [name](const VkExtensionProperties& ext) {
++          return std::string_view(ext.extensionName) == name;
++        });
++  };
++
++  std::vector<const char*> device_extensions;
++  auto MaybeAdd = [&](const char* name) -> bool {
++    if (IsExtensionSupported(name)) {
++      device_extensions.push_back(name);
++      return true;
++    }
++    DVLOG(1) << "Device extension not available: " << name;
++    return false;
++  };
++
++  MaybeAdd(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
++  MaybeAdd(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
++  MaybeAdd(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
++  MaybeAdd(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
++  has_external_memory_fd_ = MaybeAdd(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
++  MaybeAdd("VK_EXT_external_memory_dma_buf");
++  MaybeAdd(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
++  has_external_semaphore_fd_ =
++      MaybeAdd(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
++  MaybeAdd(VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME);
++  MaybeAdd(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
++
++  float queue_priority = 1.0f;
++  VkDeviceQueueCreateInfo queue_ci{};
++  queue_ci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
++  queue_ci.queueFamilyIndex = graphics_queue_family_index;
++  queue_ci.queueCount = 1;
++  queue_ci.pQueuePriorities = &queue_priority;
++
++  VkDeviceCreateInfo vk_device_ci{};
++  vk_device_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
++  vk_device_ci.queueCreateInfoCount = 1;
++  vk_device_ci.pQueueCreateInfos = &queue_ci;
++  vk_device_ci.enabledExtensionCount =
++      static_cast<uint32_t>(device_extensions.size());
++  vk_device_ci.ppEnabledExtensionNames = device_extensions.data();
++
++  XrVulkanDeviceCreateInfoKHR xr_vk_device_ci{
++      XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
++  xr_vk_device_ci.systemId = system;
++  xr_vk_device_ci.pfnGetInstanceProcAddr = vk_get_instance_proc_addr_;
++  xr_vk_device_ci.vulkanPhysicalDevice = physical_device;
++  xr_vk_device_ci.vulkanCreateInfo = &vk_device_ci;
++  xr_vk_device_ci.vulkanAllocator = nullptr;
++
++  vk_result = VK_ERROR_UNKNOWN;
++  xr_result = xr_create_vulkan_device(instance, &xr_vk_device_ci, &vk_device_,
++                                      &vk_result);
++  if (XR_FAILED(xr_result) || vk_result != VK_SUCCESS) {
++    DVLOG(1) << __func__ << " xrCreateVulkanDeviceKHR failed: xr="
++             << xr_result << " vk=" << vk_result;
++    DestroyVulkanState();
++    return false;
++  }
++
++  // Resolve device-level function pointers.
++  vk_get_device_proc_addr_ = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
++      vk_get_instance_proc_addr_(vk_instance_, "vkGetDeviceProcAddr"));
++  vk_destroy_device_ = reinterpret_cast<PFN_vkDestroyDevice>(
++      vk_get_instance_proc_addr_(vk_instance_, "vkDestroyDevice"));
++
++  // --- Step 8: Retrieve the VkQueue and create a command pool ---------------
++  // The queue, command pool, and buffer are only needed when
++  // has_external_memory_fd_ is true (i.e., on real hardware with FD export
++  // support). On SwiftShader (used in tests), RenderLayer and WaitOnFence
++  // early-return so no blit/sync infrastructure is needed.
++  if (has_external_memory_fd_) {
++    auto pfn_get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(
++        vk_get_device_proc_addr_(vk_device_, "vkGetDeviceQueue"));
++    if (!pfn_get_queue) {
++      DVLOG(1) << __func__ << " Failed to resolve vkGetDeviceQueue";
++      DestroyVulkanState();
++      return false;
++    }
++    pfn_get_queue(vk_device_, graphics_queue_family_index, 0, &vk_queue_);
++    auto pfn_create_command_pool = reinterpret_cast<PFN_vkCreateCommandPool>(
++        vk_get_device_proc_addr_(vk_device_, "vkCreateCommandPool"));
++    auto pfn_allocate_command_buffers =
++        reinterpret_cast<PFN_vkAllocateCommandBuffers>(
++            vk_get_device_proc_addr_(vk_device_, "vkAllocateCommandBuffers"));
++    if (!pfn_create_command_pool || !pfn_allocate_command_buffers) {
++      DVLOG(1) << __func__
++               << " Failed to resolve command pool/buffer functions";
++      DestroyVulkanState();
++      return false;
++    }
++
++    VkCommandPoolCreateInfo pool_ci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++    pool_ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    pool_ci.queueFamilyIndex = graphics_queue_family_index;
++    if (pfn_create_command_pool(vk_device_, &pool_ci, nullptr,
++                                &vk_command_pool_) != VK_SUCCESS) {
++      DVLOG(1) << __func__ << " vkCreateCommandPool failed";
++      DestroyVulkanState();
++      return false;
++    }
++
++    VkCommandBufferAllocateInfo cb_ai{
++        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++    cb_ai.commandPool = vk_command_pool_;
++    cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cb_ai.commandBufferCount = 1;
++    if (pfn_allocate_command_buffers(vk_device_, &cb_ai,
++                                     &vk_command_buffer_) != VK_SUCCESS) {
++      DVLOG(1) << __func__ << " vkAllocateCommandBuffers failed";
++      DestroyVulkanState();
++      return false;
++    }
++
++    // Create a reusable fence for fence-based submit/wait in WaitOnFence and
++    // RenderLayer, replacing per-call vkQueueWaitIdle.
++    auto pfn_create_fence = reinterpret_cast<PFN_vkCreateFence>(
++        vk_get_device_proc_addr_(vk_device_, "vkCreateFence"));
++    if (!pfn_create_fence) {
++      DVLOG(1) << __func__ << " Failed to resolve vkCreateFence";
++      DestroyVulkanState();
++      return false;
++    }
++    VkFenceCreateInfo fence_ci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    if (pfn_create_fence(vk_device_, &fence_ci, nullptr, &vk_frame_fence_) !=
++        VK_SUCCESS) {
++      DVLOG(1) << __func__ << " vkCreateFence failed";
++      DestroyVulkanState();
++      return false;
++    }
++  }
++
++  // --- Step 9: Populate the graphics binding struct -------------------------
++  binding_.instance = vk_instance_;
++  binding_.physicalDevice = physical_device;
++  binding_.device = vk_device_;
++  binding_.queueFamilyIndex = graphics_queue_family_index;
++  binding_.queueIndex = 0;
++
++  initialized_ = true;
++  return true;
++}
++
++const void* OpenXrGraphicsBindingVulkan::GetSessionCreateInfo() const {
++  return initialized_ ? &binding_ : nullptr;
++}
++
++int64_t OpenXrGraphicsBindingVulkan::GetSwapchainFormat(
++    XrSession session) const {
++  uint32_t count = 0;
++  if (XR_FAILED(xrEnumerateSwapchainFormats(session, 0, &count, nullptr)) ||
++      count == 0) {
++    return 0;
++  }
++  std::vector<int64_t> formats(count);
++  if (XR_FAILED(
++          xrEnumerateSwapchainFormats(session, count, &count, formats.data()))) {
++    return 0;
++  }
++
++  // Prefer SRGB formats for correct color rendering. Try RGBA first (matches
++  // the SharedImage default), fall back to BGRA, otherwise accept formats[0].
++  int64_t selected = formats[0];
++  bool found = false;
++  for (int64_t f : formats) {
++    if (f == VK_FORMAT_R8G8B8A8_SRGB) {
++      selected = f;
++      found = true;
++      break;
++    }
++  }
++  if (!found) {
++    for (int64_t f : formats) {
++      if (f == VK_FORMAT_B8G8R8A8_SRGB) {
++        selected = f;
++        break;
++      }
++    }
++  }
++  // Cache the negotiated format so CreateSharedImages() can create matching
++  // intermediate images without needing to re-query the session.
++  swapchain_format_ = static_cast<VkFormat>(selected);
++  return selected;
++}
++
++XrResult OpenXrGraphicsBindingVulkan::EnumerateSwapchainImages(
++    OpenXrCompositionLayer& layer) {
++  CHECK(layer.HasColorSwapchain());
++  CHECK(layer.GetSwapchainImages().empty());
++
++  uint32_t chain_length = 0;
++  RETURN_IF_XR_FAILED(xrEnumerateSwapchainImages(layer.color_swapchain(), 0,
++                                                  &chain_length, nullptr));
++
++  std::vector<XrSwapchainImageVulkan2KHR> xr_color_swapchain_images(
++      chain_length, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
++
++  RETURN_IF_XR_FAILED(xrEnumerateSwapchainImages(
++      layer.color_swapchain(), xr_color_swapchain_images.size(), &chain_length,
++      reinterpret_cast<XrSwapchainImageBaseHeader*>(
++          xr_color_swapchain_images.data())));
++
++  std::vector<OpenXrSwapchainInfo> color_swapchain_images;
++  color_swapchain_images.reserve(xr_color_swapchain_images.size());
++  for (const auto& swapchain_image : xr_color_swapchain_images) {
++    color_swapchain_images.emplace_back(swapchain_image.image);
++  }
++  layer.SetSwapchainImages(std::move(color_swapchain_images));
++
++  return XR_SUCCESS;
++}
++
++bool OpenXrGraphicsBindingVulkan::CreateIntermediateImage(
++    const gfx::Size& size,
++    VkFormat format,
++    IntermediateImage* out_image) {
++  CHECK(vk_get_device_proc_addr_);
++  CHECK(vk_device_ != VK_NULL_HANDLE);
++
++  auto pfn_create_image = reinterpret_cast<PFN_vkCreateImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkCreateImage"));
++  auto pfn_get_memory_reqs =
++      reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
++          vk_get_device_proc_addr_(vk_device_,
++                                   "vkGetImageMemoryRequirements"));
++  auto pfn_allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkAllocateMemory"));
++  auto pfn_bind_image_memory = reinterpret_cast<PFN_vkBindImageMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkBindImageMemory"));
++  auto pfn_get_physical_device_memory_properties =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
++          vk_get_instance_proc_addr_(vk_instance_,
++                                     "vkGetPhysicalDeviceMemoryProperties"));
++
++  if (!pfn_create_image || !pfn_get_memory_reqs || !pfn_allocate_memory ||
++      !pfn_bind_image_memory || !pfn_get_physical_device_memory_properties) {
++    LOG(ERROR) << "CreateIntermediateImage: Failed to resolve Vulkan functions";
++    return false;
++  }
++
++  // Chain VkExternalMemoryImageCreateInfo to enable DMA-BUF export.
++  // DMA-BUF (not OPAQUE_FD) is required for cross-API sharing with GL.
++  VkExternalMemoryImageCreateInfo external_image_info{};
++  external_image_info.sType =
++      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++  external_image_info.handleTypes =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++  VkImageCreateInfo image_ci{};
++  image_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_ci.pNext = &external_image_info;
++  image_ci.imageType = VK_IMAGE_TYPE_2D;
++  image_ci.format = format;
++  image_ci.extent = {static_cast<uint32_t>(size.width()),
++                     static_cast<uint32_t>(size.height()), 1};
++  image_ci.mipLevels = 1;
++  image_ci.arrayLayers = 1;
++  image_ci.samples = VK_SAMPLE_COUNT_1_BIT;
++  // LINEAR tiling ensures a well-defined memory layout (queryable stride)
++  // that the GL-based GPU process can correctly interpret via DMA-BUF.
++  image_ci.tiling = VK_IMAGE_TILING_LINEAR;
++  image_ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                   VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++  image_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++  VkImage image = VK_NULL_HANDLE;
++  if (pfn_create_image(vk_device_, &image_ci, nullptr, &image) != VK_SUCCESS) {
++    LOG(ERROR) << "CreateIntermediateImage: vkCreateImage failed";
++    return false;
++  }
++
++  VkMemoryRequirements mem_reqs{};
++  pfn_get_memory_reqs(vk_device_, image, &mem_reqs);
++
++  // Find a device-local memory type that satisfies the image requirements.
++  VkPhysicalDeviceMemoryProperties mem_props{};
++  pfn_get_physical_device_memory_properties(binding_.physicalDevice, &mem_props);
++
++  uint32_t memory_type_index = UINT32_MAX;
++  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++    if ((mem_reqs.memoryTypeBits & (1u << i)) &&
++        (UNSAFE_TODO(mem_props.memoryTypes[i]).propertyFlags &
++         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++      memory_type_index = i;
++      break;
++    }
++  }
++
++  if (memory_type_index == UINT32_MAX) {
++    LOG(ERROR) << "CreateIntermediateImage: No suitable device-local memory "
++               << "type found";
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, image, nullptr);
++    }
++    return false;
++  }
++
++  // Chain VkExportMemoryAllocateInfo to make the memory exportable as DMA-BUF.
++  VkExportMemoryAllocateInfo export_alloc_info{};
++  export_alloc_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++  export_alloc_info.handleTypes =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++  VkMemoryAllocateInfo alloc_info{};
++  alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++  alloc_info.pNext = &export_alloc_info;
++  alloc_info.allocationSize = mem_reqs.size;
++  alloc_info.memoryTypeIndex = memory_type_index;
++
++  VkDeviceMemory memory = VK_NULL_HANDLE;
++  if (pfn_allocate_memory(vk_device_, &alloc_info, nullptr, &memory) !=
++      VK_SUCCESS) {
++    LOG(ERROR) << "CreateIntermediateImage: vkAllocateMemory failed";
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, image, nullptr);
++    }
++    return false;
++  }
++
++  if (pfn_bind_image_memory(vk_device_, image, memory, 0) != VK_SUCCESS) {
++    LOG(ERROR) << "CreateIntermediateImage: vkBindImageMemory failed";
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    auto pfn_free_memory = reinterpret_cast<PFN_vkFreeMemory>(
++        vk_get_device_proc_addr_(vk_device_, "vkFreeMemory"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, image, nullptr);
++    }
++    if (pfn_free_memory) {
++      pfn_free_memory(vk_device_, memory, nullptr);
++    }
++    return false;
++  }
++
++  // Query the actual row stride for LINEAR tiling.
++  auto pfn_get_image_subresource_layout =
++      reinterpret_cast<PFN_vkGetImageSubresourceLayout>(
++          vk_get_device_proc_addr_(vk_device_,
++                                   "vkGetImageSubresourceLayout"));
++  VkSubresourceLayout layout{};
++  if (pfn_get_image_subresource_layout) {
++    VkImageSubresource subresource{};
++    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    subresource.mipLevel = 0;
++    subresource.arrayLayer = 0;
++    pfn_get_image_subresource_layout(vk_device_, image, &subresource, &layout);
++  } else {
++    // Fallback: guess stride.
++    layout.rowPitch = static_cast<uint64_t>(size.width()) * 4;
++    layout.offset = 0;
++    layout.size = layout.rowPitch * size.height();
++  }
++
++  out_image->image = image;
++  out_image->memory = memory;
++  out_image->stride = static_cast<uint32_t>(layout.rowPitch);
++  out_image->offset = static_cast<uint32_t>(layout.offset);
++  out_image->allocation_size = layout.size;
++  return true;
++}
++
++void OpenXrGraphicsBindingVulkan::DestroyIntermediateImages() {
++  if (vk_device_ == VK_NULL_HANDLE || !vk_get_device_proc_addr_) {
++    intermediate_images_.clear();
++    return;
++  }
++
++  auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++  auto pfn_free_memory = reinterpret_cast<PFN_vkFreeMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkFreeMemory"));
++
++  for (auto& img : intermediate_images_) {
++    if (pfn_destroy_image && img.image != VK_NULL_HANDLE) {
++      pfn_destroy_image(vk_device_, img.image, nullptr);
++    }
++    if (pfn_free_memory && img.memory != VK_NULL_HANDLE) {
++      pfn_free_memory(vk_device_, img.memory, nullptr);
++    }
++  }
++  intermediate_images_.clear();
++}
++
++void OpenXrGraphicsBindingVulkan::DestroyOverlayImage() {
++  if (vk_device_ == VK_NULL_HANDLE || !vk_get_device_proc_addr_) {
++    overlay_image_ = VK_NULL_HANDLE;
++    overlay_memory_ = VK_NULL_HANDLE;
++    overlay_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
++    has_overlay_ = false;
++    return;
++  }
++  if (overlay_image_ != VK_NULL_HANDLE) {
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, overlay_image_, nullptr);
++    }
++    overlay_image_ = VK_NULL_HANDLE;
++  }
++  if (overlay_memory_ != VK_NULL_HANDLE) {
++    auto pfn_free_memory = reinterpret_cast<PFN_vkFreeMemory>(
++        vk_get_device_proc_addr_(vk_device_, "vkFreeMemory"));
++    if (pfn_free_memory) {
++      pfn_free_memory(vk_device_, overlay_memory_, nullptr);
++    }
++    overlay_memory_ = VK_NULL_HANDLE;
++  }
++  overlay_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
++  has_overlay_ = false;
++}
++
++bool OpenXrGraphicsBindingVulkan::ImportOverlayDmaBuf(
++    const gfx::GpuMemoryBufferHandle& handle,
++    const gfx::Size& size,
++    VkFormat format) {
++  CHECK(vk_get_device_proc_addr_);
++  CHECK(vk_device_ != VK_NULL_HANDLE);
++
++  // The browser-side GraphicsDelegate exports its SharedImage as a
++  // NativePixmapHandle wrapping a single DMA-BUF plane.
++  if (handle.type != gfx::NATIVE_PIXMAP) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: handle is not NATIVE_PIXMAP";
++    return false;
++  }
++  const gfx::NativePixmapHandle& pixmap = handle.native_pixmap_handle();
++  if (pixmap.planes.empty() || !pixmap.planes[0].fd.is_valid()) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: no DMA-BUF FD in NativePixmapHandle";
++    return false;
++  }
++
++  // Dup the FD — vkAllocateMemory takes ownership on success.
++  base::ScopedFD dup_fd(dup(pixmap.planes[0].fd.get()));
++  if (!dup_fd.is_valid()) {
++    PLOG(ERROR) << "ImportOverlayDmaBuf: dup() failed";
++    return false;
++  }
++
++  auto pfn_create_image = reinterpret_cast<PFN_vkCreateImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkCreateImage"));
++  auto pfn_allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkAllocateMemory"));
++  auto pfn_bind_image_memory = reinterpret_cast<PFN_vkBindImageMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkBindImageMemory"));
++  auto pfn_get_image_memory_requirements =
++      reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
++          vk_get_device_proc_addr_(vk_device_, "vkGetImageMemoryRequirements"));
++  auto pfn_get_physical_device_memory_properties =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
++          vk_get_instance_proc_addr_(vk_instance_,
++                                     "vkGetPhysicalDeviceMemoryProperties"));
++  if (!pfn_create_image || !pfn_allocate_memory || !pfn_bind_image_memory ||
++      !pfn_get_image_memory_requirements ||
++      !pfn_get_physical_device_memory_properties) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: failed to resolve Vulkan functions";
++    return false;
++  }
++
++  // Create VkImage matching the source SharedImage layout (linear, DMA-BUF
++  // externally allocated).
++  VkExternalMemoryImageCreateInfo external_image_info{};
++  external_image_info.sType =
++      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++  external_image_info.handleTypes =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++  VkImageCreateInfo image_ci{};
++  image_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_ci.pNext = &external_image_info;
++  image_ci.imageType = VK_IMAGE_TYPE_2D;
++  image_ci.format = format;
++  image_ci.extent = {static_cast<uint32_t>(size.width()),
++                     static_cast<uint32_t>(size.height()), 1};
++  image_ci.mipLevels = 1;
++  image_ci.arrayLayers = 1;
++  image_ci.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_ci.tiling = VK_IMAGE_TILING_LINEAR;
++  image_ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++  image_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++  VkImage image = VK_NULL_HANDLE;
++  if (pfn_create_image(vk_device_, &image_ci, nullptr, &image) != VK_SUCCESS) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: vkCreateImage failed";
++    return false;
++  }
++
++  VkMemoryRequirements mem_reqs{};
++  pfn_get_image_memory_requirements(vk_device_, image, &mem_reqs);
++
++  // Find a memory type satisfying the image requirements. For imported DMA-BUF
++  // the actual properties are determined by the exporter; we accept whatever
++  // type matches memoryTypeBits.
++  VkPhysicalDeviceMemoryProperties mem_props{};
++  pfn_get_physical_device_memory_properties(binding_.physicalDevice,
++                                             &mem_props);
++  uint32_t memory_type_index = UINT32_MAX;
++  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++    if (mem_reqs.memoryTypeBits & (1u << i)) {
++      memory_type_index = i;
++      break;
++    }
++  }
++  if (memory_type_index == UINT32_MAX) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: no compatible memory type";
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, image, nullptr);
++    }
++    return false;
++  }
++
++  // Chain VkImportMemoryFdInfoKHR to allocate memory from the imported FD.
++  // vkAllocateMemory takes ownership of the FD on success.
++  VkImportMemoryFdInfoKHR import_info{};
++  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
++  import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++  import_info.fd = dup_fd.release();
++
++  VkMemoryAllocateInfo alloc_info{};
++  alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++  alloc_info.pNext = &import_info;
++  alloc_info.allocationSize = mem_reqs.size;
++  alloc_info.memoryTypeIndex = memory_type_index;
++
++  VkDeviceMemory memory = VK_NULL_HANDLE;
++  if (pfn_allocate_memory(vk_device_, &alloc_info, nullptr, &memory) !=
++      VK_SUCCESS) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: vkAllocateMemory failed "
++               << "(imported FD was not consumed; closing)";
++    close(import_info.fd);
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, image, nullptr);
++    }
++    return false;
++  }
++
++  if (pfn_bind_image_memory(vk_device_, image, memory, 0) != VK_SUCCESS) {
++    LOG(ERROR) << "ImportOverlayDmaBuf: vkBindImageMemory failed";
++    auto pfn_free_memory = reinterpret_cast<PFN_vkFreeMemory>(
++        vk_get_device_proc_addr_(vk_device_, "vkFreeMemory"));
++    if (pfn_free_memory) {
++      pfn_free_memory(vk_device_, memory, nullptr);
++    }
++    auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++        vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++    if (pfn_destroy_image) {
++      pfn_destroy_image(vk_device_, image, nullptr);
++    }
++    return false;
++  }
++
++  overlay_image_ = image;
++  overlay_memory_ = memory;
++  overlay_size_ = size;
++  overlay_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
++  return true;
++}
++
++bool OpenXrGraphicsBindingVulkan::CanUseSharedImages() const {
++  return initialized_;
++}
++
++void OpenXrGraphicsBindingVulkan::CreateSharedImages(
++    OpenXrCompositionLayer& layer,
++    gpu::SharedImageInterface* sii) {
++  CHECK(sii);
++
++  // VK_KHR_external_memory_fd is required to export VkDeviceMemory as FDs.
++  // This extension is not available on SwiftShader, so we skip SharedImage
++  // creation in that case — all unit tests take this early-return path.
++  if (!has_external_memory_fd_) {
++    DVLOG(1) << "CreateSharedImages: VK_KHR_external_memory_fd not available, "
++             << "skipping SharedImage creation";
++    return;
++  }
++
++  if (!vk_get_device_proc_addr_ || vk_device_ == VK_NULL_HANDLE) {
++    DLOG(ERROR) << "CreateSharedImages: Vulkan not initialized";
++    return;
++  }
++
++  const gfx::Size size = layer.GetSwapchainImageSize();
++  DVLOG(1) << "CreateSharedImages: SwapchainImageSize=" << size.ToString()
++           << " TransferSize=" << layer.GetTransferSize().ToString();
++  if (size.IsEmpty()) {
++    DLOG(ERROR) << "CreateSharedImages: Swapchain image size is empty";
++    return;
++  }
++
++  // swapchain_format_ was set by GetSwapchainFormat() during swapchain creation.
++  // Verify it is populated before proceeding.
++  if (swapchain_format_ == VK_FORMAT_UNDEFINED) {
++    LOG(ERROR) << "CreateSharedImages: swapchain format not yet negotiated";
++    return;
++  }
++
++  // Destroy any previously created intermediate images.
++  DestroyIntermediateImages();
++
++  auto pfn_get_memory_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
++      vk_get_device_proc_addr_(vk_device_, "vkGetMemoryFdKHR"));
++  if (!pfn_get_memory_fd) {
++    LOG(ERROR) << "CreateSharedImages: vkGetMemoryFdKHR not available";
++    return;
++  }
++
++  auto swapchain_images = layer.GetSwapchainImages();
++  intermediate_images_.resize(swapchain_images.size());
++
++  for (size_t i = 0; i < swapchain_images.size(); ++i) {
++    if (!CreateIntermediateImage(size, swapchain_format_,
++                                &intermediate_images_[i])) {
++      LOG(ERROR) << "Failed to create intermediate image " << i;
++      DestroyIntermediateImages();
++      return;
++    }
++
++    // Export the VkDeviceMemory as a DMA-BUF file descriptor.
++    int fd = -1;
++    VkMemoryGetFdInfoKHR fd_info{};
++    fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
++    fd_info.memory = intermediate_images_[i].memory;
++    fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++    if (pfn_get_memory_fd(vk_device_, &fd_info, &fd) != VK_SUCCESS || fd < 0) {
++      LOG(ERROR) << "vkGetMemoryFdKHR (DMA_BUF) failed for image " << i;
++      DestroyIntermediateImages();
++      return;
++    }
++
++    // Wrap the DMA-BUF FD with proper stride from VkSubresourceLayout.
++    gfx::NativePixmapHandle pixmap_handle;
++    pixmap_handle.modifier = 0;  // DRM_FORMAT_MOD_LINEAR
++    pixmap_handle.planes.emplace_back(
++        /*stride=*/intermediate_images_[i].stride,
++        /*offset=*/intermediate_images_[i].offset,
++        /*size=*/intermediate_images_[i].allocation_size,
++        base::ScopedFD(fd));
++
++    gfx::GpuMemoryBufferHandle gmb_handle(std::move(pixmap_handle));
++
++    // The SharedImages created here will be transferred to other processes to
++    // have their contents written by WebGL or WebGPU. Readback by OpenXR is
++    // via the blit in RenderLayer.
++    gpu::SharedImageUsageSet shared_image_usage =
++        gpu::SHARED_IMAGE_USAGE_SCANOUT |
++        gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++        gpu::SHARED_IMAGE_USAGE_GLES2_READ |
++        gpu::SHARED_IMAGE_USAGE_GLES2_WRITE;
++
++    // Map the Vulkan swapchain format to the matching SharedImage format so
++    // the GPU process imports the DMA-BUF with the correct channel layout.
++    viz::SharedImageFormat si_format =
++        (swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB)
++            ? viz::SinglePlaneFormat::kBGRA_8888
++            : viz::SinglePlaneFormat::kRGBA_8888;
++
++    swapchain_images[i].shared_image = sii->CreateSharedImage(
++        {si_format, size, gfx::ColorSpace::CreateSRGB(), shared_image_usage,
++         "OpenXrVulkanBinding"},
++        std::move(gmb_handle));
++
++    if (!swapchain_images[i].shared_image) {
++      LOG(ERROR) << "CreateSharedImage failed for slot " << i;
++      DestroyIntermediateImages();
++      return;
++    }
++
++    swapchain_images[i].sync_token = sii->GenVerifiedSyncToken();
++  }
++}
++
++bool OpenXrGraphicsBindingVulkan::WaitOnFence(OpenXrCompositionLayer& layer,
++                                              gfx::GpuFence& gpu_fence) {
++  if (!has_external_semaphore_fd_) {
++    return true;  // Extension not available (e.g. SwiftShader).
++  }
++
++  // Extract the sync FD from the GpuFence. Peek() returns a non-owned FD.
++  const gfx::GpuFenceHandle& fence_handle = gpu_fence.GetGpuFenceHandle();
++  int fence_fd = fence_handle.Peek();
++  if (fence_fd < 0) {
++    return true;  // No valid FD — nothing to wait on.
++  }
++
++  auto pfn_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(
++      vk_get_device_proc_addr_(vk_device_, "vkCreateSemaphore"));
++  auto pfn_import_semaphore_fd =
++      reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
++          vk_get_device_proc_addr_(vk_device_, "vkImportSemaphoreFdKHR"));
++  auto pfn_destroy_semaphore = reinterpret_cast<PFN_vkDestroySemaphore>(
++      vk_get_device_proc_addr_(vk_device_, "vkDestroySemaphore"));
++  auto pfn_queue_submit = reinterpret_cast<PFN_vkQueueSubmit>(
++      vk_get_device_proc_addr_(vk_device_, "vkQueueSubmit"));
++  auto pfn_reset_fences = reinterpret_cast<PFN_vkResetFences>(
++      vk_get_device_proc_addr_(vk_device_, "vkResetFences"));
++  auto pfn_wait_for_fences = reinterpret_cast<PFN_vkWaitForFences>(
++      vk_get_device_proc_addr_(vk_device_, "vkWaitForFences"));
++
++  if (!pfn_create_semaphore || !pfn_import_semaphore_fd ||
++      !pfn_destroy_semaphore || !pfn_queue_submit || !pfn_reset_fences ||
++      !pfn_wait_for_fences) {
++    LOG(ERROR) << "WaitOnFence: Failed to resolve Vulkan semaphore functions";
++    return false;
++  }
++
++  VkSemaphore semaphore = VK_NULL_HANDLE;
++  VkSemaphoreCreateInfo sem_ci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++  if (pfn_create_semaphore(vk_device_, &sem_ci, nullptr, &semaphore) !=
++      VK_SUCCESS) {
++    LOG(ERROR) << "WaitOnFence: vkCreateSemaphore failed";
++    return false;
++  }
++
++  // Import the fence FD into the semaphore. vkImportSemaphoreFdKHR takes
++  // ownership of the FD on success, so we dup() since GpuFenceHandle still
++  // owns the original.
++  VkImportSemaphoreFdInfoKHR import_info{
++      VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR};
++  import_info.semaphore = semaphore;
++  import_info.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
++  import_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
++  import_info.fd = dup(fence_fd);
++
++  if (pfn_import_semaphore_fd(vk_device_, &import_info) != VK_SUCCESS) {
++    close(import_info.fd);
++    pfn_destroy_semaphore(vk_device_, semaphore, nullptr);
++    LOG(ERROR) << "WaitOnFence: vkImportSemaphoreFdKHR failed";
++    return false;
++  }
++
++  // Submit a wait on the imported semaphore so that subsequent GPU work
++  // (the blit in RenderLayer) does not start until the fence signals.
++  VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++  submit.waitSemaphoreCount = 1;
++  submit.pWaitSemaphores = &semaphore;
++  submit.pWaitDstStageMask = &wait_stage;
++
++  // Reset and use vk_frame_fence_ instead of vkQueueWaitIdle, scoping the
++  // CPU stall to this specific submit rather than all pending queue work.
++  pfn_reset_fences(vk_device_, 1, &vk_frame_fence_);
++  VkResult result = pfn_queue_submit(vk_queue_, 1, &submit, vk_frame_fence_);
++  if (result == VK_SUCCESS) {
++    pfn_wait_for_fences(vk_device_, 1, &vk_frame_fence_, VK_TRUE, UINT64_MAX);
++  }
++
++  pfn_destroy_semaphore(vk_device_, semaphore, nullptr);
++  return result == VK_SUCCESS;
++}
++
++bool OpenXrGraphicsBindingVulkan::RenderLayer(
++    OpenXrCompositionLayer& layer,
++    const scoped_refptr<viz::ContextProvider>& context_provider) {
++  if (!has_external_memory_fd_ || intermediate_images_.empty()) {
++    return true;  // No intermediate images — nothing to blit.
++  }
++
++  // Determine the active swapchain image and its index.
++  OpenXrSwapchainInfo* active_info = layer.GetActiveSwapchainImage();
++  if (!active_info) {
++    return false;
++  }
++
++  // Compute the index of the active image within the swapchain images span.
++  base::span<OpenXrSwapchainInfo> swapchain_images = layer.GetSwapchainImages();
++  size_t active_index = static_cast<size_t>(active_info - swapchain_images.data());
++  if (active_index >= intermediate_images_.size()) {
++    return false;
++  }
++
++  VkImage src = intermediate_images_[active_index].image;
++  VkImage dst = active_info->vk_image;
++  if (src == VK_NULL_HANDLE || dst == VK_NULL_HANDLE) {
++    return false;
++  }
++
++  const gfx::Size size = layer.GetSwapchainImageSize();
++
++  // Resolve device-level Vulkan function pointers.
++  auto pfn_reset_cb = reinterpret_cast<PFN_vkResetCommandBuffer>(
++      vk_get_device_proc_addr_(vk_device_, "vkResetCommandBuffer"));
++  auto pfn_begin_cb = reinterpret_cast<PFN_vkBeginCommandBuffer>(
++      vk_get_device_proc_addr_(vk_device_, "vkBeginCommandBuffer"));
++  auto pfn_end_cb = reinterpret_cast<PFN_vkEndCommandBuffer>(
++      vk_get_device_proc_addr_(vk_device_, "vkEndCommandBuffer"));
++  auto pfn_cmd_pipeline_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
++      vk_get_device_proc_addr_(vk_device_, "vkCmdPipelineBarrier"));
++  auto pfn_cmd_copy_image = reinterpret_cast<PFN_vkCmdCopyImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkCmdCopyImage"));
++  auto pfn_queue_submit = reinterpret_cast<PFN_vkQueueSubmit>(
++      vk_get_device_proc_addr_(vk_device_, "vkQueueSubmit"));
++  auto pfn_reset_fences = reinterpret_cast<PFN_vkResetFences>(
++      vk_get_device_proc_addr_(vk_device_, "vkResetFences"));
++  auto pfn_wait_for_fences = reinterpret_cast<PFN_vkWaitForFences>(
++      vk_get_device_proc_addr_(vk_device_, "vkWaitForFences"));
++
++  if (!pfn_reset_cb || !pfn_begin_cb || !pfn_end_cb ||
++      !pfn_cmd_pipeline_barrier || !pfn_cmd_copy_image || !pfn_queue_submit ||
++      !pfn_reset_fences || !pfn_wait_for_fences) {
++    LOG(ERROR) << "RenderLayer: Failed to resolve Vulkan command functions";
++    return false;
++  }
++
++  pfn_reset_cb(vk_command_buffer_, 0);
++
++  VkCommandBufferBeginInfo begin_info{
++      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++  if (pfn_begin_cb(vk_command_buffer_, &begin_info) != VK_SUCCESS) {
++    return false;
++  }
++
++  // Transition src from its tracked layout to TRANSFER_SRC_OPTIMAL.
++  // On first use the layout is UNDEFINED; on subsequent frames it is GENERAL
++  // (restored after the previous blit to allow external GL/DMA-BUF access).
++  // srcAccessMask=0 is correct because WaitOnFence already serialized the
++  // external GL writes via a semaphore wait on this queue.
++  VkImageMemoryBarrier src_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++  src_barrier.srcAccessMask = 0;
++  src_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++  src_barrier.oldLayout = intermediate_images_[active_index].current_layout;
++  src_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  src_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  src_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  src_barrier.image = src;
++  src_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  pfn_cmd_pipeline_barrier(
++      vk_command_buffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
++      &src_barrier);
++
++  // Transition dst: UNDEFINED -> TRANSFER_DST_OPTIMAL.
++  // OpenXR swapchain images start in UNDEFINED or COLOR_ATTACHMENT_OPTIMAL
++  // after xrAcquireSwapchainImage. Using UNDEFINED as oldLayout is always safe.
++  VkImageMemoryBarrier dst_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++  dst_barrier.srcAccessMask = 0;
++  dst_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++  dst_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  dst_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++  dst_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  dst_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  dst_barrier.image = dst;
++  dst_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  pfn_cmd_pipeline_barrier(vk_command_buffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                           nullptr, 1, &dst_barrier);
++
++  // Copy the intermediate image to the swapchain image.
++  VkImageCopy region{};
++  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.extent = {static_cast<uint32_t>(size.width()),
++                   static_cast<uint32_t>(size.height()), 1};
++  pfn_cmd_copy_image(vk_command_buffer_, src,
++                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++
++  // Composite the browser overlay (permission prompts, capture indicators,
++  // etc.) on top of the WebXR content. dst is already in TRANSFER_DST_OPTIMAL.
++  // The overlay is blitted to a fixed screen-space rect per eye.
++  if (overlay_visible_ && has_overlay_) {
++    RecordOverlayBlitCommands(vk_command_buffer_, dst, size);
++  }
++
++  // Transition dst back: TRANSFER_DST_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL.
++  // OpenXR expects COLOR_ATTACHMENT_OPTIMAL for xrReleaseSwapchainImage.
++  dst_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++  dst_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
++  dst_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++  dst_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++  pfn_cmd_pipeline_barrier(vk_command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                           nullptr, 0, nullptr, 1, &dst_barrier);
++
++  // Transition src back to GENERAL so the next GL/DMA-BUF write has a
++  // well-defined Vulkan layout on the subsequent frame.
++  src_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++  src_barrier.dstAccessMask = 0;
++  src_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  src_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++  pfn_cmd_pipeline_barrier(vk_command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
++                           0, nullptr, 1, &src_barrier);
++
++  if (pfn_end_cb(vk_command_buffer_) != VK_SUCCESS) {
++    return false;
++  }
++
++  // Submit with vk_frame_fence_ instead of vkQueueWaitIdle, scoping the CPU
++  // stall to this specific submit.
++  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++  submit.commandBufferCount = 1;
++  submit.pCommandBuffers = &vk_command_buffer_;
++  pfn_reset_fences(vk_device_, 1, &vk_frame_fence_);
++  VkResult result = pfn_queue_submit(vk_queue_, 1, &submit, vk_frame_fence_);
++  if (result != VK_SUCCESS) {
++    return false;
++  }
++  pfn_wait_for_fences(vk_device_, 1, &vk_frame_fence_, VK_TRUE, UINT64_MAX);
++
++  // Record the new layout for next frame's barrier.
++  intermediate_images_[active_index].current_layout = VK_IMAGE_LAYOUT_GENERAL;
++  return true;
++}
++
++void OpenXrGraphicsBindingVulkan::CleanupWithoutSubmit() {
++  DestroyIntermediateImages();
++}
++
++gfx::Size OpenXrGraphicsBindingVulkan::GetMaxTextureSize() {
++  return max_texture_size_;
++}
++
++void OpenXrGraphicsBindingVulkan::RecordOverlayBlitCommands(
++    VkCommandBuffer cb,
++    VkImage dst,
++    const gfx::Size& swapchain_size) {
++  CHECK(has_overlay_);
++  CHECK(overlay_image_ != VK_NULL_HANDLE);
++  CHECK(vk_get_device_proc_addr_);
++
++  auto pfn_cmd_pipeline_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
++      vk_get_device_proc_addr_(vk_device_, "vkCmdPipelineBarrier"));
++  auto pfn_cmd_blit_image = reinterpret_cast<PFN_vkCmdBlitImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkCmdBlitImage"));
++  if (!pfn_cmd_pipeline_barrier || !pfn_cmd_blit_image) {
++    DVLOG(1) << "RecordOverlayBlitCommands: function pointers unavailable";
++    return;
++  }
++
++  // Transition overlay from its tracked layout to TRANSFER_SRC_OPTIMAL.
++  VkImageMemoryBarrier ov_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++  ov_barrier.srcAccessMask = 0;
++  ov_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++  ov_barrier.oldLayout = overlay_layout_;
++  ov_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  ov_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  ov_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  ov_barrier.image = overlay_image_;
++  ov_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  pfn_cmd_pipeline_barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                           nullptr, 1, &ov_barrier);
++
++  // Destination rectangle: center-bottom 30% of each eye half of the
++  // swapchain. Not head-locked to world space — this is a screen-space
++  // overlay, so the dialog always stays in the user's view. A full quad-
++  // layer implementation (with proper 3D pose) is a follow-up.
++  const int sw = swapchain_size.width();
++  const int sh = swapchain_size.height();
++  const int eye_w = sw / 2;
++  const int dst_w = eye_w * 40 / 100;   // 40% of eye width
++  const int dst_h = sh * 25 / 100;      // 25% of full height
++  const int dst_y = sh * 60 / 100;      // centered-low
++  const int left_dst_x = (eye_w - dst_w) / 2;
++  const int right_dst_x = eye_w + (eye_w - dst_w) / 2;
++
++  auto uv_to_src_offset = [&](const gfx::RectF& uv, bool right_edge) {
++    const int x =
++        static_cast<int>((right_edge ? uv.right() : uv.x()) * overlay_size_.width());
++    const int y =
++        static_cast<int>((right_edge ? uv.bottom() : uv.y()) * overlay_size_.height());
++    return VkOffset3D{x, y, right_edge ? 1 : 0};
++  };
++
++  VkImageBlit blits[2];
++  // Left eye.
++  blits[0].srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  blits[0].dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  blits[0].srcOffsets[0] = uv_to_src_offset(overlay_left_uv_, false);
++  blits[0].srcOffsets[1] = uv_to_src_offset(overlay_left_uv_, true);
++  blits[0].dstOffsets[0] = {left_dst_x, dst_y, 0};
++  blits[0].dstOffsets[1] = {left_dst_x + dst_w, dst_y + dst_h, 1};
++  // Right eye.
++  blits[1].srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  blits[1].dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  blits[1].srcOffsets[0] = uv_to_src_offset(overlay_right_uv_, false);
++  blits[1].srcOffsets[1] = uv_to_src_offset(overlay_right_uv_, true);
++  blits[1].dstOffsets[0] = {right_dst_x, dst_y, 0};
++  blits[1].dstOffsets[1] = {right_dst_x + dst_w, dst_y + dst_h, 1};
++
++  pfn_cmd_blit_image(cb, overlay_image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                     dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, blits,
++                     VK_FILTER_LINEAR);
++
++  // Restore overlay to GENERAL so the next browser-side write doesn't see
++  // TRANSFER_SRC.
++  ov_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++  ov_barrier.dstAccessMask = 0;
++  ov_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  ov_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++  pfn_cmd_pipeline_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
++                           nullptr, 0, nullptr, 1, &ov_barrier);
++  overlay_layout_ = VK_IMAGE_LAYOUT_GENERAL;
++}
++
++bool OpenXrGraphicsBindingVulkan::SetOverlayTexture(
++    gfx::GpuMemoryBufferHandle texture,
++    const gpu::SyncToken& sync_token,
++    const gfx::RectF& left,
++    const gfx::RectF& right) {
++  if (texture.is_null()) {
++    // Browser signals "no overlay this frame" by sending a null handle.
++    // Retain the imported VkImage so we can keep compositing with the same
++    // GPU resources next frame; just mark the overlay as inactive.
++    has_overlay_ = false;
++    return true;
++  }
++
++  if (!has_external_memory_fd_) {
++    DVLOG(1) << "SetOverlayTexture: VK_KHR_external_memory_fd unavailable, "
++             << "overlay will not be composited";
++    has_overlay_ = false;
++    return true;
++  }
++
++  // Derive the logical pixel size from the NativePixmapHandle's first plane.
++  // The browser-side GraphicsDelegate exports an RGBA_8888 SharedImage via
++  // gfx::BufferUsage::SCANOUT, so the per-eye-pair stereo texture is
++  // (left_viewport + right_viewport) wide.
++  if (texture.type != gfx::NATIVE_PIXMAP) {
++    LOG(ERROR) << "SetOverlayTexture: expected NATIVE_PIXMAP, got "
++               << static_cast<int>(texture.type);
++    return false;
++  }
++  const gfx::NativePixmapHandle& pixmap = texture.native_pixmap_handle();
++  if (pixmap.planes.empty()) {
++    LOG(ERROR) << "SetOverlayTexture: no planes in NativePixmapHandle";
++    return false;
++  }
++
++  // The SharedImage size travels alongside the handle on the browser side;
++  // the Chromium utility process recovers it from the SharedImage service.
++  // Here we approximate it from the plane stride (bytes/row / 4) × height
++  // inferred from allocation size when the handle doesn't carry size
++  // directly. To keep this simple and correct, we assume the overlay size
++  // matches the latest `left.union(right)` normalized bounds scaled to the
++  // intermediate image size — which is exactly the browser-side texture.
++  gfx::Size size;
++  if (!intermediate_images_.empty()) {
++    // The overlay matches GraphicsDelegate::GetTextureSize() which is the
++    // same size as our intermediate (swapchain) images.
++    // Re-query the current swapchain image size from the first intermediate.
++    // The browser-side texture width = left_viewport + right_viewport, same
++    // as our swapchain image.
++    // Fallback: use 2 × max-texture for safety if the query fails.
++    // We'll trust the GpuMemoryBuffer stride + height to derive the size.
++    uint32_t stride = pixmap.planes[0].stride;
++    uint32_t width = stride / 4;  // RGBA8 = 4 bytes/texel
++    uint64_t plane_size = pixmap.planes[0].size;
++    uint32_t height = width ? static_cast<uint32_t>(plane_size / stride) : 0;
++    if (width == 0 || height == 0) {
++      LOG(ERROR) << "SetOverlayTexture: cannot derive overlay size "
++                 << "(stride=" << stride << ", size=" << plane_size << ")";
++      return false;
++    }
++    size = gfx::Size(width, height);
++  } else {
++    LOG(ERROR) << "SetOverlayTexture: called before intermediate images were "
++               << "created";
++    return false;
++  }
++
++  // Re-import only when the size changed; otherwise reuse the existing
++  // VkImage. Note that a new DMA-BUF FD is sent every frame, but as long as
++  // the underlying SharedImage is the same size, the ID3D11-equivalent
++  // binding on Linux is to keep the same VkImage tied to the same memory.
++  // In practice the browser-side GraphicsDelegate::EnsureMemoryBuffer()
++  // recreates the SharedImage only on resize, so we mirror that policy here.
++  if (overlay_image_ == VK_NULL_HANDLE || size != overlay_size_) {
++    DestroyOverlayImage();
++    // GraphicsDelegate uses kRGBA_8888 (non-SRGB); match with UNORM so the
++    // copy preserves the already-gamma-encoded browser UI pixels.
++    if (!ImportOverlayDmaBuf(texture, size, VK_FORMAT_R8G8B8A8_UNORM)) {
++      has_overlay_ = false;
++      return false;
++    }
++  }
++
++  overlay_left_uv_ = left;
++  overlay_right_uv_ = right;
++  has_overlay_ = true;
++  return true;
++}
++
++void OpenXrGraphicsBindingVulkan::OnSwapchainImageActivated(
++    OpenXrCompositionLayer& layer,
++    gpu::SharedImageInterface* sii) {
++  // No-op for direct-write: the active swapchain image is already ready.
++}
++
++bool OpenXrGraphicsBindingVulkan::SupportsLayers() const {
++  return false;
++}
++
++void OpenXrGraphicsBindingVulkan::ResizeSharedBuffer(
++    OpenXrCompositionLayer& layer,
++    OpenXrSwapchainInfo& swap_chain_info,
++    gpu::SharedImageInterface* sii) {
++  // Re-create all shared images for the layer at the new size.
++  DestroyIntermediateImages();
++  CreateSharedImages(layer, sii);
++}
++
++bool OpenXrGraphicsBindingVulkan::ShouldFlipSubmittedImage(
++    OpenXrCompositionLayer& layer) const {
++  // GL has bottom-left origin; Vulkan/OpenXR has top-left origin.
++  // The submitted image needs to be flipped vertically.
++  return true;
++}
++
++std::unique_ptr<OpenXrCompositionLayer::GraphicsBindingData>
++OpenXrGraphicsBindingVulkan::CreateLayerGraphicsBindingData() const {
++  // No per-layer Vulkan state needed for the single-layer MVP.
++  return nullptr;
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+new file mode 100644
+index 0000000000000..7bd21b3d5400d
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+@@ -0,0 +1,175 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DEVICE_VR_OPENXR_LINUX_OPENXR_GRAPHICS_BINDING_VULKAN_H_
++#define DEVICE_VR_OPENXR_LINUX_OPENXR_GRAPHICS_BINDING_VULKAN_H_
++
++#include <vector>
++
++#include "base/scoped_native_library.h"
++#include "device/vr/openxr/openxr_graphics_binding.h"
++#include "device/vr/openxr/openxr_platform.h"
++#include "device/vr/vr_export.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace device {
++
++// Vulkan-backed OpenXrGraphicsBinding for the Linux OpenXR code path.
++// Uses XR_KHR_vulkan_enable2 to drive XrSession creation with a Vulkan
++// graphics binding.
++class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
++    : public OpenXrGraphicsBinding {
++ public:
++  explicit OpenXrGraphicsBindingVulkan(
++      const OpenXrExtensionEnumeration* extension_enum);
++
++  OpenXrGraphicsBindingVulkan(const OpenXrGraphicsBindingVulkan&) = delete;
++  OpenXrGraphicsBindingVulkan& operator=(const OpenXrGraphicsBindingVulkan&) =
++      delete;
++
++  ~OpenXrGraphicsBindingVulkan() override;
++
++  // OpenXrGraphicsBinding:
++  bool Initialize(XrInstance instance, XrSystemId system) override;
++  const void* GetSessionCreateInfo() const override;
++  int64_t GetSwapchainFormat(XrSession session) const override;
++  XrResult EnumerateSwapchainImages(OpenXrCompositionLayer& layer) override;
++  bool CanUseSharedImages() const override;
++  void CleanupWithoutSubmit() override;
++  gfx::Size GetMaxTextureSize() override;
++  bool SetOverlayTexture(gfx::GpuMemoryBufferHandle texture,
++                         const gpu::SyncToken& sync_token,
++                         const gfx::RectF& left,
++                         const gfx::RectF& right) override;
++  void OnSwapchainImageActivated(OpenXrCompositionLayer& layer,
++                                 gpu::SharedImageInterface* sii) override;
++  bool SupportsLayers() const override;
++  void ResizeSharedBuffer(OpenXrCompositionLayer& layer,
++                          OpenXrSwapchainInfo& swap_chain_info,
++                          gpu::SharedImageInterface* sii) override;
++
++ protected:
++  // OpenXrGraphicsBinding:
++  bool WaitOnFence(OpenXrCompositionLayer& layer,
++                   gfx::GpuFence& gpu_fence) override;
++  bool RenderLayer(
++      OpenXrCompositionLayer& layer,
++      const scoped_refptr<viz::ContextProvider>& context_provider) override;
++  void CreateSharedImages(OpenXrCompositionLayer& layer,
++                          gpu::SharedImageInterface* sii) override;
++  bool ShouldFlipSubmittedImage(
++      OpenXrCompositionLayer& layer) const override;
++  std::unique_ptr<OpenXrCompositionLayer::GraphicsBindingData>
++  CreateLayerGraphicsBindingData() const override;
++
++ private:
++  // Intermediate Vulkan image created by Chromium for SharedImage export.
++  // The OpenXR spec does not expose VkDeviceMemory for runtime-owned swapchain
++  // images, so we create our own images with exportable memory and blit to the
++  // swapchain images in RenderLayer.
++  struct IntermediateImage {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    uint32_t stride = 0;       // Row pitch from VkSubresourceLayout
++    uint32_t offset = 0;       // Plane offset
++    uint64_t allocation_size = 0;  // Total allocation size
++    // Tracks the current Vulkan image layout so RenderLayer can supply the
++    // correct oldLayout in pipeline barriers across frames.
++    VkImageLayout current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++  };
++
++  // Cleans up Vulkan resources (VkDevice, VkInstance) if they were created.
++  void DestroyVulkanState();
++
++  // Cleans up the command pool and command buffer.
++  void DestroyCommandPool();
++
++  // Creates a single exportable VkImage + VkDeviceMemory pair.
++  bool CreateIntermediateImage(const gfx::Size& size,
++                               VkFormat format,
++                               IntermediateImage* out_image);
++
++  // Destroys all intermediate images and frees their Vulkan memory.
++  void DestroyIntermediateImages();
++
++  // Imports the browser-overlay DMA-BUF (handed in through SetOverlayTexture)
++  // as a VkImage so RenderLayer can composite it into the swapchain.
++  // Returns true if the import succeeded and overlay_image_ is valid.
++  bool ImportOverlayDmaBuf(const gfx::GpuMemoryBufferHandle& handle,
++                           const gfx::Size& size,
++                           VkFormat format);
++
++  // Destroys overlay_image_ / overlay_memory_ and resets overlay state.
++  void DestroyOverlayImage();
++
++  // Records overlay blit commands on `cb`: overlay_image_ -> swapchain image
++  // (dst), using vkCmdBlitImage so source (stereo texture) and destination
++  // (swapchain) can differ in size. Issued only when has_overlay_ is true.
++  // dst must already be in VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL.
++  void RecordOverlayBlitCommands(VkCommandBuffer cb,
++                                 VkImage dst,
++                                 const gfx::Size& swapchain_size);
++
++  XrGraphicsBindingVulkan2KHR binding_{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
++  bool initialized_ = false;
++
++  // Vulkan loader library handle.
++  base::ScopedNativeLibrary vulkan_loader_;
++
++  // Raw Vulkan handles owned by this object.
++  VkInstance vk_instance_ = VK_NULL_HANDLE;
++  VkDevice vk_device_ = VK_NULL_HANDLE;
++
++  // Resolved Vulkan function pointers.
++  PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr_ = nullptr;
++  PFN_vkGetDeviceProcAddr vk_get_device_proc_addr_ = nullptr;
++  PFN_vkDestroyInstance vk_destroy_instance_ = nullptr;
++  PFN_vkDestroyDevice vk_destroy_device_ = nullptr;
++
++  // True if VK_KHR_external_memory_fd was successfully enabled at VkDevice
++  // creation. False on runtimes (e.g. SwiftShader) that don't support it.
++  bool has_external_memory_fd_ = false;
++
++  // True if VK_KHR_external_semaphore_fd was successfully enabled at VkDevice
++  // creation.
++  bool has_external_semaphore_fd_ = false;
++
++  // Queue, command pool, command buffer, and submit fence for RenderLayer blits.
++  VkQueue vk_queue_ = VK_NULL_HANDLE;
++  VkCommandPool vk_command_pool_ = VK_NULL_HANDLE;
++  VkCommandBuffer vk_command_buffer_ = VK_NULL_HANDLE;
++  // Reusable fence for GPU-synchronized submit/wait. Replaces per-call
++  // vkQueueWaitIdle, scoping the CPU stall to the specific submit.
++  VkFence vk_frame_fence_ = VK_NULL_HANDLE;
++
++  // Intermediate images owned by Chromium for SharedImage export.
++  std::vector<IntermediateImage> intermediate_images_;
++
++  // The Vulkan format negotiated by GetSwapchainFormat(), cached so that
++  // CreateSharedImages() can create intermediate images with the matching
++  // format and choose the correct viz::SharedImageFormat.
++  mutable VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
++
++  // Browser-overlay DMA-BUF imported as a VkImage for compositing in
++  // RenderLayer. Empty until SetOverlayTexture() is called with a valid
++  // handle. Re-imported when the size changes.
++  VkImage overlay_image_ = VK_NULL_HANDLE;
++  VkDeviceMemory overlay_memory_ = VK_NULL_HANDLE;
++  VkImageLayout overlay_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
++  gfx::Size overlay_size_;
++  // UV rects within the overlay texture that belong to the left and right
++  // eye, respectively, as delivered by the browser-side GraphicsDelegate.
++  gfx::RectF overlay_left_uv_;
++  gfx::RectF overlay_right_uv_;
++  bool has_overlay_ = false;
++
++  // Maximum texture dimensions queried from VkPhysicalDeviceLimits.
++  // Defaults to 4096 until Initialize() queries the real value.
++  gfx::Size max_texture_size_{4096, 4096};
++};
++
++}  // namespace device
++
++#endif  // DEVICE_VR_OPENXR_LINUX_OPENXR_GRAPHICS_BINDING_VULKAN_H_
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+new file mode 100644
+index 0000000000000..c1ee09eea5313
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+@@ -0,0 +1,182 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "device/vr/openxr/linux/openxr_graphics_binding_vulkan.h"
++
++#include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
++#include "device/vr/openxr/openxr_platform.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/openxr/src/include/openxr/openxr.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++
++namespace device {
++
++class OpenXrGraphicsBindingVulkanTest : public ::testing::Test {
++ protected:
++  void SetUp() override {
++    helper_ = std::make_unique<OpenXrPlatformHelperLinux>();
++    ASSERT_TRUE(helper_->EnsureInitialized());
++  }
++
++  void TearDown() override {
++    if (xr_session_ != XR_NULL_HANDLE) {
++      xrDestroySession(xr_session_);
++    }
++    if (xr_instance_ != XR_NULL_HANDLE) {
++      helper_->DestroyInstance(xr_instance_);
++    }
++    helper_.reset();
++  }
++
++  bool CreateXrInstanceAndSystem() {
++    XrResult result = helper_->CreateInstance(&xr_instance_);
++    if (XR_FAILED(result)) {
++      return false;
++    }
++
++    XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
++    system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++    result = xrGetSystem(xr_instance_, &system_info, &system_id_);
++    return XR_SUCCEEDED(result);
++  }
++
++  bool InitializeBinding() {
++    binding_ = std::make_unique<OpenXrGraphicsBindingVulkan>(
++        helper_->GetExtensionEnumeration());
++    return binding_->Initialize(xr_instance_, system_id_);
++  }
++
++  bool CreateSession() {
++    const void* session_create_info = binding_->GetSessionCreateInfo();
++    if (!session_create_info) {
++      return false;
++    }
++
++    XrSessionCreateInfo create_info{XR_TYPE_SESSION_CREATE_INFO};
++    create_info.systemId = system_id_;
++    create_info.next = session_create_info;
++    XrResult result = xrCreateSession(xr_instance_, &create_info, &xr_session_);
++    return XR_SUCCEEDED(result);
++  }
++
++  std::unique_ptr<OpenXrPlatformHelperLinux> helper_;
++  std::unique_ptr<OpenXrGraphicsBindingVulkan> binding_;
++  XrInstance xr_instance_ = XR_NULL_HANDLE;
++  XrSystemId system_id_ = XR_NULL_SYSTEM_ID;
++  XrSession xr_session_ = XR_NULL_HANDLE;
++};
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, InitializeSucceeds) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++
++  auto binding = std::make_unique<OpenXrGraphicsBindingVulkan>(
++      helper_->GetExtensionEnumeration());
++
++  // Before initialization, the binding is not usable.
++  EXPECT_FALSE(binding->CanUseSharedImages());
++  EXPECT_EQ(binding->GetSessionCreateInfo(), nullptr);
++
++  // Initialize should succeed with the mock runtime and SwiftShader.
++  EXPECT_TRUE(binding->Initialize(xr_instance_, system_id_));
++  EXPECT_TRUE(binding->CanUseSharedImages());
++
++  // Verify the binding struct is populated.
++  const auto* info = static_cast<const XrGraphicsBindingVulkan2KHR*>(
++      binding->GetSessionCreateInfo());
++  ASSERT_NE(info, nullptr);
++  EXPECT_EQ(info->type, XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR);
++  EXPECT_NE(info->instance, VK_NULL_HANDLE);
++  EXPECT_NE(info->physicalDevice, VK_NULL_HANDLE);
++  EXPECT_NE(info->device, VK_NULL_HANDLE);
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, InitializeIdempotent) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++
++  auto binding = std::make_unique<OpenXrGraphicsBindingVulkan>(
++      helper_->GetExtensionEnumeration());
++
++  EXPECT_TRUE(binding->Initialize(xr_instance_, system_id_));
++
++  // Calling Initialize again should succeed (idempotent).
++  EXPECT_TRUE(binding->Initialize(xr_instance_, system_id_));
++  EXPECT_TRUE(binding->CanUseSharedImages());
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, DestructorCleansUp) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++
++  {
++    auto binding = std::make_unique<OpenXrGraphicsBindingVulkan>(
++        helper_->GetExtensionEnumeration());
++    ASSERT_TRUE(binding->Initialize(xr_instance_, system_id_));
++    // binding goes out of scope — destructor should clean up VkDevice/VkInstance
++    // without crashing.
++  }
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, GetSwapchainFormatReturnsSRGB) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++  ASSERT_TRUE(CreateSession());
++
++  // The mock returns VK_FORMAT_R8G8B8A8_SRGB (43) for Linux.
++  int64_t format = binding_->GetSwapchainFormat(xr_session_);
++  EXPECT_EQ(format, VK_FORMAT_R8G8B8A8_SRGB);
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, GetSwapchainFormatBeforeSession) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++
++  // Without a valid session, GetSwapchainFormat should return 0.
++  int64_t format = binding_->GetSwapchainFormat(XR_NULL_HANDLE);
++  EXPECT_EQ(format, 0);
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, SupportsLayersReturnsFalse) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++  EXPECT_FALSE(binding_->SupportsLayers());
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, GetMaxTextureSize) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++  gfx::Size max_size = binding_->GetMaxTextureSize();
++  EXPECT_GT(max_size.width(), 0);
++  EXPECT_GT(max_size.height(), 0);
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, CleanupWithoutSubmitDoesNotCrash) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++  // Should not crash.
++  binding_->CleanupWithoutSubmit();
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, SetOverlayTextureReturnsTrue) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++
++  gfx::GpuMemoryBufferHandle handle;
++  gpu::SyncToken sync_token;
++  gfx::RectF left(0, 0, 0.5f, 1.0f);
++  gfx::RectF right(0.5f, 0, 0.5f, 1.0f);
++
++  EXPECT_TRUE(binding_->SetOverlayTexture(std::move(handle), sync_token, left,
++                                           right));
++}
++
++TEST_F(OpenXrGraphicsBindingVulkanTest, CanCreateSession) {
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++
++  // Creating a session with the Vulkan binding should succeed.
++  EXPECT_TRUE(CreateSession());
++  EXPECT_NE(xr_session_, XR_NULL_HANDLE);
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_platform_helper_linux.cc b/device/vr/openxr/linux/openxr_platform_helper_linux.cc
+new file mode 100644
+index 0000000000000..d22be4d15e8ce
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_platform_helper_linux.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
++
++#include <utility>
++
++#include "base/logging.h"
++#include "device/vr/openxr/linux/openxr_graphics_binding_vulkan.h"
++#include "device/vr/openxr/openxr_api_wrapper.h"
++#include "device/vr/public/mojom/isolated_xr_service.mojom.h"
++#include "third_party/openxr/src/include/openxr/openxr.h"
++
++namespace device {
++
++OpenXrPlatformHelperLinux::OpenXrPlatformHelperLinux() = default;
++OpenXrPlatformHelperLinux::~OpenXrPlatformHelperLinux() = default;
++
++bool OpenXrPlatformHelperLinux::Initialize() {
++  // No platform-specific initialization is needed on Linux.
++  // The base class EnsureInitialized() will create extension_enumeration_
++  // by calling xrEnumerateInstanceExtensionProperties after this returns true.
++  return true;
++}
++
++std::unique_ptr<OpenXrGraphicsBinding>
++OpenXrPlatformHelperLinux::GetGraphicsBinding() {
++  return std::make_unique<OpenXrGraphicsBindingVulkan>(
++      GetExtensionEnumeration());
++}
++
++void OpenXrPlatformHelperLinux::GetPlatformCreateInfo(
++    const device::OpenXrCreateInfo& create_info,
++    PlatformCreateInfoReadyCallback result_callback,
++    PlatormInitiatedShutdownCallback /*shutdown_callback*/) {
++  // Linux has no platform-specific XrInstanceCreateInfo.next struct.
++  std::move(result_callback).Run(nullptr);
++}
++
++device::mojom::XRDeviceData OpenXrPlatformHelperLinux::GetXRDeviceData() {
++  device::mojom::XRDeviceData data;
++  data.is_ar_blend_mode_supported = false;
++  return data;
++}
++
++void OpenXrPlatformHelperLinux::PrepareForSessionShutdown(
++    base::OnceClosure shutdown_ready_callback) {
++  std::move(shutdown_ready_callback).Run();
++}
++
++XrResult OpenXrPlatformHelperLinux::CreateInstance(XrInstance* instance,
++                                                  void* create_info) {
++  // If a cached polling instance exists, destroy it before creating a new
++  // one for the session. The base class CHECKs xr_instance_ == NULL.
++  if (xr_instance_ != XR_NULL_HANDLE) {
++    DestroyInstance(xr_instance_);
++  }
++  return OpenXrPlatformHelper::CreateInstance(instance, create_info);
++}
++
++bool OpenXrPlatformHelperLinux::IsApiAvailable() {
++  // Reuse the cached instance if one already exists.
++  if (xr_instance_ != XR_NULL_HANDLE) {
++    return true;
++  }
++  // Create an instance and KEEP it alive for subsequent IsHardwareAvailable
++  // calls. This avoids creating/destroying an instance every 5 seconds.
++  // The instance is destroyed in CreateInstance() when a real session starts.
++  XrInstance instance = XR_NULL_HANDLE;
++  XrResult result =
++      OpenXrPlatformHelper::CreateInstance(&instance, nullptr);
++  // xr_instance_ is now set by the base class.
++  return XR_SUCCEEDED(result);
++}
++
++bool OpenXrPlatformHelperLinux::IsHardwareAvailable() {
++  // After a session ends, xr_instance_ is destroyed. Re-create a cached
++  // instance for polling, just like IsApiAvailable does at startup.
++  if (xr_instance_ == XR_NULL_HANDLE) {
++    XrInstance instance = XR_NULL_HANDLE;
++    if (XR_FAILED(OpenXrPlatformHelper::CreateInstance(&instance, nullptr))) {
++      return false;
++    }
++    // xr_instance_ is now set by the base class.
++  }
++  XrSystemId system;
++  return XR_SUCCEEDED(OpenXrApiWrapper::GetSystem(xr_instance_, &system));
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_platform_helper_linux.h b/device/vr/openxr/linux/openxr_platform_helper_linux.h
+new file mode 100644
+index 0000000000000..1df8da0bfcc49
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_platform_helper_linux.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DEVICE_VR_OPENXR_LINUX_OPENXR_PLATFORM_HELPER_LINUX_H_
++#define DEVICE_VR_OPENXR_LINUX_OPENXR_PLATFORM_HELPER_LINUX_H_
++
++#include <memory>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "device/vr/openxr/openxr_platform_helper.h"
++#include "device/vr/public/mojom/isolated_xr_service.mojom-forward.h"
++#include "device/vr/vr_export.h"
++
++namespace device {
++
++// Linux platform helper for OpenXR. Runs inside the isolated XR utility
++// process and talks to an externally-managed OpenXR runtime (Monado on
++// Linux) via the Khronos OpenXR loader.
++//
++// Unlike Windows, Linux does not need to cache the XrInstance as a leaky
++// singleton, and unlike Android, Linux does not need to call
++// xrInitializeLoaderKHR.
++class DEVICE_VR_EXPORT OpenXrPlatformHelperLinux : public OpenXrPlatformHelper {
++ public:
++  OpenXrPlatformHelperLinux();
++
++  OpenXrPlatformHelperLinux(const OpenXrPlatformHelperLinux&) = delete;
++  OpenXrPlatformHelperLinux& operator=(const OpenXrPlatformHelperLinux&) =
++      delete;
++
++  ~OpenXrPlatformHelperLinux() override;
++
++  // OpenXrPlatformHelper (pure virtuals):
++  std::unique_ptr<OpenXrGraphicsBinding> GetGraphicsBinding() override;
++  void GetPlatformCreateInfo(
++      const device::OpenXrCreateInfo& create_info,
++      PlatformCreateInfoReadyCallback result_callback,
++      PlatormInitiatedShutdownCallback shutdown_callback) override;
++  device::mojom::XRDeviceData GetXRDeviceData() override;
++  void PrepareForSessionShutdown(
++      base::OnceClosure shutdown_ready_callback) override;
++
++  // Parallel to OpenXrPlatformHelperWindows — not virtual on the base.
++  // Called from xr_runtime_provider.cc's Linux-specific block.
++  bool IsApiAvailable();
++  bool IsHardwareAvailable();
++
++  // Override to destroy any cached polling instance before creating a new
++  // session instance (base class CHECKs xr_instance_ == NULL).
++  using OpenXrPlatformHelper::CreateInstance;  // unhide 1-arg overload
++  XrResult CreateInstance(XrInstance* instance, void* create_info) override;
++
++ protected:
++  // OpenXrPlatformHelper:
++  bool Initialize() override;
++};
++
++}  // namespace device
++
++#endif  // DEVICE_VR_OPENXR_LINUX_OPENXR_PLATFORM_HELPER_LINUX_H_
+diff --git a/device/vr/openxr/linux/openxr_platform_helper_linux_statics.cc b/device/vr/openxr/linux/openxr_platform_helper_linux_statics.cc
+new file mode 100644
+index 0000000000000..a4b2b7c24d8b2
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_platform_helper_linux_statics.cc
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Linux-specific implementations of static methods on OpenXrPlatformHelper
++// and OpenXrGraphicsBinding that are called during xrCreateInstance.
++// Mirrors device/vr/openxr/android/openxr_platform_helper_android_statics.cc.
++
++#include "device/vr/openxr/openxr_graphics_binding.h"
++#include "device/vr/openxr/openxr_platform_helper.h"
++
++namespace device {
++
++// static
++void OpenXrPlatformHelper::GetRequiredExtensions(
++    std::vector<const char*>& extensions) {
++  // Linux has no platform-specific required extensions for xrCreateInstance.
++  // (Android requires XR_KHR_android_create_instance here; Windows
++  // conditionally requires XR_EXT_win32_appcontainer_compatible.)
++}
++
++// static
++std::vector<const char*> OpenXrPlatformHelper::GetOptionalExtensions() {
++  // No Linux-specific optional platform extensions.
++  return {};
++}
++
++// static
++void OpenXrGraphicsBinding::GetRequiredExtensions(
++    std::vector<const char*>& extensions) {
++  extensions.push_back("XR_KHR_vulkan_enable2");
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_platform_helper_linux_unittest.cc b/device/vr/openxr/linux/openxr_platform_helper_linux_unittest.cc
+new file mode 100644
+index 0000000000000..14f9b34fd118e
+--- /dev/null
++++ b/device/vr/openxr/linux/openxr_platform_helper_linux_unittest.cc
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/test/bind.h"
++#include "device/vr/openxr/openxr_graphics_binding.h"
++#include "device/vr/openxr/openxr_platform_helper.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace device {
++
++TEST(OpenXrPlatformHelperLinuxTest, EnsureInitializedSucceeds) {
++  OpenXrPlatformHelperLinux helper;
++  EXPECT_TRUE(helper.EnsureInitialized());
++  EXPECT_NE(helper.GetExtensionEnumeration(), nullptr);
++}
++
++TEST(OpenXrPlatformHelperLinuxTest, GetPlatformCreateInfoCallbackWithNull) {
++  OpenXrPlatformHelperLinux helper;
++  bool ran = false;
++  void* captured = reinterpret_cast<void*>(0xDEAD);
++  helper.GetPlatformCreateInfo(
++      OpenXrCreateInfo{},
++      base::BindLambdaForTesting([&](void* info) {
++        ran = true;
++        captured = info;
++      }),
++      base::DoNothing());
++  EXPECT_TRUE(ran);
++  EXPECT_EQ(captured, nullptr);
++}
++
++TEST(OpenXrPlatformHelperLinuxTest, GetGraphicsBindingReturnsVulkan) {
++  OpenXrPlatformHelperLinux helper;
++  ASSERT_TRUE(helper.EnsureInitialized());
++  auto binding = helper.GetGraphicsBinding();
++  ASSERT_NE(binding, nullptr)
++      << "GetGraphicsBinding must never return null (spec §5.1)";
++  // Vulkan binding's CanUseSharedImages() returns false until Initialize()
++  // is called (initialized_ starts false). This just verifies we get a
++  // non-null binding object.
++}
++
++TEST(OpenXrPlatformHelperLinuxTest, PrepareForSessionShutdownRunsCallback) {
++  OpenXrPlatformHelperLinux helper;
++  bool ran = false;
++  helper.PrepareForSessionShutdown(
++      base::BindLambdaForTesting([&]() { ran = true; }));
++  EXPECT_TRUE(ran);
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/openxr_platform.h b/device/vr/openxr/openxr_platform.h
+index a0158be7f93c8..260b69d81026c 100644
+--- a/device/vr/openxr/openxr_platform.h
++++ b/device/vr/openxr/openxr_platform.h
+@@ -21,6 +21,8 @@
+ #elif BUILDFLAG(IS_ANDROID)
+ #include <EGL/egl.h>
+ #include <jni.h>
++#elif BUILDFLAG(IS_LINUX)
++#include <vulkan/vulkan_core.h>
+ #endif
+ 
+ #include "third_party/openxr/src/include/openxr/openxr_platform.h"
+diff --git a/device/vr/openxr/openxr_render_loop.h b/device/vr/openxr/openxr_render_loop.h
+index e7c492c915a22..16c3ca1884cd5 100644
+--- a/device/vr/openxr/openxr_render_loop.h
++++ b/device/vr/openxr/openxr_render_loop.h
+@@ -38,7 +38,7 @@
+ #include "third_party/openxr/src/include/openxr/openxr.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+ #include "base/threading/thread.h"
+ #endif
+ 
+@@ -65,14 +65,12 @@ class XRThread : public base::android::JavaHandlerThread {
+       : base::android::JavaHandlerThread(name) {}
+   ~XRThread() override = default;
+ };
+-#elif BUILDFLAG(IS_WIN)
++#elif BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+ class XRThread : public base::Thread {
+  public:
+   explicit XRThread(const char* name) : base::Thread(name) {}
+   ~XRThread() override = default;
+ };
+-#else
+-#error "Trying to build OpenXR for an unsupported platform"
+ #endif
+ 
+ class OpenXrRenderLoop : public XRThread,
+diff --git a/device/vr/openxr/openxr_swapchain_info.cc b/device/vr/openxr/openxr_swapchain_info.cc
+index 42dcb4cffcf58..233e71fe77bbc 100644
+--- a/device/vr/openxr/openxr_swapchain_info.cc
++++ b/device/vr/openxr/openxr_swapchain_info.cc
+@@ -17,8 +17,13 @@ OpenXrSwapchainInfo::OpenXrSwapchainInfo(ID3D11Texture2D* d3d11_texture)
+ #elif BUILDFLAG(IS_ANDROID)
+ OpenXrSwapchainInfo::OpenXrSwapchainInfo(uint32_t texture)
+     : openxr_texture(texture) {}
++#elif BUILDFLAG(IS_LINUX)
++OpenXrSwapchainInfo::OpenXrSwapchainInfo(VkImage vk_image)
++    : vk_image(vk_image) {}
+ #endif
+ 
++OpenXrSwapchainInfo::OpenXrSwapchainInfo() = default;
++
+ OpenXrSwapchainInfo::~OpenXrSwapchainInfo() {
+   // If shared images are being used, the mailbox holder should have been
+   // cleared before destruction, either due to the context provider being lost
+diff --git a/device/vr/openxr/openxr_swapchain_info.h b/device/vr/openxr/openxr_swapchain_info.h
+index 667bb98f38383..42f1a7a5cd4d1 100644
+--- a/device/vr/openxr/openxr_swapchain_info.h
++++ b/device/vr/openxr/openxr_swapchain_info.h
+@@ -19,6 +19,10 @@
+ #include "ui/gl/scoped_egl_image.h"
+ #endif
+ 
++#if BUILDFLAG(IS_LINUX)
++#include <vulkan/vulkan_core.h>
++#endif
++
+ namespace device {
+ 
+ // TODO(crbug.com/40909689): Refactor this class.
+@@ -28,6 +32,8 @@ struct OpenXrSwapchainInfo {
+   explicit OpenXrSwapchainInfo(ID3D11Texture2D*);
+ #elif BUILDFLAG(IS_ANDROID)
+   explicit OpenXrSwapchainInfo(uint32_t texture);
++#elif BUILDFLAG(IS_LINUX)
++  explicit OpenXrSwapchainInfo(VkImage vk_image);
+ #endif
+   OpenXrSwapchainInfo();
+   virtual ~OpenXrSwapchainInfo();
+@@ -49,6 +55,9 @@ struct OpenXrSwapchainInfo {
+   // texture prior to submission.
+   Microsoft::WRL::ComPtr<ID3D11Texture2D> d3d11_shared_texture = nullptr;
+   Microsoft::WRL::ComPtr<ID3D11Fence> d3d11_fence;
++#elif BUILDFLAG(IS_LINUX)
++  // The Vulkan image handle from the OpenXR swapchain.
++  VkImage vk_image = VK_NULL_HANDLE;
+ #elif BUILDFLAG(IS_ANDROID)
+   // Ideally this would be a gluint, but there are conflicting headers for GL
+   // depending on *how* you want to use it; so we can't use it at the moment.
+diff --git a/device/vr/openxr/openxr_view_configuration.cc b/device/vr/openxr/openxr_view_configuration.cc
+index 653011bf0d448..03ca48ad2e27d 100644
+--- a/device/vr/openxr/openxr_view_configuration.cc
++++ b/device/vr/openxr/openxr_view_configuration.cc
+@@ -67,9 +67,10 @@ uint32_t OpenXrViewProperties::ClampHeight(uint32_t val) const {
+ }
+ 
+ uint32_t OpenXrViewProperties::Width() const {
+-  // TODO(crbug.com/40918787):Windows cannot support framebuffer scaling, so
+-  // must use the recommended size.
+-  if constexpr (BUILDFLAG(IS_WIN)) {
++  // TODO(crbug.com/40918787): Windows and Linux cannot support framebuffer
++  // scaling, so must use the recommended size. Android uses max size with
++  // framebuffer scaling.
++  if constexpr (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)) {
+     return ClampWidth(xr_properties_.recommendedImageRectWidth);
+   } else {
+     return ClampWidth(xr_properties_.maxImageRectWidth);
+@@ -77,9 +78,10 @@ uint32_t OpenXrViewProperties::Width() const {
+ }
+ 
+ uint32_t OpenXrViewProperties::Height() const {
+-  // TODO(crbug.com/40918787):Windows cannot support framebuffer scaling, so
+-  // must use the recommended size.
+-  if constexpr (BUILDFLAG(IS_WIN)) {
++  // TODO(crbug.com/40918787): Windows and Linux cannot support framebuffer
++  // scaling, so must use the recommended size. Android uses max size with
++  // framebuffer scaling.
++  if constexpr (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)) {
+     return ClampHeight(xr_properties_.recommendedImageRectHeight);
+   } else {
+     return ClampHeight(xr_properties_.maxImageRectHeight);
+diff --git a/device/vr/openxr/test/fake_openxr_impl_api.cc b/device/vr/openxr/test/fake_openxr_impl_api.cc
+index a14869560c744..545c87de07596 100644
+--- a/device/vr/openxr/test/fake_openxr_impl_api.cc
++++ b/device/vr/openxr/test/fake_openxr_impl_api.cc
+@@ -13,11 +13,23 @@
+ #include <wrl.h>
+ #endif
+ 
++#if BUILDFLAG(IS_LINUX)
++#include <vector>
++#endif
++
+ namespace {
+ // Global test helper that communicates with the test and contains the mock
+ // OpenXR runtime state/properties. A reference to this is returned as the
+ // instance handle through xrCreateInstance.
+ OpenXrTestHelper g_test_helper;
++
++#if BUILDFLAG(IS_LINUX)
++// Stored from xrCreateVulkanInstanceKHR so that xrGetVulkanGraphicsDevice2KHR
++// and xrCreateVulkanDeviceKHR can resolve Vulkan functions without receiving
++// the VkInstance/pfnGetInstanceProcAddr directly.
++PFN_vkGetInstanceProcAddr g_pfn_get_instance_proc_addr = nullptr;
++VkInstance g_vk_instance = VK_NULL_HANDLE;
++#endif
+ }  // namespace
+ 
+ // Extension methods
+@@ -285,6 +297,25 @@ XrResult xrCreateSession(XrInstance instance,
+             "D3D11Device is nullptr");
+ 
+   g_test_helper.SetD3DDevice(binding->device);
++#elif BUILDFLAG(IS_LINUX)
++  // Linux supports headless sessions (next == nullptr) and Vulkan-bound
++  // sessions (next points to XrGraphicsBindingVulkan2KHR).
++  if (create_info->next != nullptr) {
++    const XrGraphicsBindingVulkan2KHR* binding =
++        static_cast<const XrGraphicsBindingVulkan2KHR*>(create_info->next);
++    RETURN_IF(binding->type != XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
++              XR_ERROR_VALIDATION_FAILURE,
++              "xrCreateSession next has unexpected type for Linux");
++    RETURN_IF(binding->instance == VK_NULL_HANDLE,
++              XR_ERROR_VALIDATION_FAILURE,
++              "XrGraphicsBindingVulkan2KHR instance is VK_NULL_HANDLE");
++    RETURN_IF(binding->physicalDevice == VK_NULL_HANDLE,
++              XR_ERROR_VALIDATION_FAILURE,
++              "XrGraphicsBindingVulkan2KHR physicalDevice is VK_NULL_HANDLE");
++    RETURN_IF(binding->device == VK_NULL_HANDLE,
++              XR_ERROR_VALIDATION_FAILURE,
++              "XrGraphicsBindingVulkan2KHR device is VK_NULL_HANDLE");
++  }
+ #elif BUILDFLAG(IS_ANDROID)
+   const XrGraphicsBindingOpenGLESAndroidKHR* binding =
+       static_cast<const XrGraphicsBindingOpenGLESAndroidKHR*>(
+@@ -693,6 +724,9 @@ XrResult xrEnumerateSwapchainFormats(XrSession session,
+ #elif BUILDFLAG(IS_ANDROID)
+   // This is what is hardcoded in `OpenXrGraphicsBindingOpenGLES`.
+   formats[0] = OpenXrTestHelper::kSwapchainFormat;
++#elif BUILDFLAG(IS_LINUX)
++  // VK_FORMAT_R8G8B8A8_SRGB = 43
++  formats[0] = 43;
+ #endif
+ 
+   return XR_SUCCESS;
+@@ -766,6 +800,23 @@ XrResult xrEnumerateSwapchainImages(XrSwapchain swapchain,
+ 
+     image.image = texture_ids[i];
+   }
++#elif BUILDFLAG(IS_LINUX)
++  // SAFETY: Test-only implementation of a C-Style API that thus has to provide
++  // arrays as a pointer and a size. The sole callers are our own product/test
++  // code.
++  auto images_span = UNSAFE_BUFFERS(
++      base::span(reinterpret_cast<XrSwapchainImageVulkan2KHR*>(images),
++                 image_capacity_input));
++  for (uint32_t i = 0; i < image_capacity_input; i++) {
++    XrSwapchainImageVulkan2KHR& image = images_span[i];
++    RETURN_IF(image.type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR,
++              XR_ERROR_VALIDATION_FAILURE,
++              "XrSwapchainImageVulkan2KHR type invalid");
++    // SwiftShader cannot create real VkImages in the mock without a full
++    // rendering setup. Return VK_NULL_HANDLE — EnumerateSwapchainImages and
++    // CreateSharedImages handle null images gracefully.
++    image.image = VK_NULL_HANDLE;
++  }
+ #endif
+ 
+   return XR_SUCCESS;
+@@ -1309,6 +1360,129 @@ XrResult xrWaitSwapchainImage(XrSwapchain swapchain,
+   return XR_SUCCESS;
+ }
+ 
++#if BUILDFLAG(IS_LINUX)
++// --- XR_KHR_vulkan_enable2 pass-through implementations ----------------------
++// These forward Vulkan creation calls to the real Vulkan loader so that unit
++// tests can work with actual VkInstance/VkDevice handles (via SwiftShader).
++
++XrResult xrGetVulkanGraphicsRequirements2KHR(
++    XrInstance instance,
++    XrSystemId systemId,
++    XrGraphicsRequirementsVulkanKHR* graphicsRequirements) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(g_test_helper.ValidateInstance(instance));
++  RETURN_IF_XR_FAILED(g_test_helper.ValidateSystemId(systemId));
++  RETURN_IF(graphicsRequirements == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "graphicsRequirements is nullptr");
++  graphicsRequirements->type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR;
++  graphicsRequirements->next = nullptr;
++  graphicsRequirements->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
++  graphicsRequirements->maxApiVersionSupported = XR_MAKE_VERSION(1, 3, 0);
++  return XR_SUCCESS;
++}
++
++XrResult xrCreateVulkanInstanceKHR(
++    XrInstance instance,
++    const XrVulkanInstanceCreateInfoKHR* createInfo,
++    VkInstance* vulkanInstance,
++    VkResult* vulkanResult) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(g_test_helper.ValidateInstance(instance));
++  RETURN_IF(createInfo == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "createInfo is nullptr");
++  RETURN_IF(vulkanInstance == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "vulkanInstance is nullptr");
++  RETURN_IF(vulkanResult == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "vulkanResult is nullptr");
++  RETURN_IF(!createInfo->pfnGetInstanceProcAddr, XR_ERROR_VALIDATION_FAILURE,
++            "pfnGetInstanceProcAddr is null");
++
++  // Stash the getter so xrGetVulkanGraphicsDevice2KHR can use it later.
++  g_pfn_get_instance_proc_addr = createInfo->pfnGetInstanceProcAddr;
++
++  auto pfn_create_instance = reinterpret_cast<PFN_vkCreateInstance>(
++      createInfo->pfnGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
++  if (!pfn_create_instance) {
++    *vulkanResult = VK_ERROR_INITIALIZATION_FAILED;
++    return XR_ERROR_RUNTIME_FAILURE;
++  }
++  *vulkanResult = pfn_create_instance(createInfo->vulkanCreateInfo,
++                                      createInfo->vulkanAllocator,
++                                      vulkanInstance);
++  if (*vulkanResult == VK_SUCCESS) {
++    g_vk_instance = *vulkanInstance;
++  }
++  return (*vulkanResult == VK_SUCCESS) ? XR_SUCCESS : XR_ERROR_RUNTIME_FAILURE;
++}
++
++XrResult xrGetVulkanGraphicsDevice2KHR(
++    XrInstance instance,
++    const XrVulkanGraphicsDeviceGetInfoKHR* getInfo,
++    VkPhysicalDevice* vulkanPhysicalDevice) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(g_test_helper.ValidateInstance(instance));
++  RETURN_IF(getInfo == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "getInfo is nullptr");
++  RETURN_IF(vulkanPhysicalDevice == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "vulkanPhysicalDevice is nullptr");
++  RETURN_IF(!g_pfn_get_instance_proc_addr, XR_ERROR_RUNTIME_FAILURE,
++            "vkGetInstanceProcAddr not available — call "
++            "xrCreateVulkanInstanceKHR first");
++
++  auto pfn_enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
++      g_pfn_get_instance_proc_addr(getInfo->vulkanInstance,
++                                   "vkEnumeratePhysicalDevices"));
++  if (!pfn_enumerate) {
++    return XR_ERROR_RUNTIME_FAILURE;
++  }
++
++  uint32_t count = 0;
++  pfn_enumerate(getInfo->vulkanInstance, &count, nullptr);
++  if (count == 0) {
++    return XR_ERROR_RUNTIME_FAILURE;
++  }
++
++  std::vector<VkPhysicalDevice> devices(count);
++  pfn_enumerate(getInfo->vulkanInstance, &count, devices.data());
++  *vulkanPhysicalDevice = devices[0];
++  return XR_SUCCESS;
++}
++
++XrResult xrCreateVulkanDeviceKHR(
++    XrInstance instance,
++    const XrVulkanDeviceCreateInfoKHR* createInfo,
++    VkDevice* vulkanDevice,
++    VkResult* vulkanResult) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(g_test_helper.ValidateInstance(instance));
++  RETURN_IF(createInfo == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "createInfo is nullptr");
++  RETURN_IF(vulkanDevice == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "vulkanDevice is nullptr");
++  RETURN_IF(vulkanResult == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "vulkanResult is nullptr");
++  RETURN_IF(!createInfo->pfnGetInstanceProcAddr, XR_ERROR_VALIDATION_FAILURE,
++            "pfnGetInstanceProcAddr is null");
++
++  // vkCreateDevice is an instance-level function that requires a valid
++  // VkInstance to resolve via vkGetInstanceProcAddr. Use the VkInstance
++  // stored from xrCreateVulkanInstanceKHR.
++  auto pfn_create_device = reinterpret_cast<PFN_vkCreateDevice>(
++      createInfo->pfnGetInstanceProcAddr(g_vk_instance, "vkCreateDevice"));
++  if (!pfn_create_device) {
++    *vulkanResult = VK_ERROR_INITIALIZATION_FAILED;
++    return XR_ERROR_RUNTIME_FAILURE;
++  }
++  *vulkanResult = pfn_create_device(createInfo->vulkanPhysicalDevice,
++                                    createInfo->vulkanCreateInfo,
++                                    createInfo->vulkanAllocator,
++                                    vulkanDevice);
++  return (*vulkanResult == VK_SUCCESS) ? XR_SUCCESS : XR_ERROR_RUNTIME_FAILURE;
++}
++
++// --- end XR_KHR_vulkan_enable2 -----------------------------------------------
++#endif  // BUILDFLAG(IS_LINUX)
++
+ // Getter for extension methods. Casts the correct function dynamically based on
+ // the method name provided.
+ // Please add new OpenXR APIs below in alphabetical order.
+@@ -1352,6 +1526,12 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+   TRY_LOAD_METHOD(xrEnumerateViewConfigurationViews);
+ #if BUILDFLAG(IS_WIN)
+   TRY_LOAD_METHOD(xrGetD3D11GraphicsRequirementsKHR);
++#endif
++#if BUILDFLAG(IS_LINUX)
++  TRY_LOAD_METHOD(xrCreateVulkanDeviceKHR);
++  TRY_LOAD_METHOD(xrCreateVulkanInstanceKHR);
++  TRY_LOAD_METHOD(xrGetVulkanGraphicsDevice2KHR);
++  TRY_LOAD_METHOD(xrGetVulkanGraphicsRequirements2KHR);
+ #endif
+   TRY_LOAD_METHOD(xrGetActionStateFloat);
+   TRY_LOAD_METHOD(xrGetActionStateBoolean);
+diff --git a/device/vr/openxr/test/openxr_linux.json b/device/vr/openxr/test/openxr_linux.json
+new file mode 100644
+index 0000000000000..318286b7e6292
+--- /dev/null
++++ b/device/vr/openxr/test/openxr_linux.json
+@@ -0,0 +1,6 @@
++{
++  "file_format_version": "1.0.0",
++  "runtime": {
++    "library_path": "../../../libmockopenxrruntime.so"
++  }
++}
+diff --git a/device/vr/openxr/test/openxr_test_helper.cc b/device/vr/openxr/test/openxr_test_helper.cc
+index 99c03c8ecb50a..3075e7f1be59d 100644
+--- a/device/vr/openxr/test/openxr_test_helper.cc
++++ b/device/vr/openxr/test/openxr_test_helper.cc
+@@ -28,7 +28,8 @@ bool PathContainsString(const std::string& path, const std::string& s) {
+   return path.contains(s);
+ }
+ 
+-device::XrEye GetEyeForIndex(uint32_t index, uint32_t num_views) {
++[[maybe_unused]] device::XrEye GetEyeForIndex(uint32_t index,
++                                               uint32_t num_views) {
+   DCHECK_LE(num_views, 2u);
+ 
+   if (num_views == 1) {
+@@ -76,6 +77,11 @@ const std::vector<const char*>& OpenXrTestHelper::GetSupportedExtensions() {
+       XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
+       XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME,
+       XR_KHR_COMPOSITION_LAYER_CUBE_EXTENSION_NAME,
++#elif BUILDFLAG(IS_LINUX)
++      // Headless sessions on Linux use XR_MND_headless.
++      "XR_MND_headless",
++      // Vulkan graphics binding for Linux sessions.
++      XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
+ #endif
+   });
+   return *kExtensions;
+@@ -951,8 +957,10 @@ void OpenXrTestHelper::CreateTextures(XrSwapchain swapchain) {
+   } else {
+     xr_gl_->glBindTexture_fn(GL_TEXTURE_2D, 0);
+   }
+-#endif
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID)
+ }
++#endif
+ 
+ #if BUILDFLAG(IS_WIN)
+ void OpenXrTestHelper::SetD3DDevice(ID3D11Device* d3d_device) {
+@@ -1195,11 +1203,14 @@ uint32_t OpenXrTestHelper::NextSwapchainImageIndex(XrSwapchain swapchain) {
+   acquired_swapchain_texture_ =
+       (acquired_swapchain_texture_ + 1) % textures_arr_.size();
+   return acquired_swapchain_texture_;
+-#else
++#elif BUILDFLAG(IS_ANDROID)
+   acquired_swapchain_textures_[swapchain] =
+       (acquired_swapchain_textures_[swapchain] + 1) %
+       opengl_es_textures_arrays_[swapchain].size();
+   return acquired_swapchain_textures_[swapchain];
++#else
++  // Linux: swapchain image management is not yet implemented.
++  return 0;
+ #endif
+ }
+ 
+diff --git a/device/vr/public/cpp/features.cc b/device/vr/public/cpp/features.cc
+index 55ecf208cfde4..93db000d0d64d 100644
+--- a/device/vr/public/cpp/features.cc
++++ b/device/vr/public/cpp/features.cc
+@@ -45,8 +45,9 @@ BASE_FEATURE(kWebXrVisibleBlurred, base::FEATURE_ENABLED_BY_DEFAULT);
+ #if BUILDFLAG(ENABLE_OPENXR)
+ // Controls WebXR support for the OpenXR Runtime.
+ BASE_FEATURE(kOpenXR,
+-             BUILDFLAG(IS_WIN) ? base::FEATURE_ENABLED_BY_DEFAULT
+-                               : base::FEATURE_DISABLED_BY_DEFAULT);
++             (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
++                 ? base::FEATURE_ENABLED_BY_DEFAULT
++                 : base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Controls whether the OpenXr runtime is allowed to try to use the spatial
+ // entities framework.
+diff --git a/third_party/openxr/BUILD.gn b/third_party/openxr/BUILD.gn
+index 8f01ec5c96294..96c84d926fa5d 100644
+--- a/third_party/openxr/BUILD.gn
++++ b/third_party/openxr/BUILD.gn
+@@ -214,7 +214,7 @@ if (enable_openxr) {
+         "XR_USE_PLATFORM_WIN32",
+         "XR_USE_GRAPHICS_API_D3D11",
+       ]
+-    } else {
++    } else if (is_android) {
+       defines = [
+         "XRLOADER_DISABLE_EXCEPTION_HANDLING",
+         "XR_KHR_LOADER_INIT_SUPPORT",
+@@ -222,6 +222,12 @@ if (enable_openxr) {
+         "XR_USE_PLATFORM_ANDROID",
+         "XR_USE_GRAPHICS_API_OPENGL_ES",
+       ]
++    } else if (is_linux) {
++      defines = [
++        "XRLOADER_DISABLE_EXCEPTION_HANDLING",
++        "XR_OS_LINUX",
++        "XR_USE_GRAPHICS_API_VULKAN",
++      ]
+     }
+   }
+ }
+-- 
+2.51.0
+

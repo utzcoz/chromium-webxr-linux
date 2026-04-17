@@ -1,0 +1,182 @@
+<!doctype html>
+<!-- One-stop manual test for WebXR-over-OpenXR on Linux.
+     Covers two things in one page:
+       1. Main WebXR: Enter VR → immersive-vr session → stereo
+          clear-color frame (verifies projection-layer rendering).
+       2. Browser overlay: while a session is active, the Permission
+          and Capture buttons trigger Chromium UI that should render
+          as a small stereo quad in each eye.
+     The on-page log records every event so you can correlate what the
+     page asked for with what the headset actually displays. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebXR test (VR + overlay)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2em auto; line-height: 1.4; }
+  button { display: block; margin: 6px 0; padding: 10px 14px; font-size: 15px; min-width: 260px; }
+  #log { background:#111; color:#0f0; font-family:monospace; white-space:pre-wrap;
+         padding:10px; margin-top:1em; min-height:180px; }
+  .section { border-top:1px solid #ccc; margin-top:1em; padding-top:1em; }
+  .status { font-weight:bold; }
+  .ok { color:#080; } .bad { color:#a00; }
+</style>
+</head>
+<body>
+<h1>WebXR test — VR session + browser overlay</h1>
+<p>This page tests both halves of the Linux patch in one place:</p>
+<ol>
+  <li><b>Main WebXR:</b> click <b>Enter VR</b>; the headset should show
+    a solid dark-blue frame (the clear-color).</li>
+  <li><b>Browser overlay:</b> while still in VR, click any Permission
+    or Capture button on the desktop. The Chromium prompt should appear
+    as a small stereo quad near the bottom of each eye.</li>
+</ol>
+<p>The on-page log records every event for correlation. If nothing
+  appears in the headset, the log plus the --vmodule output tells you
+  which layer failed.</p>
+
+<p id="support" class="status bad">Checking WebXR support...</p>
+
+<div class="section">
+  <h2>Session</h2>
+  <button id="enter">Enter VR</button>
+  <button id="exit" disabled>Exit VR</button>
+</div>
+
+<div class="section">
+  <h2>Permission prompts</h2>
+  <button data-perm="geolocation">Request geolocation</button>
+  <button data-perm="camera">Request camera</button>
+  <button data-perm="microphone">Request microphone</button>
+  <button data-perm="notifications">Request notifications</button>
+</div>
+
+<div class="section">
+  <h2>Capture / media picker</h2>
+  <button id="gum-audio">getUserMedia({audio:true})</button>
+  <button id="gum-video">getUserMedia({video:true})</button>
+  <button id="gdm">getDisplayMedia (screen picker)</button>
+  <button id="stop-capture" disabled>Stop all capture</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+  const $  = (s) => document.querySelector(s);
+  const log = (msg) => {
+    const t = new Date().toISOString().substring(11, 23);
+    $("#log").textContent += `[${t}] ${msg}\n`;
+    $("#log").scrollTop = $("#log").scrollHeight;
+  };
+
+  let session = null;
+  let refSpace = null;
+  let rafId = 0;
+  let streams = [];
+
+  // --- XR support check ---------------------------------------------------
+  if (!("xr" in navigator)) {
+    $("#support").textContent = "navigator.xr not available.";
+  } else {
+    navigator.xr.isSessionSupported("immersive-vr").then((supported) => {
+      if (supported) {
+        $("#support").textContent = "immersive-vr supported.";
+        $("#support").className = "status ok";
+      } else {
+        $("#support").textContent = "immersive-vr NOT supported.";
+      }
+    });
+  }
+
+  // --- Session control ----------------------------------------------------
+  $("#enter").onclick = async () => {
+    try {
+      session = await navigator.xr.requestSession("immersive-vr", {
+        optionalFeatures: ["local-floor"]
+      });
+      log("session started");
+      $("#enter").disabled = true;
+      $("#exit").disabled = false;
+      session.addEventListener("end", () => {
+        log("session ended");
+        $("#enter").disabled = false;
+        $("#exit").disabled = true;
+        session = null;
+      });
+
+      const canvas = document.createElement("canvas");
+      const gl = canvas.getContext("webgl", { xrCompatible: true });
+      const layer = new XRWebGLLayer(session, gl);
+      session.updateRenderState({ baseLayer: layer });
+      refSpace = await session.requestReferenceSpace("local");
+
+      const onXRFrame = (t, frame) => {
+        const sess = frame.session;
+        rafId = sess.requestAnimationFrame(onXRFrame);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, sess.renderState.baseLayer.framebuffer);
+        gl.clearColor(0.05, 0.1, 0.2, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      };
+      session.requestAnimationFrame(onXRFrame);
+    } catch (e) {
+      log("requestSession failed: " + e);
+    }
+  };
+
+  $("#exit").onclick = () => session && session.end();
+
+  // --- Permission prompts -------------------------------------------------
+  document.querySelectorAll("[data-perm]").forEach(b => {
+    b.onclick = async () => {
+      const perm = b.dataset.perm;
+      log(`requesting permission: ${perm} (in_vr=${!!session})`);
+      try {
+        if (perm === "geolocation") {
+          await new Promise((ok, err) =>
+            navigator.geolocation.getCurrentPosition(ok, err,
+              { timeout: 10000 }));
+          log(`${perm}: granted`);
+        } else if (perm === "notifications") {
+          log(`${perm}: ` + await Notification.requestPermission());
+        } else {
+          const s = await navigator.mediaDevices.getUserMedia(
+            perm === "camera" ? { video: true } : { audio: true });
+          s.getTracks().forEach(t => t.stop());
+          log(`${perm}: granted, track stopped`);
+        }
+      } catch (e) {
+        log(`${perm}: error ${e.message || e}`);
+      }
+    };
+  });
+
+  // --- Capture ------------------------------------------------------------
+  const startStream = async (constraints, label) => {
+    log(`${label}: starting (in_vr=${!!session})`);
+    try {
+      const fn = label === "gdm"
+        ? navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices)
+        : navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      const s = await fn(constraints);
+      streams.push(s);
+      log(`${label}: started, ${s.getTracks().length} tracks live`);
+      $("#stop-capture").disabled = false;
+    } catch (e) {
+      log(`${label}: error ${e.message || e}`);
+    }
+  };
+
+  $("#gum-audio").onclick = () => startStream({ audio: true }, "gum-audio");
+  $("#gum-video").onclick = () => startStream({ video: true }, "gum-video");
+  $("#gdm").onclick       = () => startStream({ video: true }, "gdm");
+
+  $("#stop-capture").onclick = () => {
+    streams.forEach(s => s.getTracks().forEach(t => t.stop()));
+    streams = [];
+    $("#stop-capture").disabled = true;
+    log("capture: all streams stopped");
+  };
+</script>
+</body>
+</html>
