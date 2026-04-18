@@ -41,22 +41,18 @@ WebXR in Chromium has a fixed top half that is the same on every
 platform, and a platform-specific bottom half under `device/vr/` that
 drives the actual XR runtime:
 
-```
-             Blink  (navigator.xr)                         <-- spec surface
-                    |
-                    | Mojo (blink.mojom.VRService)
-                    v
-     content/browser/xr  ·  XRRuntimeManagerImpl           <-- picks a runtime
-                    |
-                    | Mojo (device.mojom.XRRuntime)
-                    v
-     content/services/isolated_xr_device                   <-- utility process
-                    |
-                    v
-     device/vr/<runtime>                                    <-- platform backend
-                    |
-                    v
-        native XR runtime (D3D11 / GLES / Vulkan / …)
+```mermaid
+flowchart TB
+    Blink["Blink — navigator.xr<br/><i>spec surface</i>"]
+    Browser["content/browser/xr — XRRuntimeManagerImpl<br/><i>picks a runtime</i>"]
+    Utility["content/services/isolated_xr_device<br/><i>utility process</i>"]
+    Backend["device/vr/&lt;runtime&gt;<br/><i>platform backend</i>"]
+    Native["Native XR runtime<br/>D3D11 · GLES · Vulkan · …"]
+
+    Blink -->|Mojo: blink.mojom.VRService| Browser
+    Browser -->|Mojo: device.mojom.XRRuntime| Utility
+    Utility --> Backend
+    Backend --> Native
 ```
 
 Platform → runtime matrix:
@@ -153,21 +149,23 @@ sequenceDiagram
     MN->>HMD: present
 ```
 
-A plain-text fallback of the same picture:
+Data-flow angle (who hands what to whom):
 
-```
-  Renderer  <-- mojo WebXR -->  Browser  <-- mojo xr-device -->  Utility
-     |                                                             ^  |
-     | GL draws into SharedImage                                   /   |
-     v                                                            /    |
-    GPU  <---- DMA-BUF (shared memory) + sync FD ----------------+    |
-                                                                      |
-                                                     OpenXR loader    |
-                                                     XR_KHR_vulkan_   v
-                                                     enable2       monado-service
-                                                                      |
-                                                                      v
-                                                                     HMD
+```mermaid
+flowchart LR
+    Blink["Renderer<br/>Blink · WebGL"]
+    Browser["Browser<br/>XRRuntimeManagerImpl"]
+    GPU["GPU process<br/>SharedImage"]
+    Utility["Utility<br/>Vulkan + OpenXR"]
+    Monado["monado-service"]
+    HMD(["HMD"])
+
+    Blink <-->|mojo WebXR| Browser
+    Browser <-->|mojo xr-device| Utility
+    Blink -->|GL draws into<br/>SharedImage| GPU
+    GPU -->|DMA-BUF + sync FD| Utility
+    Utility -->|OpenXR loader<br/>XR_KHR_vulkan_enable2| Monado
+    Monado --> HMD
 ```
 
 ## Base commits
