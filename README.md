@@ -57,12 +57,12 @@ flowchart TB
 
 Platform → runtime matrix:
 
-| Platform         | immersive-vr runtime             | immersive-ar runtime            | inline fallback                       | Source dir(s) |
-| ---------------- | -------------------------------- | ------------------------------- | ------------------------------------- | ------------- |
-| Windows          | OpenXR (D3D11 binding)           | OpenXR (D3D11 binding)          | orientation sensor / OpenXR           | `device/vr/openxr/{,windows}/` |
-| Linux (this patch) | OpenXR (Vulkan binding)        | —                               | orientation sensor                    | `device/vr/openxr/{,linux}/`   |
+| Platform         | immersive-vr runtime               | immersive-ar runtime            | inline fallback                       | Source dir(s) |
+| ---------------- | ---------------------------------- | ------------------------------- | ------------------------------------- | ------------- |
+| Windows          | OpenXR (D3D11 binding)             | OpenXR (D3D11 binding)          | orientation sensor                    | `device/vr/openxr/{,windows}/` |
+| Linux (this patch) | OpenXR (Vulkan binding)          | —                               | orientation sensor                    | `device/vr/openxr/{,linux}/`   |
 | Android          | OpenXR (GLES binding) or Cardboard | OpenXR (GLES binding) or ARCore | orientation sensor                    | `device/vr/openxr/{,android}/`, `device/vr/android/{cardboard,arcore}/` |
-| macOS / iOS / ChromeOS | not supported              | not supported                   | orientation sensor (where applicable) | — |
+| macOS / iOS / ChromeOS | not supported                | not supported                   | orientation sensor (where applicable) | — |
 
 The three OpenXR ports share the heavy lifting in `device/vr/openxr/`:
 
@@ -82,12 +82,16 @@ The three OpenXR ports share the heavy lifting in `device/vr/openxr/`:
   | Android  | `OpenXrGraphicsBindingOpenGLES` | OpenGL ES              |
   | Linux    | `OpenXrGraphicsBindingVulkan`   | Vulkan (this patch)    |
 
-Each graphics binding is ≈1k LOC of GPU plumbing: create the native
-graphics device against the OpenXR loader, allocate textures that can be
-exported to Chromium's `SharedImage` (so Blink/WebGL can render into
-them), and bridge GPU sync primitives between the renderer and the
-OpenXR compositor (`vkImportSemaphoreFdKHR` on Linux, `ID3D11Fence` on
-Windows, `EGL_ANDROID_native_fence_sync` on Android).
+Each graphics binding is a few hundred to a few thousand lines of GPU
+plumbing (`openxr_graphics_binding_d3d11.cc` ≈ 400 LOC,
+`openxr_graphics_binding_open_gles.cc` ≈ 500 LOC,
+`openxr_graphics_binding_vulkan.cc` ≈ 1400 LOC — the Vulkan one inlines
+more of the bring-up). They create the native graphics device against
+the OpenXR loader, allocate textures that can be exported to Chromium's
+`SharedImage` (so Blink/WebGL can render into them), and bridge GPU
+sync primitives between the renderer and the OpenXR compositor
+(`vkImportSemaphoreFdKHR` on Linux, `ID3D11Fence` on Windows,
+`EGL_ANDROID_native_fence_sync` on Android).
 
 Non-OpenXR backends live under `device/vr/android/`:
 
@@ -95,9 +99,11 @@ Non-OpenXR backends live under `device/vr/android/`:
   without an XR runtime.
 - `arcore/` — ARCore-based immersive-ar session support on Android.
 
-Inline (non-immersive) sessions use `device/vr/orientation/`, a
-sensor-fusion fallback that works anywhere a device-orientation sensor
-is available.
+Inline (non-immersive) sessions are routed through
+`XRRuntimeManagerImpl::GetInlineRuntime()`, which always picks the
+`ORIENTATION_DEVICE_ID` runtime under `device/vr/orientation/` — a
+sensor-fusion fallback. OpenXR and the other immersive backends are
+not involved in inline sessions.
 
 ## Linux path in detail
 
@@ -223,10 +229,13 @@ rm -f /run/user/$(id -u)/monado_comp_ipc
 ./build/src/xrt/targets/service/monado-service
 ```
 
-The service will pick up any real HMD it recognizes via hidraw/libusb. If
-you have no headset, Monado also provides a simulated HMD driver you can
-select with `XRT_COMPOSITOR_NULL=1` or the `simulated` driver via
-environment variables; consult Monado's docs for the current knobs.
+The service will pick up any real HMD it recognizes via hidraw/libusb.
+If no hardware is attached, Monado falls back to its built-in
+*simulated HMD* driver (the session will report the system name
+`"Monado: Simulated HMD"` in the Chromium log) so you can still bring
+up and verify the pipeline headless. See Monado's documentation for
+how to force a specific driver if the auto-detection picks the wrong
+one.
 
 Verify the socket is live:
 
@@ -248,7 +257,7 @@ mkdir chromium && cd chromium
 fetch --nohooks chromium
 cd src
 git checkout b3323dffecb06dd4b9fc95a4d31e2928895c1140   # matches patch base
-gclient sync -D --with_branch_heads --with_tags
+gclient sync
 ./build/install-build-deps.sh
 ```
 
