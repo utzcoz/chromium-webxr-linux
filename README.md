@@ -395,5 +395,8 @@ Please include:
 
 ## License
 
-The patch is licensed under the same BSD-style license as Chromium. See
-each modified file's header for details.
+This repository (README, test page, and the patch file itself) is
+distributed under the BSD 3-Clause license in [LICENSE](LICENSE), which
+matches the license of Chromium itself. The per-file headers inside the
+patch retain Chromium's own copyright notices for the files they
+modify.
