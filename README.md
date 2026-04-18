@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="webxr-openxr-chromium-icon.png" alt="WebXR on Linux" width="180">
+</p>
+
 # WebXR over OpenXR on Linux
 
 A Chromium patch that adds WebXR immersive-vr support to Linux builds of
@@ -320,8 +324,18 @@ If you prefer a reference demo once the basics work, the Immersive Web
 samples also exercise input tracking and room scale:
 
 - <https://immersive-web.github.io/webxr-samples/immersive-vr-session.html>
+- <https://immersive-web.github.io/webxr-samples/reduced-bind-rendering.html>
 - <https://immersive-web.github.io/webxr-samples/input-tracking.html>
 - <https://immersive-web.github.io/webxr-samples/room-scale.html>
+
+<p align="center">
+  <img src="webxr-openxr-chromium-reduced-bind-rendering-sample.png"
+       alt="Reduced-bind-rendering WebXR sample running under this patch"
+       width="640">
+  <br>
+  <em>Immersive Web's <code>reduced-bind-rendering</code> sample
+  rendering stereo through Chromium → OpenXR → Monado.</em>
+</p>
 
 ### Filtering the log
 
