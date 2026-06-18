@@ -10,7 +10,9 @@ reference OpenXR runtime.
 
 [Monado]: https://monado.dev/
 
-## What the patch does
+## What the patches do
+
+This is a three-patch series — apply `0001`, `0002`, and `0003` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -34,6 +36,19 @@ reference OpenXR runtime.
   `vkCmdBlitImage` to a screen-space rect per eye. **The overlay is not
   actually constructed on Linux today** — see *Known limitations*
   below.
+- Adds a `--webxr-openxr-swapchain-format=rgba|bgra` switch (default `rgba`)
+  to choose the swapchain channel ordering, forwarded into the isolated XR
+  utility process; the swapchain `VkFormat`, exported DMA-BUF image, and
+  `viz::SharedImageFormat` are kept consistent so colors are not swizzled
+  (`0003`).
+- Drops `SHARED_IMAGE_USAGE_SCANOUT` from the swapchain `SharedImage`s — they
+  are blitted into the OpenXR swapchain, never scanned out, and requesting
+  SCANOUT on a `LINEAR` (modifier 0) NativePixmap left no backing factory able
+  to satisfy it, so `CreateSharedImage` returned null and the session crashed
+  (`0003`).
+- Falls back to a CPU `glFinish` for GL → Vulkan synchronization when the GL
+  backend does not advertise `GL_CHROMIUM_gpu_fence`, so `--use-angle=vulkan`
+  is no longer required — only recommended for performance (`0002`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -261,18 +276,19 @@ gclient sync
 ./build/install-build-deps.sh
 ```
 
-## 3. Apply the patch
+## 3. Apply the patches
 
-From inside `chromium/src`:
+From inside `chromium/src`, apply the three-patch series in order (the glob
+expands to `0001`, `0002`, `0003`):
 
 ```bash
-git am /path/to/chromium-webxr-linux/0001-vr-add-WebXR-over-OpenXR-support-on-Linux.patch
+git am /path/to/chromium-webxr-linux/000*.patch
 ```
 
 If `git am` fails because of a newer Chromium base, try a 3-way merge:
 
 ```bash
-git am --3way /path/to/chromium-webxr-linux/0001-*.patch
+git am --3way /path/to/chromium-webxr-linux/000*.patch
 # resolve any conflicts, then:
 git add -A && git am --continue
 ```
@@ -308,12 +324,38 @@ XR_RUNTIME_JSON=/path/to/monado/build/openxr_monado-dev.json \
   --no-sandbox \
   --allow-file-access-from-files \
   --enable-features=OpenXR \
+  --use-gl=angle --use-angle=vulkan \
   --vmodule='*openxr*=3,*xr_runtime*=3,*isolated_xr*=3,*vr_ui*=3,*graphics_delegate*=3' \
   --enable-logging=stderr \
   --user-data-dir=/tmp/chrome-xr-test-profile \
   "file:///path/to/chromium-webxr-linux/tests/webxr-test.html" \
   2>&1 | tee /tmp/chrome-xr.log
 ```
+
+### GPU backend — `--use-angle=vulkan`
+
+`--use-gl=angle --use-angle=vulkan` selects ANGLE's Vulkan backend for the GPU
+process. It is **recommended for performance**: it exposes a real GPU fence
+(`GL_CHROMIUM_gpu_fence`, backed by `EGL_ANDROID_native_fence_sync`) so the
+Vulkan compositor side does an asynchronous GPU-side wait on the WebGL render.
+
+As of `0002` it is **no longer required**: on a GL backend that does not expose
+that fence (e.g. the default ANGLE-on-GL stack), the render loop falls back to a
+per-frame CPU `glFinish`, which is correct but slower. Before that fix the
+session crashed (`GLES2CommandBufferStub::GetGpuFenceHandle`, *callback was
+destroyed*) on the first submitted frame, so without the flag nothing rendered.
+To see which path was taken, add `*openxr_render_loop*=1` to `--vmodule` and
+grep the log for `GL_CHROMIUM_gpu_fence supported=`.
+
+### Swapchain channel order — `--webxr-openxr-swapchain-format`
+
+Append `--webxr-openxr-swapchain-format=bgra` to negotiate a BGRA swapchain
+(`VK_FORMAT_B8G8R8A8_SRGB`) instead of the default RGBA
+(`VK_FORMAT_R8G8B8A8_SRGB`); use it if a runtime/driver renders correct colors
+only with BGRA channel ordering. The whole chain (swapchain `VkFormat`, the
+exported DMA-BUF image, and `viz::SharedImageFormat`) follows the choice, so
+colors are not swizzled. Sanity check with the page's dark-blue clear color:
+blue means the channels are correct; red/brown would indicate a swizzle.
 
 On the page:
 

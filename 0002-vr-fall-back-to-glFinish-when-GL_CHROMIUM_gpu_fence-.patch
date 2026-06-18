@@ -1,0 +1,108 @@
+From a6b12003afac65e6121308ddab0c49924ac6eed0 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Fri, 19 Jun 2026 00:19:04 +0800
+Subject: [PATCH 2/3] vr: fall back to glFinish when GL_CHROMIUM_gpu_fence is
+ unavailable
+
+OpenXrRenderLoop::SubmitFrameDrawnIntoTexture unconditionally created a
+GPU fence (CreateGpuFenceCHROMIUM + GetGpuFence) so the graphics binding
+could do a server-side wait on the WebGL render. On GL backends without
+GL_CHROMIUM_gpu_fence (backed by EGL_ANDROID_native_fence_sync) -- notably
+the default Linux ANGLE-on-GL stack -- the GPU process drops the mojo
+response callback and FATAL-crashes in
+GLES2CommandBufferStub::GetGpuFenceHandle the instant a frame is submitted.
+
+Detect the extension once (cached in supports_gpu_fence_); when absent,
+skip the fence and do a CPU glFinish before submitting so the WebGL write
+into the shared image completes before the Vulkan blit reads it. The
+binding's WaitOnFence is already a no-op without a fence FD.
+
+The check is gated on the capability, so Windows/Android (which advertise
+the extension) keep the async-fence path unchanged. This removes the need
+for --use-angle=vulkan on Linux; it becomes a performance choice rather
+than a requirement.
+---
+ device/vr/openxr/openxr_render_loop.cc | 41 ++++++++++++++++++++++----
+ device/vr/openxr/openxr_render_loop.h  |  7 +++++
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index 5698ebb2347e4..ba68562563bb9 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <optional>
++#include <string_view>
+ #include <utility>
+ 
+ #include "base/debug/dump_without_crashing.h"
+@@ -921,11 +922,41 @@ void OpenXrRenderLoop::SubmitFrameDrawnIntoTexture(
+   DVLOG(3) << __func__ << " frame_index=" << frame_index;
+   gpu::gles2::GLES2Interface* gl = context_provider_->ContextGL();
+   gl->WaitSyncTokenCHROMIUM(sync_token.GetConstData());
+-  const GLuint id = gl->CreateGpuFenceCHROMIUM();
+-  context_provider_->ContextSupport()->GetGpuFence(
+-      id, base::BindOnce(&OpenXrRenderLoop::OnWebXrTokenSignaled,
+-                         weak_ptr_factory_.GetWeakPtr(), frame_index, layer_ids,
+-                         id));
++
++  // GL_CHROMIUM_gpu_fence (backed by EGL_ANDROID_native_fence_sync) lets the
++  // graphics binding do a GPU-side wait on the WebGL render. Some GL backends
++  // do not support it — notably the default Linux ANGLE-on-GL stack — and
++  // requesting a fence there drops the GPU-process mojo callback and crashes
++  // (GLES2CommandBufferStub::GetGpuFenceHandle). Detect support once via the
++  // advertised extension and, when absent, fall back to a CPU glFinish.
++  if (!supports_gpu_fence_.has_value()) {
++    const char* extensions =
++        reinterpret_cast<const char*>(gl->GetString(GL_EXTENSIONS));
++    supports_gpu_fence_ =
++        extensions && std::string_view(extensions).find(
++                          "GL_CHROMIUM_gpu_fence") != std::string_view::npos;
++    DVLOG(1) << __func__
++             << " GL_CHROMIUM_gpu_fence supported=" << *supports_gpu_fence_;
++  }
++
++  if (*supports_gpu_fence_) {
++    const GLuint id = gl->CreateGpuFenceCHROMIUM();
++    context_provider_->ContextSupport()->GetGpuFence(
++        id, base::BindOnce(&OpenXrRenderLoop::OnWebXrTokenSignaled,
++                           weak_ptr_factory_.GetWeakPtr(), frame_index,
++                           layer_ids, id));
++    return;
++  }
++
++  // No GPU fence available: a CPU finish guarantees the WebGL write into the
++  // shared image is complete before the graphics binding reads it. There is no
++  // fence to hand to the binding for a server-side wait, so submit directly
++  // (the binding's WaitOnFence is a no-op without a fence FD). This trades the
++  // async GPU fence for a per-frame CPU stall.
++  gl->Finish();
++  TRACE_EVENT_END("xr", perfetto::Track(frame_index));
++  MarkFrameSubmitted(frame_index);
++  MaybeCompositeAndSubmit(layer_ids);
+ }
+ 
+ void OpenXrRenderLoop::OnWebXrTokenSignaled(
+diff --git a/device/vr/openxr/openxr_render_loop.h b/device/vr/openxr/openxr_render_loop.h
+index 16c3ca1884cd5..6f868943df4a4 100644
+--- a/device/vr/openxr/openxr_render_loop.h
++++ b/device/vr/openxr/openxr_render_loop.h
+@@ -290,6 +290,13 @@ class OpenXrRenderLoop : public XRThread,
+   scoped_refptr<viz::ContextProvider> context_provider_;
+   VizContextProviderFactoryAsync context_provider_factory_async_;
+ 
++  // Cached result of whether the GL context advertises GL_CHROMIUM_gpu_fence
++  // (backed by EGL_ANDROID_native_fence_sync). When absent (e.g. the default
++  // Linux ANGLE-on-GL stack), SubmitFrameDrawnIntoTexture falls back to a CPU
++  // glFinish instead of a GPU fence, because requesting an unsupported fence
++  // crashes the GPU process. Computed lazily on the first frame submit.
++  std::optional<bool> supports_gpu_fence_;
++
+   FPSMeter fps_meter_;
+   SlidingTimeDeltaAverage webxr_js_time_;
+   SlidingTimeDeltaAverage webxr_gpu_time_;
+-- 
+2.53.0
+

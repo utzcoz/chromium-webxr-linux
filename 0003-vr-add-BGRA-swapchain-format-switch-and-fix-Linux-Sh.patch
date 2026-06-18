@@ -1,0 +1,330 @@
+From bb8879f8cb99d290506e6822ff3f847a3dc828c4 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Fri, 19 Jun 2026 00:19:06 +0800
+Subject: [PATCH 3/3] vr: add BGRA swapchain-format switch and fix Linux
+ SharedImage backing
+
+Adds --webxr-openxr-swapchain-format=rgba|bgra (device::switches),
+forwarded from the browser into the isolated XR utility process via
+ServiceProcessHost WithExtraCommandLineSwitches (switches are not copied
+to utility processes by default). OpenXrGraphicsBindingVulkan::
+GetSwapchainFormat() honors it with an ordered preference list (SRGB
+preferred over UNORM, the non-selected ordering kept as a fallback), and
+CreateSharedImages maps the viz SharedImage format to match (kBGRA_8888
+for both BGRA SRGB and UNORM) so colors are not swizzled. The mock OpenXR
+runtime now advertises both orderings so the selection is unit-tested.
+Default behavior (rgba) is unchanged.
+
+Also drops SHARED_IMAGE_USAGE_SCANOUT from the swapchain SharedImages.
+The images are blitted into the OpenXR swapchain, never scanned out, and
+requesting SCANOUT on a LINEAR (modifier 0) NativePixmap left no backing
+factory able to satisfy it -- CreateSharedImage returned null and the
+session crashed (scoped_refptr DCHECK), so no frames ever displayed. This
+affected RGBA and BGRA identically.
+---
+ content/browser/BUILD.gn                      |  1 +
+ .../browser/xr/service/xr_device_service.cc   | 31 +++++++++--
+ .../linux/openxr_graphics_binding_vulkan.cc   | 55 +++++++++++++------
+ ...openxr_graphics_binding_vulkan_unittest.cc | 21 ++++++-
+ device/vr/openxr/test/fake_openxr_impl_api.cc | 18 ++++--
+ device/vr/public/cpp/switches.cc              |  4 ++
+ device/vr/public/cpp/switches.h               | 12 ++++
+ 7 files changed, 116 insertions(+), 26 deletions(-)
+
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 41634a9509f07..cc57e102a2fd3 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3751,6 +3751,7 @@ source_set("browser") {
+       "//content/browser/xr/webxr_internals/mojom:mojo_bindings",
+       "//device/vr/buildflags",
+       "//device/vr/orientation",
++      "//device/vr/public/cpp",
+       "//services/metrics/public/cpp:ukm_builders",
+     ]
+   }
+diff --git a/content/browser/xr/service/xr_device_service.cc b/content/browser/xr/service/xr_device_service.cc
+index 2a3fba74ce402..12e6aca0afee1 100644
+--- a/content/browser/xr/service/xr_device_service.cc
++++ b/content/browser/xr/service/xr_device_service.cc
+@@ -4,13 +4,19 @@
+ 
+ #include "content/browser/xr/service/xr_device_service.h"
+ 
++#include "base/command_line.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/no_destructor.h"
++#include "base/strings/strcat.h"
+ #include "build/build_config.h"
+ #include "content/public/browser/gpu_client.h"
+ #include "content/public/browser/service_process_host.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
++#if BUILDFLAG(IS_LINUX)
++#include "device/vr/public/cpp/switches.h"
++#endif
++
+ namespace content {
+ 
+ namespace {
+@@ -46,11 +52,26 @@ const mojo::Remote<device::mojom::XRDeviceService>& GetXRDeviceService() {
+   static base::NoDestructor<mojo::Remote<device::mojom::XRDeviceService>>
+       remote;
+   if (!*remote) {
+-    content::ServiceProcessHost::Launch(
+-        remote->BindNewPipeAndPassReceiver(),
+-        content::ServiceProcessHost::Options()
+-            .WithDisplayName("Isolated XR Device Service")
+-            .Pass());
++    auto options = content::ServiceProcessHost::Options();
++    options.WithDisplayName("Isolated XR Device Service");
++
++#if BUILDFLAG(IS_LINUX)
++    // ServiceProcessHost does not copy browser switches to the utility process.
++    // Forward the swapchain-format switch so OpenXrGraphicsBindingVulkan, which
++    // runs in the isolated XR process, can read it.
++    const base::CommandLine* browser_command_line =
++        base::CommandLine::ForCurrentProcess();
++    if (browser_command_line->HasSwitch(
++            device::switches::kWebXrOpenXrSwapchainFormat)) {
++      options.WithExtraCommandLineSwitches(
++          {base::StrCat({device::switches::kWebXrOpenXrSwapchainFormat, "=",
++                         browser_command_line->GetSwitchValueASCII(
++                             device::switches::kWebXrOpenXrSwapchainFormat)})});
++    }
++#endif
++
++    content::ServiceProcessHost::Launch(remote->BindNewPipeAndPassReceiver(),
++                                        std::move(options));
+ 
+     // Ensure that if the interface is ever disconnected (e.g. the service
+     // process crashes) or goes idle for a short period of time -- meaning there
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+index e82f19a7ba771..25072c0f7b474 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+@@ -10,6 +10,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/files/scoped_file.h"
+ #include "base/logging.h"
+@@ -19,6 +20,7 @@
+ #include "device/vr/openxr/openxr_extension_helper.h"
+ #include "device/vr/openxr/openxr_swapchain_info.h"
+ #include "device/vr/openxr/openxr_util.h"
++#include "device/vr/public/cpp/switches.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
+@@ -428,28 +430,44 @@ int64_t OpenXrGraphicsBindingVulkan::GetSwapchainFormat(
+     return 0;
+   }
+ 
+-  // Prefer SRGB formats for correct color rendering. Try RGBA first (matches
+-  // the SharedImage default), fall back to BGRA, otherwise accept formats[0].
++  // Choose a channel ordering. The default prefers RGBA (matches the
++  // SharedImage default); --webxr-openxr-swapchain-format=bgra prefers BGRA for
++  // configs whose GL/compositor path expects BGRA channel order. Within each
++  // ordering, SRGB is preferred over UNORM for correct color. The non-preferred
++  // ordering is kept as a fallback so a runtime that only advertises one
++  // ordering still works, and formats[0] is the last resort.
++  const bool prefer_bgra =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          switches::kWebXrOpenXrSwapchainFormat) ==
++      switches::kWebXrOpenXrSwapchainFormatBgra;
++
++  const int64_t kPreferRgba[] = {
++      VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM,
++      VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM};
++  const int64_t kPreferBgra[] = {
++      VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM,
++      VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM};
++  const auto& preference = prefer_bgra ? kPreferBgra : kPreferRgba;
++
+   int64_t selected = formats[0];
+-  bool found = false;
+-  for (int64_t f : formats) {
+-    if (f == VK_FORMAT_R8G8B8A8_SRGB) {
+-      selected = f;
+-      found = true;
+-      break;
+-    }
+-  }
+-  if (!found) {
++  for (int64_t candidate : preference) {
++    bool offered = false;
+     for (int64_t f : formats) {
+-      if (f == VK_FORMAT_B8G8R8A8_SRGB) {
+-        selected = f;
++      if (f == candidate) {
++        offered = true;
+         break;
+       }
+     }
++    if (offered) {
++      selected = candidate;
++      break;
++    }
+   }
+   // Cache the negotiated format so CreateSharedImages() can create matching
+   // intermediate images without needing to re-query the session.
+   swapchain_format_ = static_cast<VkFormat>(selected);
++  VLOG(1) << "OpenXR Vulkan swapchain format negotiated: " << selected
++          << (prefer_bgra ? " (bgra requested)" : " (rgba/default)");
+   return selected;
+ }
+ 
+@@ -920,17 +938,22 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+ 
+     // The SharedImages created here will be transferred to other processes to
+     // have their contents written by WebGL or WebGPU. Readback by OpenXR is
+-    // via the blit in RenderLayer.
++    // via the blit in RenderLayer. NOTE: no SHARED_IMAGE_USAGE_SCANOUT — these
++    // images are blitted into the OpenXR swapchain, never scanned out to a
++    // display. Requesting SCANOUT on a LINEAR (modifier 0) NativePixmap leaves
++    // no backing factory able to satisfy it, so CreateSharedImage returns null.
+     gpu::SharedImageUsageSet shared_image_usage =
+-        gpu::SHARED_IMAGE_USAGE_SCANOUT |
+         gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
+         gpu::SHARED_IMAGE_USAGE_GLES2_READ |
+         gpu::SHARED_IMAGE_USAGE_GLES2_WRITE;
+ 
+     // Map the Vulkan swapchain format to the matching SharedImage format so
+     // the GPU process imports the DMA-BUF with the correct channel layout.
++    // Match the SharedImage channel order to the negotiated swapchain format so
++    // colors are not swizzled. Both SRGB and UNORM BGRA map to kBGRA_8888.
+     viz::SharedImageFormat si_format =
+-        (swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB)
++        (swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
++         swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM)
+             ? viz::SinglePlaneFormat::kBGRA_8888
+             : viz::SinglePlaneFormat::kRGBA_8888;
+ 
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+index c1ee09eea5313..fcf6da2338a45 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+@@ -4,8 +4,10 @@
+ 
+ #include "device/vr/openxr/linux/openxr_graphics_binding_vulkan.h"
+ 
++#include "base/test/scoped_command_line.h"
+ #include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
+ #include "device/vr/openxr/openxr_platform.h"
++#include "device/vr/public/cpp/switches.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/openxr/src/include/openxr/openxr.h"
+ #include "ui/gfx/geometry/size.h"
+@@ -122,11 +124,28 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, GetSwapchainFormatReturnsSRGB) {
+   ASSERT_TRUE(InitializeBinding());
+   ASSERT_TRUE(CreateSession());
+ 
+-  // The mock returns VK_FORMAT_R8G8B8A8_SRGB (43) for Linux.
++  // The mock advertises both RGBA and BGRA SRGB on Linux. With no switch, RGBA
++  // is preferred.
+   int64_t format = binding_->GetSwapchainFormat(xr_session_);
+   EXPECT_EQ(format, VK_FORMAT_R8G8B8A8_SRGB);
+ }
+ 
++TEST_F(OpenXrGraphicsBindingVulkanTest, GetSwapchainFormatSelectsBgraWithSwitch) {
++  base::test::ScopedCommandLine scoped_command_line;
++  scoped_command_line.GetProcessCommandLine()->AppendSwitchASCII(
++      switches::kWebXrOpenXrSwapchainFormat,
++      switches::kWebXrOpenXrSwapchainFormatBgra);
++
++  ASSERT_TRUE(CreateXrInstanceAndSystem());
++  ASSERT_TRUE(InitializeBinding());
++  ASSERT_TRUE(CreateSession());
++
++  // With --webxr-openxr-swapchain-format=bgra and the runtime advertising BGRA
++  // SRGB, the binding negotiates VK_FORMAT_B8G8R8A8_SRGB instead of RGBA.
++  int64_t format = binding_->GetSwapchainFormat(xr_session_);
++  EXPECT_EQ(format, VK_FORMAT_B8G8R8A8_SRGB);
++}
++
+ TEST_F(OpenXrGraphicsBindingVulkanTest, GetSwapchainFormatBeforeSession) {
+   ASSERT_TRUE(CreateXrInstanceAndSystem());
+   ASSERT_TRUE(InitializeBinding());
+diff --git a/device/vr/openxr/test/fake_openxr_impl_api.cc b/device/vr/openxr/test/fake_openxr_impl_api.cc
+index 545c87de07596..55ce0fd143dd9 100644
+--- a/device/vr/openxr/test/fake_openxr_impl_api.cc
++++ b/device/vr/openxr/test/fake_openxr_impl_api.cc
+@@ -702,13 +702,21 @@ XrResult xrEnumerateSwapchainFormats(XrSession session,
+                                      int64_t* formats) {
+   DVLOG(2) << __FUNCTION__;
+   RETURN_IF_XR_FAILED(g_test_helper.ValidateSession(session));
+-  RETURN_IF(format_capacity_input != 1 && format_capacity_input != 0,
++  // Linux advertises both RGBA and BGRA SRGB so the Vulkan binding's format
++  // selection (and the --webxr-openxr-swapchain-format switch) can be tested.
++  // Windows/Android keep a single hardcoded format.
++#if BUILDFLAG(IS_LINUX)
++  constexpr uint32_t kNumFormats = 2;
++#else
++  constexpr uint32_t kNumFormats = 1;
++#endif
++  RETURN_IF(format_capacity_input != kNumFormats && format_capacity_input != 0,
+             XR_ERROR_SIZE_INSUFFICIENT,
+             "xrEnumerateSwapchainFormats does not equal length returned by "
+             "previous call");
+   RETURN_IF(format_count_output == nullptr, XR_ERROR_VALIDATION_FAILURE,
+             "format_count_output is nullptr");
+-  *format_count_output = 1;
++  *format_count_output = kNumFormats;
+   if (format_capacity_input == 0) {
+     return XR_SUCCESS;
+   }
+@@ -725,8 +733,10 @@ XrResult xrEnumerateSwapchainFormats(XrSession session,
+   // This is what is hardcoded in `OpenXrGraphicsBindingOpenGLES`.
+   formats[0] = OpenXrTestHelper::kSwapchainFormat;
+ #elif BUILDFLAG(IS_LINUX)
+-  // VK_FORMAT_R8G8B8A8_SRGB = 43
+-  formats[0] = 43;
++  // Linux advertises both RGBA and BGRA SRGB (kNumFormats == 2 above).
++  auto formats_span = UNSAFE_BUFFERS(base::span(formats, size_t{kNumFormats}));
++  formats_span[0] = 43;  // VK_FORMAT_R8G8B8A8_SRGB
++  formats_span[1] = 50;  // VK_FORMAT_B8G8R8A8_SRGB
+ #endif
+ 
+   return XR_SUCCESS;
+diff --git a/device/vr/public/cpp/switches.cc b/device/vr/public/cpp/switches.cc
+index ee8b249be60a6..7d128003d025a 100644
+--- a/device/vr/public/cpp/switches.cc
++++ b/device/vr/public/cpp/switches.cc
+@@ -10,4 +10,8 @@ const char kWebXrHandAnonymizationStrategy[] =
+ const char kWebXrHandAnonymizationStrategyNone[] = "none";
+ const char kWebXrHandAnonymizationStrategyRuntime[] = "runtime";
+ const char kWebXrHandAnonymizationStrategyFallback[] = "fallback";
++
++const char kWebXrOpenXrSwapchainFormat[] = "webxr-openxr-swapchain-format";
++const char kWebXrOpenXrSwapchainFormatRgba[] = "rgba";
++const char kWebXrOpenXrSwapchainFormatBgra[] = "bgra";
+ }  // namespace device::switches
+diff --git a/device/vr/public/cpp/switches.h b/device/vr/public/cpp/switches.h
+index b9bde0c828f85..04561860f356f 100644
+--- a/device/vr/public/cpp/switches.h
++++ b/device/vr/public/cpp/switches.h
+@@ -16,6 +16,18 @@ COMPONENT_EXPORT(VR_FEATURES)
+ extern const char kWebXrHandAnonymizationStrategyRuntime[];
+ COMPONENT_EXPORT(VR_FEATURES)
+ extern const char kWebXrHandAnonymizationStrategyFallback[];
++
++// Selects the swapchain pixel format the Linux OpenXR/Vulkan backend negotiates
++// in OpenXrGraphicsBindingVulkan::GetSwapchainFormat(). Accepts the values
++// below; absent or unrecognized values keep the default (RGBA) behavior.
++COMPONENT_EXPORT(VR_FEATURES)
++extern const char kWebXrOpenXrSwapchainFormat[];
++// "rgba": prefer VK_FORMAT_R8G8B8A8_SRGB (default).
++COMPONENT_EXPORT(VR_FEATURES)
++extern const char kWebXrOpenXrSwapchainFormatRgba[];
++// "bgra": prefer VK_FORMAT_B8G8R8A8_SRGB (falls back to *_UNORM).
++COMPONENT_EXPORT(VR_FEATURES)
++extern const char kWebXrOpenXrSwapchainFormatBgra[];
+ }  // namespace device::switches
+ 
+ #endif  // DEVICE_VR_PUBLIC_CPP_SWITCHES_H_
+-- 
+2.53.0
+
