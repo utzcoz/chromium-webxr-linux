@@ -347,6 +347,23 @@ destroyed*) on the first submitted frame, so without the flag nothing rendered.
 To see which path was taken, add `*openxr_render_loop*=1` to `--vmodule` and
 grep the log for `GL_CHROMIUM_gpu_fence supported=`.
 
+Whether the default backend exposes the fence depends on the Ozone platform,
+because Chromium initializes ANGLE on a different native driver for each
+(observed on AMD/Mesa via the unmasked WebGL renderer string):
+
+| Ozone platform | Default ANGLE native backend | `GL_CHROMIUM_gpu_fence` |
+| -------------- | ---------------------------- | ----------------------- |
+| Wayland        | ANGLE on `OpenGL ES` (EGL/GBM) | supported (async fence) |
+| X11            | ANGLE on desktop `OpenGL` (GLX) | absent (glFinish fallback) |
+
+`GL_CHROMIUM_gpu_fence` requires the underlying EGL to expose
+`EGL_ANDROID_native_fence_sync`. Mesa provides it on the GLES/EGL path (Wayland)
+but not on the desktop-GL/GLX path (X11), so on the default backend Wayland
+takes the GPU-fence path while X11 takes the `glFinish` fallback. This is a
+backend-selection detail, not a Wayland-vs-X11 capability difference:
+`--use-angle=vulkan` exposes the fence (via `VK_KHR_external_fence_fd`) on
+both, and the `glFinish` fallback renders correctly on both regardless.
+
 ### Swapchain channel order — `--webxr-openxr-swapchain-format`
 
 Append `--webxr-openxr-swapchain-format=bgra` to negotiate a BGRA swapchain
