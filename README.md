@@ -357,6 +357,23 @@ exported DMA-BUF image, and `viz::SharedImageFormat`) follows the choice, so
 colors are not swizzled. Sanity check with the page's dark-blue clear color:
 blue means the channels are correct; red/brown would indicate a swizzle.
 
+### Window system — X11 and Wayland (`--ozone-platform`)
+
+**Both `--ozone-platform=x11` and `--ozone-platform=wayland` work**, verified at
+parity against Monado on AMD RADV (real Enter VR session, ~470 frames/8 s on
+X11, ~446 on Wayland — timing variance only; both stable, zero crashes, same
+BGRA swapchain). This is independent of Monado's own compositor window, which
+talks to Chromium over the IPC socket plus DMA-BUF FDs.
+
+The patch shares each frame as a **linear, `modifier = 0`
+(`DRM_FORMAT_MOD_LINEAR`)** DMA-BUF imported as a `gfx::NativePixmapHandle`.
+Ozone/X11 imports it through the DRM render node; Ozone/Wayland imports the
+same buffer through `zwp_linux_dmabuf`. Modifier 0 is correct on both because
+the intermediate image is `VK_IMAGE_TILING_LINEAR`. Wayland needs no special
+flags and works with the default GL backend (no `--use-angle=vulkan`); it logs
+a few harmless `NOTIMPLEMENTED_LOG_ONCE()` lines (`OnTrancheFlags`, `OnName`,
+…) for optional Wayland protocol callbacks that do not affect rendering.
+
 On the page:
 
 1. The **"immersive-vr supported"** status line should be green. If it
