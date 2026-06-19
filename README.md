@@ -364,6 +364,39 @@ backend-selection detail, not a Wayland-vs-X11 capability difference:
 `--use-angle=vulkan` exposes the fence (via `VK_KHR_external_fence_fd`) on
 both, and the `glFinish` fallback renders correctly on both regardless.
 
+#### Why the default ANGLE backend differs by Ozone platform
+
+It is not a deliberate per-platform choice — it is the *same* ordered
+preference list resolving differently because GLX (desktop GL) is X11-only.
+Tracing it through the source:
+
+1. **Chromium queues both, desktop-GL first.** On non-Android Linux with the
+   default ANGLE, `ui/gl/init/gl_display_initializer.cc` adds `ANGLE_OPENGL`
+   (desktop GL) then `ANGLE_OPENGLES` (GLES) to the list of displays to try —
+   identical for X11 and Wayland.
+2. **First display that initializes wins.** `GLDisplayEGL::InitializeDisplay`
+   (`ui/gl/gl_display.cc`) iterates that list and uses the first type that
+   returns a valid `EGLDisplay`, skipping (`continue`) any that fail.
+3. **ANGLE maps the desktop-GL request to GLX on X11 but native EGL on
+   Wayland.** For `EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE` on Linux,
+   `third_party/angle/src/libANGLE/Display.cpp` picks `CreateGLXDisplay()` for
+   `EGL_PLATFORM_X11_EXT` and `DisplayEGL` for `EGL_PLATFORM_GBM_KHR`.
+
+The only differing input is the native display (an X server connection vs a
+Wayland/GBM display). GLX is literally the "GL X11 extension" and does not
+exist on Wayland, so:
+
+- **X11:** the desktop-GL request resolves to a GLX display, succeeds first,
+  and wins → `ANGLE (…, OpenGL 4.6)`.
+- **Wayland:** there is no GLX, so the request resolves to a Mesa EGL display
+  that serves GLES contexts → `ANGLE (…, OpenGL ES 3.2)`.
+
+Mesa exposes `EGL_ANDROID_native_fence_sync` on the EGL/GLES path but not on
+the GLX desktop-GL path, which is exactly why `GL_CHROMIUM_gpu_fence` is
+present on Wayland and absent on X11 by default. `--use-angle=vulkan` requests
+`ANGLE_VULKAN` explicitly, which is window-system-independent and always
+provides the fence.
+
 ### Swapchain channel order — `--webxr-openxr-swapchain-format`
 
 Append `--webxr-openxr-swapchain-format=bgra` to negotiate a BGRA swapchain
