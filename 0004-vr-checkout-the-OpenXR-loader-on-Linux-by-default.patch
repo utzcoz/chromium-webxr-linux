@@ -1,0 +1,51 @@
+From 5b6dc81bf030e022cfe3a3a7534dee4dcd63c8f7 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sat, 20 Jun 2026 14:55:41 +0800
+Subject: [PATCH] vr: checkout the OpenXR loader on Linux by default
+
+The Linux WebXR-over-OpenXR patch turns enable_openxr on for Linux in
+device/vr/buildflags/buildflags.gni, but enable_openxr is gated on the
+checkout_openxr gclient variable:
+
+  enable_openxr = checkout_openxr &&
+                  (is_win || is_linux || ...)
+
+DEPS only defaulted checkout_openxr to true on Windows and Android, so on
+a fresh Linux checkout checkout_openxr stayed false. That had two
+consequences: the OpenXR loader (src/third_party/openxr/src) was never
+synced by gclient, and -- because checkout_openxr feeds the GN arg of the
+same name -- enable_openxr resolved to false even with the buildflags
+change, so the whole OpenXR backend was silently dropped from the build.
+
+Add checkout_linux to the checkout_openxr condition so it defaults to true
+on Linux as well, matching the platforms the backend now supports. After
+applying the patch series on a fresh Linux checkout, re-run `gclient sync`
+to fetch the OpenXR loader.
+
+Fixes: https://github.com/utzcoz/chromium-webxr-linux/issues/1
+---
+ DEPS | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/DEPS b/DEPS
+index 8375fdfce3b73..6503dd092a7dc 100644
+--- a/DEPS
++++ b/DEPS
+@@ -168,10 +168,10 @@ vars = {
+   # Fetch clangd into the same bin/ directory as our clang binary.
+   'checkout_clangd': False,
+ 
+-  # By default checkout the OpenXR loader library only on Windows and Android.
+-  # The OpenXR backend for VR in Chromium is currently only supported for these
+-  # platforms, but support for other platforms may be added in the future.
+-  'checkout_openxr' : 'checkout_win or checkout_android',
++  # By default checkout the OpenXR loader library on Windows, Linux and Android.
++  # The OpenXR backend for VR in Chromium is supported on these platforms;
++  # support for other platforms may be added in the future.
++  'checkout_openxr' : 'checkout_win or checkout_linux or checkout_android',
+ 
+   'checkout_instrumented_libraries': 'checkout_linux and checkout_configuration != "small"',
+ 
+-- 
+2.53.0
+

@@ -12,7 +12,7 @@ reference OpenXR runtime.
 
 ## What the patches do
 
-This is a three-patch series — apply `0001`, `0002`, and `0003` in order.
+This is a four-patch series — apply `0001` through `0004` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -49,6 +49,11 @@ This is a three-patch series — apply `0001`, `0002`, and `0003` in order.
 - Falls back to a CPU `glFinish` for GL → Vulkan synchronization when the GL
   backend does not advertise `GL_CHROMIUM_gpu_fence`, so `--use-angle=vulkan`
   is no longer required — only recommended for performance (`0002`).
+- Defaults the `checkout_openxr` gclient variable to true on Linux in `DEPS`
+  so `gclient sync` actually pulls the OpenXR loader into
+  `third_party/openxr`. `enable_openxr` is gated on `checkout_openxr`, so
+  without this the backend was dropped from the build on a fresh Linux
+  checkout even with `enable_openxr` flipped on for Linux (`0004`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -278,8 +283,8 @@ gclient sync
 
 ## 3. Apply the patches
 
-From inside `chromium/src`, apply the three-patch series in order (the glob
-expands to `0001`, `0002`, `0003`):
+From inside `chromium/src`, apply the four-patch series in order (the glob
+expands to `0001` through `0004`):
 
 ```bash
 git am /path/to/chromium-webxr-linux/000*.patch
@@ -291,6 +296,15 @@ If `git am` fails because of a newer Chromium base, try a 3-way merge:
 git am --3way /path/to/chromium-webxr-linux/000*.patch
 # resolve any conflicts, then:
 git add -A && git am --continue
+```
+
+Patch `0004` enables `checkout_openxr` for Linux in `DEPS`. The `gclient
+sync` in step 2 ran against the unpatched `DEPS`, so it did **not** fetch
+the OpenXR loader. Re-run `gclient sync` after applying the patches to pull
+it into `third_party/openxr`:
+
+```bash
+gclient sync
 ```
 
 ## 4. Build Chromium
