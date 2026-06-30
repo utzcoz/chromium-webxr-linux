@@ -12,7 +12,7 @@ reference OpenXR runtime.
 
 ## What the patches do
 
-This is a four-patch series — apply `0001` through `0004` in order.
+This is a five-patch series — apply `0001` through `0005` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -54,6 +54,13 @@ This is a four-patch series — apply `0001` through `0004` in order.
   `third_party/openxr`. `enable_openxr` is gated on `checkout_openxr`, so
   without this the backend was dropped from the build on a fresh Linux
   checkout even with `enable_openxr` flipped on for Linux (`0004`).
+- Runs the XR Device Service **sandboxed** on Linux instead of requiring
+  `--no-sandbox` for the OpenXR path: gives it the `kXrCompositing` sandbox
+  type, forks it from the unsandboxed zygote, and adds a pre-sandbox hook
+  (`content/utility/xr/`) that brokers the OpenXR manifest, runtime library
+  and GPU/Vulkan device files, plus `XrProcessPolicy` (the GPU process
+  policy plus the AF_UNIX socket syscalls the runtime uses to reach its
+  compositor). See *Sandbox note* below (`0005`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -283,8 +290,8 @@ gclient sync
 
 ## 3. Apply the patches
 
-From inside `chromium/src`, apply the four-patch series in order (the glob
-expands to `0001` through `0004`):
+From inside `chromium/src`, apply the five-patch series in order (the glob
+expands to `0001` through `0005`):
 
 ```bash
 git am /path/to/chromium-webxr-linux/000*.patch
@@ -492,10 +499,45 @@ service.
 
 ## Sandbox note
 
-`--no-sandbox` is required in a typical developer build because the
-unsanded zygote cannot attach. For production / packaged Chromium, the
-standard zygote sandbox is fine — the OpenXR socket access happens in the
-utility process which already has the needed syscalls allowed.
+The OpenXR path runs **fully sandboxed**; `--no-sandbox` is not required for
+it. Patch `0005` gives the XR Device Service its own Linux sandbox
+(`kXrCompositing`): the service forks from the unsandboxed zygote, a
+pre-sandbox hook starts a syscall broker for the OpenXR runtime manifest,
+the runtime library and the GPU/Vulkan device files, and `XrProcessPolicy`
+(the GPU process policy plus the AF_UNIX socket syscalls) lets the runtime
+reach its compositor over the per-user IPC socket.
+
+The one thing a *developer* build still needs `--no-sandbox` for is the
+**base zygote sandbox**, and that is a packaging concern unrelated to
+OpenXR: a locally-built `out/Default/chrome` is not allow-listed to create
+unprivileged user namespaces under Ubuntu's AppArmor restriction
+(`kernel.apparmor_restrict_unprivileged_userns=1`). Packaged Chrome is
+exempt via its installed AppArmor profile and setuid `chrome-sandbox`
+helper. For a dev build, attach an AppArmor profile to the binary path —
+
+```
+# /etc/apparmor.d/chrome-webxr-dev  (mirrors the packaged chrome profile)
+abi <abi/4.0>,
+include <tunables/global>
+profile chrome-webxr-dev /path/to/src/out/Default/chrome flags=(unconfined) {
+  userns,
+  @{exec_path} mr,
+  include if exists <local/chrome-webxr-dev>
+}
+```
+
+then `sudo apparmor_parser -r /etc/apparmor.d/chrome-webxr-dev` — or, less
+precisely, relax the restriction globally
+(`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`). With the
+base sandbox attached, launch **without** `--no-sandbox`.
+
+Verified end to end against Monado with the base sandbox enabled and no
+`--no-sandbox` (a DCHECK build): the XR utility runs as
+`--service-sandbox-type=xr_compositing`, the broker forks, the OpenXR loader
+reaches `active_runtime.json` and loads the runtime, `xrCreateInstance`
+connects to Monado, the in-process Vulkan instance/device is created, the
+immersive-vr session starts, the swapchain format is negotiated, and frames
+are submitted to the compositor.
 
 ## Known limitations
 

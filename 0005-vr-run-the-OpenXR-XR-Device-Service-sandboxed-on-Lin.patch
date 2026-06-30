@@ -1,0 +1,661 @@
+From 6ffed769df6db563aef28c0b946fa4594608d342 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Wed, 1 Jul 2026 00:07:57 +0800
+Subject: [PATCH] vr: run the OpenXR XR Device Service sandboxed on Linux
+
+The XR Device Service hosts the OpenXR loader, which resolves the active
+runtime manifest (active_runtime.json), dlopen()s the runtime library it
+names (e.g. libopenxr_monado.so), connects to the runtime's per-user IPC
+socket, and creates an in-process Vulkan instance to render into. On Linux
+the service ran as a generic kUtility process with no pre-sandbox hook and
+no broker, so none of that worked under the sandbox and the OpenXR path
+required --no-sandbox.
+
+Give the XR Device Service its own sandbox on Linux, modelled on the
+Windows kXrCompositing type and the kSpeechRecognition pre-sandbox hook:
+
+- Enable the kXrCompositing sandbox enum value and the kXrSandbox service
+  constant on Linux (sandbox.mojom, isolated_xr_service.mojom), make the
+  type round-trip through the command line (sandbox_type.cc), and accept
+  it in the browser-side launcher DCHECK (utility_sandbox_delegate.cc).
+
+- Fork the service from the unsandboxed zygote (utility_sandbox_delegate.cc
+  GetZygote), like the other hook-based services, so the broker is created
+  before the process is namespaced. The pre-sandboxed generic zygote
+  namespaces the child first, which makes the broker's single-threaded
+  fork check read an unavailable /proc and abort.
+
+- Add content/utility/xr/xr_sandbox_hook_linux.cc, a pre-sandbox hook that
+  starts a syscall broker granting read access to the OpenXR manifest
+  search paths, the runtime library and its dependency closure, the Vulkan
+  ICD, and read-write access to the DRM render nodes plus the GPU's sysfs
+  entries (the runtime creates its own Vulkan instance in-process). It does
+  not engage the namespace sandbox: the runtime must reach the compositor's
+  host AF_UNIX socket, which a network namespace would cut off.
+
+- Add sandbox/policy/linux/bpf_xr_policy_linux.cc (XrProcessPolicy): the GPU
+  process policy (the runtime renders with Vulkan) plus the AF_UNIX socket
+  syscalls the runtime uses to reach its compositor and pass DMA-BUF / sync
+  fds over it. socket() is restricted to AF_UNIX.
+
+- Guard OpenXrRenderLoop::SubmitFrameDrawnIntoTexture() against a frame that
+  arrives after StopRuntime() has reset context_provider_, matching the
+  existing null check in OnWebXrTokenSignaled().
+
+With the base zygote sandbox enabled, the OpenXR path no longer needs
+--no-sandbox.
+
+Verified end to end against Monado without --no-sandbox (AppArmor profile
+for the dev binary, DCHECK build): the sandbox engages, the XR utility runs
+as --service-sandbox-type=xr_compositing, the broker forks, the loader
+reaches active_runtime.json and loads libopenxr_monado.so, xrCreateInstance
+connects to Monado, the in-process Vulkan instance/device is created, the
+immersive-vr session starts, the swapchain format is negotiated, and frames
+are submitted to Monado.
+---
+ .../service_host/utility_sandbox_delegate.cc  |  10 +-
+ content/utility/BUILD.gn                      |   6 +
+ content/utility/utility_main.cc               |   8 +
+ content/utility/xr/BUILD.gn                   |  20 +++
+ content/utility/xr/xr_sandbox_hook_linux.cc   | 141 ++++++++++++++++++
+ content/utility/xr/xr_sandbox_hook_linux.h    |  29 ++++
+ device/vr/openxr/openxr_render_loop.cc        |   6 +
+ .../vr/public/mojom/isolated_xr_service.mojom |   4 +-
+ sandbox/policy/BUILD.gn                       |   5 +
+ sandbox/policy/linux/bpf_xr_policy_linux.cc   |  68 +++++++++
+ sandbox/policy/linux/bpf_xr_policy_linux.h    |  39 +++++
+ .../policy/linux/sandbox_seccomp_bpf_linux.cc |  10 ++
+ sandbox/policy/mojom/sandbox.mojom            |   4 +-
+ sandbox/policy/sandbox_type.cc                |  19 ++-
+ sandbox/policy/sandbox_type_unittest.cc       |   9 ++
+ 15 files changed, 369 insertions(+), 9 deletions(-)
+ create mode 100644 content/utility/xr/BUILD.gn
+ create mode 100644 content/utility/xr/xr_sandbox_hook_linux.cc
+ create mode 100644 content/utility/xr/xr_sandbox_hook_linux.h
+ create mode 100644 sandbox/policy/linux/bpf_xr_policy_linux.cc
+ create mode 100644 sandbox/policy/linux/bpf_xr_policy_linux.h
+
+diff --git a/content/browser/service_host/utility_sandbox_delegate.cc b/content/browser/service_host/utility_sandbox_delegate.cc
+index 47a64f9c60ef3..00dc9a7bfb890 100644
+--- a/content/browser/service_host/utility_sandbox_delegate.cc
++++ b/content/browser/service_host/utility_sandbox_delegate.cc
+@@ -53,10 +53,12 @@ UtilitySandboxedProcessLauncherDelegate::
+ #if DCHECK_IS_ON()
+   bool supported_sandbox_type =
+       sandbox_type_ == sandbox::mojom::Sandbox::kNoSandbox ||
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++      sandbox_type_ == sandbox::mojom::Sandbox::kXrCompositing ||
++#endif
+ #if BUILDFLAG(IS_WIN)
+       sandbox_type_ ==
+           sandbox::mojom::Sandbox::kNoSandboxAndElevatedPrivileges ||
+-      sandbox_type_ == sandbox::mojom::Sandbox::kXrCompositing ||
+       sandbox_type_ == sandbox::mojom::Sandbox::kPdfConversion ||
+       sandbox_type_ == sandbox::mojom::Sandbox::kIconReader ||
+       sandbox_type_ == sandbox::mojom::Sandbox::kMediaFoundationCdm ||
+@@ -151,6 +153,12 @@ ZygoteCommunication* UtilitySandboxedProcessLauncherDelegate::GetZygote() {
+       sandbox_type_ == sandbox::mojom::Sandbox::kNearby ||
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+       sandbox_type_ == sandbox::mojom::Sandbox::kAudio ||
++#if BUILDFLAG(IS_LINUX)
++      // The XR Device Service installs its broker and seccomp policy from a
++      // pre-sandbox hook, so it must fork from the unsandboxed zygote (like the
++      // other hook-based types) rather than the pre-sandboxed generic zygote.
++      sandbox_type_ == sandbox::mojom::Sandbox::kXrCompositing ||
++#endif
+ #if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
+       sandbox_type_ == sandbox::mojom::Sandbox::kShapeDetection ||
+ #endif
+diff --git a/content/utility/BUILD.gn b/content/utility/BUILD.gn
+index cb8edec486203..9bad2695b7b36 100644
+--- a/content/utility/BUILD.gn
++++ b/content/utility/BUILD.gn
+@@ -117,6 +117,12 @@ source_set("utility") {
+     }
+   }
+ 
++  if (is_linux) {
++    # Pre-sandbox hook for the XR Device Service (kXrCompositing). Loads the
++    # OpenXR runtime and grants broker file access before the sandbox seals.
++    deps += [ "//content/utility/xr:xr_sandbox_hook" ]
++  }
++
+   if (is_win || ((is_chromeos || is_linux) && is_chrome_branded)) {
+     deps += [
+       "//services/shape_detection:lib",
+diff --git a/content/utility/utility_main.cc b/content/utility/utility_main.cc
+index f0804f579e24d..61ca3671d2abb 100644
+--- a/content/utility/utility_main.cc
++++ b/content/utility/utility_main.cc
+@@ -46,6 +46,9 @@
+ #include "content/common/gpu_pre_sandbox_hook_linux.h"
+ #include "content/public/common/content_descriptor_keys.h"
+ #include "content/utility/speech/speech_recognition_sandbox_hook_linux.h"
++#if BUILDFLAG(IS_LINUX)
++#include "content/utility/xr/xr_sandbox_hook_linux.h"
++#endif  // BUILDFLAG(IS_LINUX)
+ #include "media/gpu/buildflags.h"
+ #include "media/media_buildflags.h"
+ #include "sandbox/policy/linux/sandbox_linux.h"
+@@ -323,6 +326,11 @@ int UtilityMain(MainFunctionParams parameters) {
+       pre_sandbox_hook =
+           base::BindOnce(&speech::SpeechRecognitionPreSandboxHook);
+       break;
++#if BUILDFLAG(IS_LINUX)
++    case sandbox::mojom::Sandbox::kXrCompositing:
++      pre_sandbox_hook = base::BindOnce(&vr::XrPreSandboxHook);
++      break;
++#endif  // BUILDFLAG(IS_LINUX)
+ #if BUILDFLAG(ENABLE_ON_DEVICE_TRANSLATION) && \
+     (BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS))
+     case sandbox::mojom::Sandbox::kOnDeviceTranslation:
+diff --git a/content/utility/xr/BUILD.gn b/content/utility/xr/BUILD.gn
+new file mode 100644
+index 0000000000000..f2e14d15ebaf3
+--- /dev/null
++++ b/content/utility/xr/BUILD.gn
+@@ -0,0 +1,20 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Pre-sandbox hook for the XR Device Service (kXrCompositing) on Linux. Loads
++# the OpenXR runtime and grants the broker file access the runtime needs before
++# the sandbox seals.
++source_set("xr_sandbox_hook") {
++  sources = [
++    "xr_sandbox_hook_linux.cc",
++    "xr_sandbox_hook_linux.h",
++  ]
++
++  deps = [
++    "//base",
++    "//sandbox/linux:sandbox_services",
++  ]
++
++  public_deps = [ "//sandbox/policy" ]
++}
+diff --git a/content/utility/xr/xr_sandbox_hook_linux.cc b/content/utility/xr/xr_sandbox_hook_linux.cc
+new file mode 100644
+index 0000000000000..53d98e6ff70ba
+--- /dev/null
++++ b/content/utility/xr/xr_sandbox_hook_linux.cc
+@@ -0,0 +1,141 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/utility/xr/xr_sandbox_hook_linux.h"
++
++#include <stdlib.h>
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/strings/string_split.h"
++#include "base/strings/stringprintf.h"
++#include "sandbox/linux/syscall_broker/broker_command.h"
++#include "sandbox/linux/syscall_broker/broker_file_permission.h"
++
++using sandbox::syscall_broker::BrokerFilePermission;
++using sandbox::syscall_broker::MakeBrokerCommandSet;
++
++namespace vr {
++
++namespace {
++
++// Returns the env var |name|, or an empty string if unset/empty.
++std::string GetEnv(const char* name) {
++  const char* value = getenv(name);
++  return (value && value[0]) ? std::string(value) : std::string();
++}
++
++// Files and directories the OpenXR loader, the Vulkan loader, and the OpenXR
++// runtime open()/stat() from inside the XR utility process. Everything is
++// read-only: the swapchain images are shared with the compositor over the IPC
++// socket and DMA-BUF fds, not through brokered files.
++std::vector<BrokerFilePermission> GetOpenXrFilePermissions() {
++  std::vector<BrokerFilePermission> permissions{
++      BrokerFilePermission::ReadOnly("/dev/urandom"),
++      BrokerFilePermission::ReadOnly("/etc/ld.so.cache"),
++  };
++
++  auto add_dir = [&permissions](const std::string& dir) {
++    if (dir.empty()) {
++      return;
++    }
++    permissions.push_back(BrokerFilePermission::ReadOnlyRecursive(
++        base::FilePath(dir).AsEndingWithSeparator().value()));
++  };
++
++  // The OpenXR loader resolves the active runtime manifest
++  // (active_runtime.json) before dlopen()ing the runtime named by its
++  // "library_path". $XR_RUNTIME_JSON points at the manifest directly;
++  // otherwise it searches the XDG config directories. Mirror that search so
++  // the manifest is reachable regardless of how the runtime was installed.
++  std::string runtime_json = GetEnv("XR_RUNTIME_JSON");
++  if (!runtime_json.empty()) {
++    base::FilePath manifest(runtime_json);
++    permissions.push_back(BrokerFilePermission::ReadOnly(manifest.value()));
++    add_dir(manifest.DirName().value());
++  }
++
++  std::string config_home = GetEnv("XDG_CONFIG_HOME");
++  if (config_home.empty()) {
++    std::string home = GetEnv("HOME");
++    if (!home.empty()) {
++      config_home = home + "/.config";
++    }
++  }
++  if (!config_home.empty()) {
++    add_dir(config_home + "/openxr");
++  }
++
++  std::string config_dirs = GetEnv("XDG_CONFIG_DIRS");
++  if (config_dirs.empty()) {
++    config_dirs = "/etc/xdg";
++  }
++  for (const auto& dir :
++       base::SplitString(config_dirs, ":", base::TRIM_WHITESPACE,
++                         base::SPLIT_WANT_NONEMPTY)) {
++    add_dir(dir + "/openxr");
++  }
++  add_dir("/etc/openxr");
++  add_dir("/usr/share/openxr");
++  add_dir("/usr/local/share/openxr");
++
++  // The runtime .so (e.g. libopenxr_monado.so), the Vulkan loader, the Vulkan
++  // ICD driver and their dependency closure live under the system library
++  // directories. The dynamic loader open()s them via the broker after the
++  // sandbox seals.
++  add_dir("/usr/lib");
++  add_dir("/usr/local/lib");
++  add_dir("/lib");
++
++  // Vulkan ICD manifests describing the installed driver.
++  add_dir("/usr/share/vulkan");
++  add_dir("/etc/vulkan");
++
++  // The OpenXR runtime creates its own Vulkan instance in this process at
++  // session start, so it needs the same GPU access the GPU process has: the
++  // DRM nodes (read-write) plus the device's sysfs entries the driver reads
++  // while enumerating physical devices.
++  permissions.push_back(BrokerFilePermission::ReadOnly("/dev/dri"));
++  for (int i = 0; i < 8; ++i) {
++    permissions.push_back(BrokerFilePermission::ReadWrite(
++        base::StringPrintf("/dev/dri/renderD%d", 128 + i)));
++    permissions.push_back(
++        BrokerFilePermission::ReadWrite(base::StringPrintf("/dev/dri/card%d", i)));
++  }
++  add_dir("/sys/dev/char");
++  add_dir("/sys/class/drm");
++  add_dir("/sys/devices");
++  add_dir("/sys/bus/pci/devices");
++
++  return permissions;
++}
++
++}  // namespace
++
++bool XrPreSandboxHook(sandbox::policy::SandboxLinux::Options options) {
++  // The broker forks and therefore must run while single-threaded; do not load
++  // any library here, as the Vulkan loader / ICD driver spawn worker threads.
++  // The OpenXR loader and the Vulkan loader open everything they need through
++  // the broker after the sandbox seals.
++  auto* instance = sandbox::policy::SandboxLinux::GetInstance();
++  instance->StartBrokerProcess(
++      MakeBrokerCommandSet({
++          sandbox::syscall_broker::COMMAND_ACCESS,
++          sandbox::syscall_broker::COMMAND_OPEN,
++          sandbox::syscall_broker::COMMAND_READLINK,
++          sandbox::syscall_broker::COMMAND_STAT,
++      }),
++      GetOpenXrFilePermissions(), options);
++  // NOTE: intentionally do not call EngageNamespaceSandboxIfPossible() here.
++  // The OpenXR runtime connects to its compositor over a host AF_UNIX socket
++  // ($XDG_RUNTIME_DIR/<runtime>_comp_ipc); the network namespace the namespace
++  // sandbox installs makes that connect() fail. The process is still confined
++  // by the seccomp policy (XrProcessPolicy) and the file broker.
++
++  return true;
++}
++
++}  // namespace vr
+diff --git a/content/utility/xr/xr_sandbox_hook_linux.h b/content/utility/xr/xr_sandbox_hook_linux.h
+new file mode 100644
+index 0000000000000..ac79e1f46e524
+--- /dev/null
++++ b/content/utility/xr/xr_sandbox_hook_linux.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_UTILITY_XR_XR_SANDBOX_HOOK_LINUX_H_
++#define CONTENT_UTILITY_XR_XR_SANDBOX_HOOK_LINUX_H_
++
++#include "sandbox/policy/linux/sandbox_linux.h"
++
++namespace vr {
++
++// Pre-sandbox hook for the XR Device Service (kXrCompositing) on Linux.
++//
++// The OpenXR loader runs inside the (sandboxed) XR utility process. Before the
++// sandbox seals, this hook:
++//   * dlopen()s the OpenXR loader so its code (and, transitively, the active
++//     runtime's library named by active_runtime.json) is mapped while the
++//     process still has full filesystem access, and
++//   * starts a syscall broker that grants read/open access to the OpenXR
++//     runtime manifest search paths, the runtime library, the Vulkan ICD, and
++//     the DRM render nodes the runtime needs when it creates an XrInstance.
++//
++// Without this the kUtility sandbox blocked the loader from open()ing the file
++// pointed to by active_runtime.json, which is why --no-sandbox was required.
++bool XrPreSandboxHook(sandbox::policy::SandboxLinux::Options options);
++
++}  // namespace vr
++
++#endif  // CONTENT_UTILITY_XR_XR_SANDBOX_HOOK_LINUX_H_
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index ba68562563bb9..e5800eed26b55 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -920,6 +920,12 @@ void OpenXrRenderLoop::SubmitFrameDrawnIntoTexture(
+   TRACE_EVENT_BEGIN("xr", "OpenXrRenderLoop::WaitSyncToken",
+                     perfetto::Track(frame_index));
+   DVLOG(3) << __func__ << " frame_index=" << frame_index;
++  // This frame can arrive after the session has ended and the context was torn
++  // down (StopRuntime() resets context_provider_); don't dereference it then.
++  if (!context_provider_) {
++    TRACE_EVENT_END("xr", perfetto::Track(frame_index));
++    return;
++  }
+   gpu::gles2::GLES2Interface* gl = context_provider_->ContextGL();
+   gl->WaitSyncTokenCHROMIUM(sync_token.GetConstData());
+ 
+diff --git a/device/vr/public/mojom/isolated_xr_service.mojom b/device/vr/public/mojom/isolated_xr_service.mojom
+index 3d51f264ac9fb..30b741307b96e 100644
+--- a/device/vr/public/mojom/isolated_xr_service.mojom
++++ b/device/vr/public/mojom/isolated_xr_service.mojom
+@@ -186,9 +186,9 @@ interface IsolatedXRRuntimeProvider {
+   RequestDevices(pending_remote<IsolatedXRRuntimeProviderClient> client);
+ };
+ 
+-[EnableIf=is_win]
++[EnableIf=is_win|is_linux]
+ const sandbox.mojom.Sandbox kXrSandbox = sandbox.mojom.Sandbox.kXrCompositing;
+-[EnableIfNot=is_win]
++[EnableIfNot=is_win|is_linux]
+ const sandbox.mojom.Sandbox kXrSandbox = sandbox.mojom.Sandbox.kUtility;
+ 
+ // The main interface for the XR Device Service. Called from the browser
+diff --git a/sandbox/policy/BUILD.gn b/sandbox/policy/BUILD.gn
+index 1a3c7c6cf8b15..3ac8758f9ca0f 100644
+--- a/sandbox/policy/BUILD.gn
++++ b/sandbox/policy/BUILD.gn
+@@ -102,6 +102,11 @@ component("policy") {
+       ]
+     }
+     if (is_linux) {
++      # The XR Device Service (kXrCompositing) sandbox only exists on Linux.
++      sources += [
++        "linux/bpf_xr_policy_linux.cc",
++        "linux/bpf_xr_policy_linux.h",
++      ]
+       deps += [ "//net" ]  # TODO(crbug.com/40220507): remove this.
+     }
+     configs += [
+diff --git a/sandbox/policy/linux/bpf_xr_policy_linux.cc b/sandbox/policy/linux/bpf_xr_policy_linux.cc
+new file mode 100644
+index 0000000000000..2d8bc2dc4f619
+--- /dev/null
++++ b/sandbox/policy/linux/bpf_xr_policy_linux.cc
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "sandbox/policy/linux/bpf_xr_policy_linux.h"
++
++#include <errno.h>
++#include <sys/socket.h>
++
++#include "sandbox/linux/bpf_dsl/bpf_dsl.h"
++#include "sandbox/linux/system_headers/linux_syscalls.h"
++
++using sandbox::bpf_dsl::Allow;
++using sandbox::bpf_dsl::Arg;
++using sandbox::bpf_dsl::Error;
++using sandbox::bpf_dsl::If;
++using sandbox::bpf_dsl::ResultExpr;
++
++namespace sandbox {
++namespace policy {
++
++XrProcessPolicy::XrProcessPolicy() : GpuProcessPolicy(MremapPolicy::kBlock) {}
++
++XrProcessPolicy::~XrProcessPolicy() = default;
++
++ResultExpr XrProcessPolicy::EvaluateSyscall(int system_call_number) const {
++  switch (system_call_number) {
++    // The OpenXR runtime connects to its compositor over an AF_UNIX socket and
++    // exchanges file descriptors (DMA-BUF, sync fences) over it. The GPU policy
++    // does not allow these because the GPU process never needs host sockets.
++#if defined(__NR_connect)
++    case __NR_connect:
++#endif
++#if defined(__NR_getpeername)
++    case __NR_getpeername:
++#endif
++#if defined(__NR_getsockname)
++    case __NR_getsockname:
++#endif
++#if defined(__NR_getsockopt)
++    case __NR_getsockopt:
++#endif
++#if defined(__NR_setsockopt)
++    case __NR_setsockopt:
++#endif
++    // The OpenXR runtime's IPC client arms a watchdog timer around its
++    // connection handshake.
++#if defined(__NR_alarm)
++    case __NR_alarm:
++#endif
++      return Allow();
++#if defined(__NR_socket)
++    case __NR_socket: {
++      // Restrict socket creation to AF_UNIX; the runtime never needs network
++      // sockets, and netlink must never be allowed.
++      const Arg<int> domain(0);
++      return If(domain == AF_UNIX, Allow()).Else(Error(EPERM));
++    }
++#endif
++    default:
++      // Everything else (GPU/DRM/Vulkan syscalls, directory enumeration, the
++      // file broker, etc.) is handled by the GPU process policy.
++      return GpuProcessPolicy::EvaluateSyscall(system_call_number);
++  }
++}
++
++}  // namespace policy
++}  // namespace sandbox
+diff --git a/sandbox/policy/linux/bpf_xr_policy_linux.h b/sandbox/policy/linux/bpf_xr_policy_linux.h
+new file mode 100644
+index 0000000000000..cef5f86904b85
+--- /dev/null
++++ b/sandbox/policy/linux/bpf_xr_policy_linux.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef SANDBOX_POLICY_LINUX_BPF_XR_POLICY_LINUX_H_
++#define SANDBOX_POLICY_LINUX_BPF_XR_POLICY_LINUX_H_
++
++#include "sandbox/linux/bpf_dsl/bpf_dsl.h"
++#include "sandbox/policy/export.h"
++#include "sandbox/policy/linux/bpf_gpu_policy_linux.h"
++
++namespace sandbox {
++namespace policy {
++
++// Seccomp-bpf policy for the XR Device Service (kXrCompositing) on Linux.
++//
++// The XR utility process drives the OpenXR runtime, which creates its own
++// Vulkan instance in-process and renders into it, so it needs the same GPU
++// syscalls the GPU process does. It additionally talks to the runtime's
++// compositor over a host AF_UNIX socket ($XDG_RUNTIME_DIR/<runtime>_comp_ipc),
++// which the GPU policy does not allow. This policy is therefore the GPU policy
++// plus the AF_UNIX socket syscalls (socket() is restricted to AF_UNIX, like
++// AudioProcessPolicy does for PulseAudio/PipeWire).
++class SANDBOX_POLICY_EXPORT XrProcessPolicy : public GpuProcessPolicy {
++ public:
++  XrProcessPolicy();
++
++  XrProcessPolicy(const XrProcessPolicy&) = delete;
++  XrProcessPolicy& operator=(const XrProcessPolicy&) = delete;
++
++  ~XrProcessPolicy() override;
++
++  bpf_dsl::ResultExpr EvaluateSyscall(int system_call_number) const override;
++};
++
++}  // namespace policy
++}  // namespace sandbox
++
++#endif  // SANDBOX_POLICY_LINUX_BPF_XR_POLICY_LINUX_H_
+diff --git a/sandbox/policy/linux/sandbox_seccomp_bpf_linux.cc b/sandbox/policy/linux/sandbox_seccomp_bpf_linux.cc
+index 73bf31cb284a2..dd00d4cabe1f2 100644
+--- a/sandbox/policy/linux/sandbox_seccomp_bpf_linux.cc
++++ b/sandbox/policy/linux/sandbox_seccomp_bpf_linux.cc
+@@ -52,6 +52,9 @@
+ #include "sandbox/policy/linux/bpf_service_policy_linux.h"
+ #include "sandbox/policy/linux/bpf_speech_recognition_policy_linux.h"
+ #include "sandbox/policy/linux/bpf_utility_policy_linux.h"
++#if BUILDFLAG(IS_LINUX)
++#include "sandbox/policy/linux/bpf_xr_policy_linux.h"
++#endif  // BUILDFLAG(IS_LINUX)
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "sandbox/policy/features.h"
+@@ -206,6 +209,10 @@ std::unique_ptr<BPFBasePolicy> SandboxSeccompBPF::PolicyForSandboxType(
+       return std::make_unique<ServiceProcessPolicy>();
+     case sandbox::mojom::Sandbox::kSpeechRecognition:
+       return std::make_unique<SpeechRecognitionProcessPolicy>();
++#if BUILDFLAG(IS_LINUX)
++    case sandbox::mojom::Sandbox::kXrCompositing:
++      return std::make_unique<XrProcessPolicy>();
++#endif  // BUILDFLAG(IS_LINUX)
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+     case sandbox::mojom::Sandbox::kOnDeviceTranslation:
+       return std::make_unique<OnDeviceTranslationProcessPolicy>();
+@@ -295,6 +302,9 @@ void SandboxSeccompBPF::RunSandboxSanityChecks(
+     case sandbox::mojom::Sandbox::kScreenAI:
+     case sandbox::mojom::Sandbox::kOnDeviceTranslation:
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++#if BUILDFLAG(IS_LINUX)
++    case sandbox::mojom::Sandbox::kXrCompositing:
++#endif  // BUILDFLAG(IS_LINUX)
+     case sandbox::mojom::Sandbox::kAudio:
+     case sandbox::mojom::Sandbox::kService:
+     case sandbox::mojom::Sandbox::kServiceWithJit:
+diff --git a/sandbox/policy/mojom/sandbox.mojom b/sandbox/policy/mojom/sandbox.mojom
+index 2d3a6a01e8bec..db56f1b033cdb 100644
+--- a/sandbox/policy/mojom/sandbox.mojom
++++ b/sandbox/policy/mojom/sandbox.mojom
+@@ -89,8 +89,8 @@ enum Sandbox {
+   // Like kUtility but allows loading of screen AI library.
+   [EnableIf=is_chromeos|is_linux|is_mac|is_win] kScreenAI,
+ 
+-  // |kXrCompositing| hosts XR Device Service on Windows.
+-  [EnableIf=is_win] kXrCompositing,
++  // |kXrCompositing| hosts the XR Device Service on Windows and Linux.
++  [EnableIf=is_win|is_linux] kXrCompositing,
+ 
+   // Allows access to OS system proxy resolver APIs (WinHTTP on Windows,
+   // SystemConfiguration/CFNetwork on macOS).
+diff --git a/sandbox/policy/sandbox_type.cc b/sandbox/policy/sandbox_type.cc
+index 455d123ef0379..1bf3963e4cbbb 100644
+--- a/sandbox/policy/sandbox_type.cc
++++ b/sandbox/policy/sandbox_type.cc
+@@ -40,10 +40,15 @@ constexpr char kPrintBackendSandbox[] = "print_backend";
+ constexpr char kScreenAISandbox[] = "screen_ai";
+ #endif
+ 
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++// The XR Device Service hosts the OpenXR runtime; it is sandboxed on Windows
++// and Linux.
++constexpr char kXrCompositingSandbox[] = "xr_compositing";
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++
+ #if BUILDFLAG(IS_WIN)
+ constexpr char kNoneSandboxAndElevatedPrivileges[] = "none_and_elevated";
+ constexpr char kPdfConversionSandbox[] = "pdf_conversion";
+-constexpr char kXrCompositingSandbox[] = "xr_compositing";
+ constexpr char kIconReaderSandbox[] = "icon_reader";
+ constexpr char kMediaFoundationCdmSandbox[] = "mf_cdm";
+ #endif  // BUILDFLAG(IS_WIN)
+@@ -131,9 +136,11 @@ void SetCommandLineFlagsForSandboxType(base::CommandLine* command_line,
+ #if BUILDFLAG(IS_FUCHSIA)
+     case Sandbox::kVideoCapture:
+ #endif
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++    case Sandbox::kXrCompositing:
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+ #if BUILDFLAG(IS_WIN)
+     case Sandbox::kNoSandboxAndElevatedPrivileges:
+-    case Sandbox::kXrCompositing:
+     case Sandbox::kPdfConversion:
+     case Sandbox::kIconReader:
+     case Sandbox::kMediaFoundationCdm:
+@@ -263,9 +270,11 @@ std::string StringFromUtilitySandboxType(Sandbox sandbox_type) {
+     case Sandbox::kOnDeviceTranslation:
+       return kOnDeviceTranslationSandbox;
+ #endif
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+     case Sandbox::kXrCompositing:
+       return kXrCompositingSandbox;
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++#if BUILDFLAG(IS_WIN)
+     case Sandbox::kPdfConversion:
+       return kPdfConversionSandbox;
+     case Sandbox::kIconReader:
+@@ -349,10 +358,12 @@ sandbox::mojom::Sandbox UtilitySandboxTypeFromString(
+   if (sandbox_string == kPrintCompositorSandbox) {
+     return Sandbox::kPrintCompositor;
+   }
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   if (sandbox_string == kXrCompositingSandbox) {
+     return Sandbox::kXrCompositing;
+   }
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++#if BUILDFLAG(IS_WIN)
+   if (sandbox_string == kPdfConversionSandbox) {
+     return Sandbox::kPdfConversion;
+   }
+diff --git a/sandbox/policy/sandbox_type_unittest.cc b/sandbox/policy/sandbox_type_unittest.cc
+index 8135090673d4f..4ac296206d260 100644
+--- a/sandbox/policy/sandbox_type_unittest.cc
++++ b/sandbox/policy/sandbox_type_unittest.cc
+@@ -96,6 +96,15 @@ TEST(SandboxTypeTest, Utility) {
+             SandboxTypeFromCommandLine(command_line12));
+ #endif
+ 
++#if BUILDFLAG(IS_LINUX)
++  // The XR Device Service (kXrCompositing) hosts the OpenXR runtime and is
++  // sandboxed on Linux as well as Windows.
++  base::CommandLine command_line_xr(command_line);
++  SetCommandLineFlagsForSandboxType(&command_line_xr, Sandbox::kXrCompositing);
++  EXPECT_EQ(Sandbox::kXrCompositing,
++            SandboxTypeFromCommandLine(command_line_xr));
++#endif
++
+ #if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || \
+     BUILDFLAG(IS_WIN)
+   base::CommandLine command_line13(command_line);
+-- 
+2.53.0
+
