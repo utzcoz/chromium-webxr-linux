@@ -209,6 +209,56 @@ flowchart LR
     Monado --> HMD
 ```
 
+## Graphics APIs: where GL is used and where Vulkan is used
+
+This is a **hybrid GL + Vulkan** pipeline. Everything the web page and the
+browser *draw* is GL; everything handed to the OpenXR runtime (Monado) is
+Vulkan; the two worlds meet at a shared DMA-BUF, with no pixel copy across the
+boundary.
+
+| Part | Graphics API | How |
+| --- | --- | --- |
+| WebXR content (the page) | **GL** — WebGL | The page renders into an `XRWebGLLayer`; Blink drives it over the GL command buffer (`gpu::gles2::GLES2Interface`). |
+| Browser overlay UI | **GL** — command-buffer GLES2 | `GraphicsDelegateLinux` renders the `chrome/browser/vr` scene graph through `gles2_c_lib`. |
+| OpenXR graphics binding | **Vulkan** | `OpenXrGraphicsBindingVulkan` creates the `VkInstance`/`VkDevice` via `XR_KHR_vulkan_enable2`; the swapchain format it negotiates is a `VkFormat`. |
+| Composite + submit to Monado | **Vulkan** | The base-layer copy and the overlay composite are Vulkan (embedded SPIR-V, `vkCmd…`), submitted with `xrEndFrame`. |
+
+The **bridge** between the two is a linear, `modifier = 0`
+(`DRM_FORMAT_MOD_LINEAR`) DMA-BUF: a GL context renders into a `SharedImage`
+backed by that DMA-BUF, and the Vulkan binding imports the *same* buffer as a
+`VkImage` (`VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf`).
+GL → Vulkan ordering is a sync-FD fence, or a CPU `glFinish` fallback when the
+GL backend lacks `GL_CHROMIUM_gpu_fence` (see *GPU backend* below). Only the
+DMA-BUF handle and a sync primitive cross the API boundary — never pixels.
+
+```mermaid
+flowchart LR
+    subgraph GLW["Drawn with GL"]
+      W["WebXR content<br/>WebGL · XRWebGLLayer"]
+      O["Browser overlay UI<br/>command-buffer GLES2"]
+    end
+    D["Shared DMA-BUF<br/>LINEAR · modifier 0<br/>SharedImage ⇄ VkImage"]
+    subgraph VKW["Submitted with Vulkan"]
+      B["OpenXrGraphicsBindingVulkan<br/>composite + xrEndFrame"]
+    end
+    W -->|GL render| D
+    O -->|GL render| D
+    D -->|import as VkImage + sync| B
+    B --> MN["monado-service"]
+```
+
+**`--use-angle=vulkan` does not change this.** WebGL is still the API the page
+and Blink use; ANGLE (inside the GPU process) merely *translates* those GL
+commands to a native-GL or a Vulkan backend underneath, depending on the flag.
+That changes how the GL is executed and which GPU-fence path you get (see *GPU
+backend* below), not what WebXR renders *with*. The WebXR and overlay layers are
+GL either way; only the OpenXR binding is Vulkan by construction.
+
+Why Vulkan for the binding: Monado exposes `XR_KHR_vulkan_enable2`, and Vulkan
+provides the external-memory / DMA-BUF interop needed to share buffers zero-copy
+with the GPU process. The other OpenXR ports use whichever API their platform's
+runtime expects — D3D11 on Windows, OpenGL ES on Android.
+
 ## Base commits
 
 The patch applies cleanly on top of these trees:
