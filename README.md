@@ -12,7 +12,7 @@ reference OpenXR runtime.
 
 ## What the patches do
 
-This is a five-patch series — apply `0001` through `0005` in order.
+This is a seven-patch series — apply `0001` through `0007` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -30,12 +30,12 @@ This is a five-patch series — apply `0001` through `0005` in order.
 - Enables `device::features::kOpenXR` by default on Linux and keeps
   `XRRuntimeManagerImpl` alive across navigations so `isSessionSupported`
   does not flap during the ~5 s re-enumeration gap.
-- Prepares the utility-process half of the VR browser overlay UI: the
-  Vulkan graphics binding imports the overlay DMA-BUF as a `VkImage`
-  (`VK_EXT_external_memory_dma_buf`) and composites it with
-  `vkCmdBlitImage` to a screen-space rect per eye. **The overlay is not
-  actually constructed on Linux today** — see *Known limitations*
-  below.
+- Renders the in-headset **VR browser overlay UI** — the permission
+  prompts, capture indicators, and media-picker notifications shown during
+  an immersive session — and composites it into the OpenXR swapchain. The
+  XR runtime process allocates the overlay image and the browser renders
+  the UI into it; a Vulkan composite pass alpha-blends it over the WebXR
+  content per eye. See *VR browser overlay UI* below (`0007`).
 - Adds a `--webxr-openxr-swapchain-format=rgba|bgra` switch (default `rgba`)
   to choose the swapchain channel ordering, forwarded into the isolated XR
   utility process; the swapchain `VkFormat`, exported DMA-BUF image, and
@@ -61,6 +61,14 @@ This is a five-patch series — apply `0001` through `0005` in order.
   and GPU/Vulkan device files, plus `XrProcessPolicy` (the GPU process
   policy plus the AF_UNIX socket syscalls the runtime uses to reach its
   compositor). See *Sandbox note* below (`0005`).
+- Narrows that sandbox's file-broker policy. Instead of granting the broker
+  recursive read over `/usr/lib`, `/lib` and friends so the OpenXR/Vulkan
+  loaders can `dlopen()` their dependency closure after the sandbox seals,
+  a pre-sandbox hook **pre-warms** the closure — it `dlopen()`s the OpenXR
+  runtime and the Vulkan loader/ICDs/implicit layers with `RTLD_NOW` while
+  the filesystem is still reachable, mirroring the GPU process's hook, so
+  the loaders' later `dlopen()`s never reach the broker. The recursive
+  grants become a narrow allow-list. See *Sandbox note* below (`0006`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -290,8 +298,8 @@ gclient sync
 
 ## 3. Apply the patches
 
-From inside `chromium/src`, apply the five-patch series in order (the glob
-expands to `0001` through `0005`):
+From inside `chromium/src`, apply the seven-patch series in order (the glob
+expands to `0001` through `0007`):
 
 ```bash
 git am /path/to/chromium-webxr-linux/000*.patch
@@ -333,8 +341,9 @@ autoninja -C out/Default device_unittests
 ## 5. Run and verify
 
 `tests/webxr-test.html` drives a WebXR immersive session. The same page
-also triggers permission prompts and media captures so you can test the
-VR-overlay path once that is fully wired on Linux.
+also triggers permission prompts and media captures so you can exercise the
+in-headset VR-overlay path (see *VR browser overlay UI* below). Every
+trigger has a keyboard shortcut so you can fire it without leaving VR.
 
 With `monado-service` running in terminal 1 and the Chromium source tree
 as the current directory:
@@ -352,6 +361,10 @@ XR_RUNTIME_JSON=/path/to/monado/build/openxr_monado-dev.json \
   "file:///path/to/chromium-webxr-linux/tests/webxr-test.html" \
   2>&1 | tee /tmp/chrome-xr.log
 ```
+
+`--no-sandbox` here is only the base-zygote shortcut for a locally-built binary;
+the OpenXR path itself runs sandboxed. Drop it once you attach the AppArmor
+profile from the *Sandbox note* below.
 
 ### GPU backend — `--use-angle=vulkan`
 
@@ -452,9 +465,11 @@ On the page:
    Chromium did not detect the OpenXR runtime.
 2. Click **Enter VR** — Monado presents a solid dark-blue frame to the
    headset (the test page's clear-color).
-3. Permission prompts clicked while in VR currently surface only as
-   2D dialogs on the desktop (see *Known limitations*). Exit VR to
-   accept or dismiss them.
+3. Permission prompts, capture indicators, and media-picker notifications
+   triggered while in VR now render **inside the headset** as an overlay
+   composited over the WebXR content — you do not have to exit (see *VR
+   browser overlay UI* below). The accept/deny dialog itself is a desktop
+   dialog, the same as on Windows.
 4. Press `Esc` or click **Exit VR**.
 
 If you prefer a reference demo once the basics work, the Immersive Web
@@ -507,6 +522,20 @@ the runtime library and the GPU/Vulkan device files, and `XrProcessPolicy`
 (the GPU process policy plus the AF_UNIX socket syscalls) lets the runtime
 reach its compositor over the per-user IPC socket.
 
+Patch `0006` tightens that broker's file policy. The loaders (OpenXR, Vulkan,
+the Vulkan ICD) `dlopen()` their dependency closure lazily, which the initial
+version served by granting the broker recursive read over `/usr/lib`, `/lib`
+and `/usr/local/lib` — far broader than upstream norms. Instead, the
+pre-sandbox hook now **pre-warms** that closure: right after the broker forks
+(which must happen while single-threaded) it `dlopen()`s the OpenXR runtime
+named by `active_runtime.json` plus the Vulkan loader, the Mesa ICDs and the
+implicit layers with `RTLD_NOW | RTLD_GLOBAL`, pulling the whole transitive
+`DT_NEEDED` closure into the process while the filesystem is still directly
+reachable. The loaders' later `dlopen()`s then find everything resident and
+never reach the broker, so the recursive grants collapse to a narrow
+allow-list naming only the few libraries the loaders open by name. This mirrors
+the GPU process's own pre-sandbox hook (`LoadLibrariesForGpu`).
+
 The one thing a *developer* build still needs `--no-sandbox` for is the
 **base zygote sandbox**, and that is a packaging concern unrelated to
 OpenXR: a locally-built `out/Default/chrome` is not allow-listed to create
@@ -539,35 +568,92 @@ connects to Monado, the in-process Vulkan instance/device is created, the
 immersive-vr session starts, the swapchain format is negotiated, and frames
 are submitted to the compositor.
 
+## VR browser overlay UI
+
+Permission prompts, capture indicators, and media-picker notifications that
+appear during an immersive session are rendered **inside the headset** as an
+overlay composited over the WebXR content, so the user does not have to take the
+headset off to notice them (`0007`). Trigger them from `tests/webxr-test.html`
+(the *Request …* and *Start … capture* buttons, each with a keyboard shortcut so
+it works from inside VR).
+
+<p align="center">
+  <img src="webxr-permission-ui-overlay.png"
+       alt="In-headset permission-prompt overlay composited per eye"
+       width="680">
+  <br>
+  <em>The generic permission notification rendered in-headset (left and right
+  eye), composited into the OpenXR swapchain that Monado presents.</em>
+</p>
+
+How it works:
+
+- The browser process renders the overlay UI (the same `chrome/browser/vr`
+  scene graph Windows uses) through a command-buffer GL `GraphicsDelegate`. On
+  Linux this is `GraphicsDelegateLinux`; the Windows delegate
+  (`graphics_delegate_win`) is left untouched.
+- So the overlay reaches the compositor even on frames where WebXR is hidden (a
+  permission prompt hides the WebXR layer), the **XR runtime process allocates
+  the overlay image** — a `LINEAR`, DMA-BUF-exportable `VkImage` — and returns
+  the exported handle to the browser via a new Linux-only field on
+  `ImmersiveOverlay.RequestNextOverlayPose`. The browser imports it and renders
+  the UI directly into it; the runtime composites it with a Vulkan pass that
+  alpha-blends the overlay over the WebXR content per eye. This mirrors how the
+  WebXR base-layer image already works, so no cross-process "produce" step is
+  needed and the overlay shows whether or not WebXR is visible.
+- The permission **dialog** itself (allow/deny) is a desktop dialog on every
+  platform; the headset shows the generic "this site needs more permissions"
+  notification, the same as Windows.
+
+Buffer ownership — the runtime owns the overlay image the browser renders into,
+the inverse of a normal browser-owned texture:
+
+```mermaid
+flowchart LR
+    subgraph U["Utility · XR runtime (OpenXrGraphicsBindingVulkan)"]
+      A["allocate overlay VkImage<br/>LINEAR · DMA-BUF export"]
+      C["Vulkan composite pass<br/>alpha-blend over WebXR, per eye"]
+    end
+    subgraph B["Browser · VR UI (GraphicsDelegateLinux)"]
+      R["render overlay UI<br/>into the imported image"]
+    end
+    MN["monado-service"]
+    HMD(["HMD"])
+
+    A -->|ExportedSharedImage via RequestNextOverlayPose reply| R
+    R -->|SubmitOverlayTexture + GL-done sync token| C
+    A -. runtime owns the backing .-> C
+    C -->|xrEndFrame · swapchain image| MN
+    MN --> HMD
+```
+
+Per frame, while an overlay is visible:
+
+```mermaid
+sequenceDiagram
+    participant BR as Browser · VR UI<br/>(GraphicsDelegateLinux)
+    participant XR as Utility · XR runtime<br/>(OpenXrGraphicsBindingVulkan)
+    participant MN as monado-service
+    participant HMD
+
+    Note over XR: a prompt / capture indicator<br/>becomes visible
+    BR->>XR: RequestNextOverlayPose
+    XR->>XR: allocate overlay VkImage<br/>(LINEAR, DMA-BUF), export
+    XR-->>BR: pose + exported overlay image<br/>+ creation sync token
+    BR->>BR: import (ImportUnowned),<br/>render overlay UI into it
+    BR->>XR: SubmitOverlayTexture (+ sync token)
+    XR->>XR: wait on sync, then Vulkan composite<br/>alpha-blend overlay over WebXR (per eye)
+    XR->>MN: xrEndFrame (swapchain image)
+    MN->>HMD: present
+```
+
 ## Known limitations
 
-**VR browser overlay UI on Linux.** Permission prompts, capture
-indicators, and media-picker dialogs are *not* rendered inside the
-headset yet. `ChromeXrIntegrationClient::CreateVrUiHost` returns
-`nullptr` on Linux because constructing `VRUiHostImpl` walks into
-`chrome/browser/vr/ui.cc` shader code that depends on `gles2_lib`'s
-thread-local GL context, and `gles2::Initialize()` (which allocates
-that TLS key) is only called from the VR test suite — never from the
-production browser process. Attempting to use the path crashes with
-a null deref on the first `glCreateShader`.
-
-What the patch does do for the overlay:
-
-- Reuses `chrome/browser/vr/graphics_delegate_win.{cc,h}` for the Linux
-  build (the file is pure `SharedImage` + GL command buffer, not D3D),
-  and `VRBrowserRendererThread::OnGraphicsReady` now bails gracefully
-  when `GraphicsDelegate::BindContext()` fails instead of crashing.
-- `OpenXrGraphicsBindingVulkan::SetOverlayTexture` imports the
-  overlay DMA-BUF as a `VkImage` and `RenderLayer` blits it to a
-  screen-space rect per eye. This code is wired and tested
-  compile-side, but unreachable in practice until the browser-side
-  `VRUiHostImpl` constructs successfully.
-
-A follow-up project is needed to wire `gles2::Initialize()` into the
-browser process (or move the VR UI rendering to a different GL
-initialisation path that works in shipping Chromium). Once that lands,
-flipping `CreateVrUiHost` to return `VRUiHostImpl` on Linux is enough
-to light up the overlay end-to-end; the utility-side code is ready.
+- **immersive-ar** is not supported on Linux — there is no AR runtime binding,
+  only immersive-vr.
+- The in-headset overlay shows the **generic** permission notification ("this
+  site needs more permissions"), not per-permission wording. This matches
+  Windows; the actual allow/deny happens in the desktop dialog.
 
 ## Reporting issues
 

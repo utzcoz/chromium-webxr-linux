@@ -1,63 +1,105 @@
 <!doctype html>
 <!-- One-stop manual test for WebXR-over-OpenXR on Linux.
      Covers two things in one page:
-       1. Main WebXR: Enter VR → immersive-vr session → stereo
+       1. Main WebXR: Enter VR -> immersive-vr session -> animated stereo
           clear-color frame (verifies projection-layer rendering).
-       2. Browser overlay: while a session is active, the Permission
-          and Capture buttons trigger Chromium UI that should render
-          as a small stereo quad in each eye.
-     The on-page log records every event so you can correlate what the
-     page asked for with what the headset actually displays. -->
+       2. Browser overlay UI: while a session is active, the browser draws
+          its own UI as a stereo quad composited on top of the WebXR content.
+          There are THREE distinct overlay surfaces, and this page can trigger
+          each one:
+            (a) Permission prompts  -> PermissionRequestManager  (camera, mic,
+                geolocation, notifications, ...)
+            (b) Capture indicators  -> the "camera/mic/screen in use" badge
+                shown while a getUserMedia/getDisplayMedia stream is live
+            (c) Media-picker dialog -> DesktopMediaPicker (getDisplayMedia)
+     The catch: the overlay only shows WHILE you are in the headset, where you
+     cannot click desktop buttons. So every trigger here is also reachable
+     hands-free: a keyboard shortcut, a "fire after 5 s" delay so you can don
+     the HMD first, an auto-demo that walks through all three overlay types on
+     a timer, and the XR controller trigger ("select") which fires the next
+     armed action. The on-page log + HUD record every event so you can
+     correlate what the page asked for with what the headset displays. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>WebXR test (VR + overlay)</title>
+<title>WebXR test (VR + overlay UI)</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2em auto; line-height: 1.4; }
-  button { display: block; margin: 6px 0; padding: 10px 14px; font-size: 15px; min-width: 260px; }
+  body { font-family: system-ui, sans-serif; max-width: 820px; margin: 2em auto; line-height: 1.4; }
+  h2 { margin-bottom: .2em; }
+  .hint { color:#666; font-size:13px; margin:.1em 0 .6em; }
+  button { margin: 4px 6px 4px 0; padding: 9px 12px; font-size: 14px; }
+  button .k { display:inline-block; min-width:1.2em; text-align:center; border:1px solid #999;
+              border-radius:4px; padding:0 4px; margin-left:6px; font:12px monospace; color:#333; background:#eee; }
   #log { background:#111; color:#0f0; font-family:monospace; white-space:pre-wrap;
-         padding:10px; margin-top:1em; min-height:180px; }
-  .section { border-top:1px solid #ccc; margin-top:1em; padding-top:1em; }
+         padding:10px; margin-top:1em; min-height:180px; max-height:300px; overflow:auto; }
+  .section { border-top:1px solid #ccc; margin-top:1em; padding-top:.6em; }
   .status { font-weight:bold; }
   .ok { color:#080; } .bad { color:#a00; }
+  .grp { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; color:#fff; margin-left:8px; }
+  .grp.perm { background:#2a6; } .grp.cap { background:#c72; } .grp.pick { background:#36c; }
+  #hud { position:sticky; top:0; background:#f6f6f6; border:1px solid #ddd; border-radius:6px;
+         padding:8px 12px; font:13px/1.5 monospace; margin-bottom:1em; z-index:1; }
+  #hud b { color:#000; }
+  label.opt { font-size:13px; color:#333; margin-right:16px; }
 </style>
 </head>
 <body>
-<h1>WebXR test — VR session + browser overlay</h1>
-<p>This page tests both halves of the Linux patch in one place:</p>
-<ol>
-  <li><b>Main WebXR:</b> click <b>Enter VR</b>; the headset should show
-    a solid dark-blue frame (the clear-color).</li>
-  <li><b>Browser overlay:</b> while still in VR, click any Permission
-    or Capture button on the desktop. The Chromium prompt should appear
-    as a small stereo quad near the bottom of each eye.</li>
-</ol>
-<p>The on-page log records every event for correlation. If nothing
-  appears in the headset, the log plus the --vmodule output tells you
-  which layer failed.</p>
+<h1>WebXR test — VR session + browser overlay UI</h1>
 
 <p id="support" class="status bad">Checking WebXR support...</p>
 
+<div id="hud">
+  session: <b id="hud-session">idle</b> &nbsp;|&nbsp;
+  frames: <b id="hud-frames">0</b> &nbsp;|&nbsp;
+  capture: <b id="hud-capture">none</b> &nbsp;|&nbsp;
+  armed: <b id="hud-armed">-</b>
+</div>
+
+<p class="hint">
+  Recommended flow: turn on <b>Delay 5 s</b> (or use <b>Auto-demo</b>), click
+  <b>Enter VR</b>, put on / look at the headset, then fire a trigger. Every
+  button has a keyboard shortcut (shown on the button) so you can trigger it
+  while wearing the HMD. The XR controller trigger fires the <b>armed</b> action.
+</p>
+
 <div class="section">
   <h2>Session</h2>
-  <button id="enter">Enter VR</button>
-  <button id="exit" disabled>Exit VR</button>
+  <button id="enter">Enter VR<span class="k">e</span></button>
+  <button id="exit" disabled>Exit VR<span class="k">q</span></button>
+  <span style="margin-left:12px">
+    <label class="opt"><input type="checkbox" id="opt-delay"> Delay 5 s before firing</label>
+    <label class="opt"><input type="checkbox" id="opt-loop"> Auto-demo loops</label>
+  </span>
 </div>
 
 <div class="section">
-  <h2>Permission prompts</h2>
-  <button data-perm="geolocation">Request geolocation</button>
-  <button data-perm="camera">Request camera</button>
-  <button data-perm="microphone">Request microphone</button>
-  <button data-perm="notifications">Request notifications</button>
+  <h2>Permission prompts <span class="grp perm">permission overlay</span></h2>
+  <p class="hint">Each triggers a browser permission prompt that should render as a quad in the headset.</p>
+  <button data-perm="camera">Request camera<span class="k">c</span></button>
+  <button data-perm="microphone">Request microphone<span class="k">m</span></button>
+  <button data-perm="geolocation">Request geolocation<span class="k">g</span></button>
+  <button data-perm="notifications">Request notifications<span class="k">n</span></button>
 </div>
 
 <div class="section">
-  <h2>Capture / media picker</h2>
-  <button id="gum-audio">getUserMedia({audio:true})</button>
-  <button id="gum-video">getUserMedia({video:true})</button>
-  <button id="gdm">getDisplayMedia (screen picker)</button>
-  <button id="stop-capture" disabled>Stop all capture</button>
+  <h2>Capture indicator <span class="grp cap">capture overlay</span></h2>
+  <p class="hint">Keeps a stream <i>live</i> so the "in use" indicator stays visible in-headset until you stop it.</p>
+  <button id="gum-audio">Start audio capture<span class="k">a</span></button>
+  <button id="gum-video">Start video capture<span class="k">v</span></button>
+  <button id="stop-capture" disabled>Stop all capture<span class="k">x</span></button>
+</div>
+
+<div class="section">
+  <h2>Media picker <span class="grp pick">picker overlay</span></h2>
+  <p class="hint">getDisplayMedia opens the desktop-media picker dialog, which the overlay host mirrors into VR.</p>
+  <button id="gdm">getDisplayMedia (screen picker)<span class="k">s</span></button>
+</div>
+
+<div class="section">
+  <h2>Hands-free</h2>
+  <p class="hint">Auto-demo walks through all three overlay types on a timer so you can watch the headset without touching anything.</p>
+  <button id="demo">Run auto-demo<span class="k">d</span></button>
+  <button id="demo-stop" disabled>Stop auto-demo</button>
 </div>
 
 <div id="log"></div>
@@ -72,25 +114,32 @@
 
   let session = null;
   let refSpace = null;
-  let rafId = 0;
+  let frames = 0;
   let streams = [];
+  let armedName = null;      // action fired by the XR controller trigger
+  let demoTimer = 0;
+
+  const setHud = () => {
+    $("#hud-session").textContent = session ? "IN VR" : "idle";
+    $("#hud-frames").textContent  = frames;
+    $("#hud-capture").textContent = streams.length
+      ? streams.reduce((n,s)=>n+s.getTracks().length,0) + " track(s) live" : "none";
+    $("#hud-armed").textContent   = armedName || "-";
+  };
 
   // --- XR support check ---------------------------------------------------
   if (!("xr" in navigator)) {
     $("#support").textContent = "navigator.xr not available.";
   } else {
     navigator.xr.isSessionSupported("immersive-vr").then((supported) => {
-      if (supported) {
-        $("#support").textContent = "immersive-vr supported.";
-        $("#support").className = "status ok";
-      } else {
-        $("#support").textContent = "immersive-vr NOT supported.";
-      }
+      $("#support").textContent = supported ? "immersive-vr supported." : "immersive-vr NOT supported.";
+      $("#support").className = "status " + (supported ? "ok" : "bad");
     });
   }
 
   // --- Session control ----------------------------------------------------
-  $("#enter").onclick = async () => {
+  const enterVR = async () => {
+    if (session) return;
     try {
       session = await navigator.xr.requestSession("immersive-vr", {
         optionalFeatures: ["local-floor"]
@@ -99,10 +148,16 @@
       $("#enter").disabled = true;
       $("#exit").disabled = false;
       session.addEventListener("end", () => {
-        log("session ended");
+        log(`session ended (${frames} frames)`);
         $("#enter").disabled = false;
         $("#exit").disabled = true;
-        session = null;
+        session = null; frames = 0; stopDemo(); setHud();
+      });
+      // The controller trigger fires the currently-armed action, so you can
+      // drive the overlay from inside VR with no keyboard.
+      session.addEventListener("select", () => {
+        log("XR select (controller trigger)");
+        if (armedName) fire(armedName); else log("  (nothing armed)");
       });
 
       const canvas = document.createElement("canvas");
@@ -113,70 +168,160 @@
 
       const onXRFrame = (t, frame) => {
         const sess = frame.session;
-        rafId = sess.requestAnimationFrame(onXRFrame);
+        sess.requestAnimationFrame(onXRFrame);
+        frames++;
         gl.bindFramebuffer(gl.FRAMEBUFFER, sess.renderState.baseLayer.framebuffer);
-        gl.clearColor(0.05, 0.1, 0.2, 1.0);
+        // Slowly cycle the clear colour so it is obvious in the headset that
+        // frames are advancing and that the overlay composites ON TOP of it.
+        const p = (t / 3000);
+        gl.clearColor(0.10 + 0.10 * Math.sin(p),
+                      0.12 + 0.10 * Math.sin(p + 2.1),
+                      0.22 + 0.10 * Math.sin(p + 4.2), 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
+        if ((frames % 30) === 0) setHud();
       };
       session.requestAnimationFrame(onXRFrame);
+      setHud();
     } catch (e) {
       log("requestSession failed: " + e);
     }
   };
-
+  $("#enter").onclick = enterVR;
   $("#exit").onclick = () => session && session.end();
 
-  // --- Permission prompts -------------------------------------------------
-  document.querySelectorAll("[data-perm]").forEach(b => {
-    b.onclick = async () => {
-      const perm = b.dataset.perm;
-      log(`requesting permission: ${perm} (in_vr=${!!session})`);
-      try {
-        if (perm === "geolocation") {
-          await new Promise((ok, err) =>
-            navigator.geolocation.getCurrentPosition(ok, err,
-              { timeout: 10000 }));
-          log(`${perm}: granted`);
-        } else if (perm === "notifications") {
-          log(`${perm}: ` + await Notification.requestPermission());
-        } else {
-          const s = await navigator.mediaDevices.getUserMedia(
-            perm === "camera" ? { video: true } : { audio: true });
-          s.getTracks().forEach(t => t.stop());
-          log(`${perm}: granted, track stopped`);
-        }
-      } catch (e) {
-        log(`${perm}: error ${e.message || e}`);
-      }
-    };
-  });
-
-  // --- Capture ------------------------------------------------------------
-  const startStream = async (constraints, label) => {
-    log(`${label}: starting (in_vr=${!!session})`);
+  // --- Action registry ----------------------------------------------------
+  // Every overlay trigger goes through fire(), which honours the "Delay 5 s"
+  // option and always logs whether a session is active (in_vr).
+  const reqPerm = async (perm) => {
+    log(`permission ${perm} (in_vr=${!!session})`);
     try {
-      const fn = label === "gdm"
-        ? navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices)
-        : navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      const s = await fn(constraints);
-      streams.push(s);
-      log(`${label}: started, ${s.getTracks().length} tracks live`);
-      $("#stop-capture").disabled = false;
-    } catch (e) {
-      log(`${label}: error ${e.message || e}`);
-    }
+      if (perm === "geolocation") {
+        await new Promise((ok, err) =>
+          navigator.geolocation.getCurrentPosition(ok, err, { timeout: 10000 }));
+        log(`  ${perm}: granted`);
+      } else if (perm === "notifications") {
+        log(`  ${perm}: ` + await Notification.requestPermission());
+      } else {
+        const s = await navigator.mediaDevices.getUserMedia(
+          perm === "camera" ? { video: true } : { audio: true });
+        s.getTracks().forEach(t => t.stop());
+        log(`  ${perm}: granted, track stopped`);
+      }
+    } catch (e) { log(`  ${perm}: error ${e.message || e}`); }
   };
 
-  $("#gum-audio").onclick = () => startStream({ audio: true }, "gum-audio");
-  $("#gum-video").onclick = () => startStream({ video: true }, "gum-video");
-  $("#gdm").onclick       = () => startStream({ video: true }, "gdm");
+  const startStream = async (constraints, label, display) => {
+    log(`${label}: starting (in_vr=${!!session})`);
+    try {
+      const md = navigator.mediaDevices;
+      const s = await (display ? md.getDisplayMedia(constraints)
+                               : md.getUserMedia(constraints));
+      streams.push(s);
+      s.getTracks().forEach(tr => tr.addEventListener("ended", setHud));
+      log(`${label}: live, ${s.getTracks().length} track(s)`);
+      $("#stop-capture").disabled = false;
+      setHud();
+    } catch (e) { log(`${label}: error ${e.message || e}`); }
+  };
 
-  $("#stop-capture").onclick = () => {
+  const stopCapture = () => {
     streams.forEach(s => s.getTracks().forEach(t => t.stop()));
     streams = [];
     $("#stop-capture").disabled = true;
-    log("capture: all streams stopped");
+    log("capture: all streams stopped"); setHud();
   };
+
+  const actions = {
+    camera:        { key:"c", el:'[data-perm="camera"]',      run: () => reqPerm("camera") },
+    microphone:    { key:"m", el:'[data-perm="microphone"]',  run: () => reqPerm("microphone") },
+    geolocation:   { key:"g", el:'[data-perm="geolocation"]', run: () => reqPerm("geolocation") },
+    notifications: { key:"n", el:'[data-perm="notifications"]',run: () => reqPerm("notifications") },
+    capAudio:      { key:"a", el:"#gum-audio", run: () => startStream({ audio: true }, "cap-audio", false) },
+    capVideo:      { key:"v", el:"#gum-video", run: () => startStream({ video: true }, "cap-video", false) },
+    screen:        { key:"s", el:"#gdm",       run: () => startStream({ video: true }, "getDisplayMedia", true) },
+    stop:          { key:"x", el:"#stop-capture", run: stopCapture },
+  };
+
+  // fire(): arm the action (for the controller trigger) and run it, optionally
+  // after a 5 s countdown so the tester can put the headset on first.
+  const fire = (name) => {
+    const a = actions[name];
+    if (!a) return;
+    armedName = name; setHud();
+    if ($("#opt-delay").checked) {
+      let n = 5;
+      log(`${name}: firing in ${n}s ...`);
+      const iv = setInterval(() => {
+        n--;
+        if (n <= 0) { clearInterval(iv); a.run(); }
+        else log(`  ${name}: ${n}...`);
+      }, 1000);
+    } else {
+      a.run();
+    }
+  };
+
+  // Wire buttons + keyboard shortcuts from the registry.
+  const keyMap = {};
+  for (const [name, a] of Object.entries(actions)) {
+    const el = $(a.el);
+    if (el) el.onclick = () => fire(name);
+    keyMap[a.key] = name;
+  }
+  keyMap["e"] = "@enter"; keyMap["q"] = "@exit"; keyMap["d"] = "@demo";
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const k = ev.key.toLowerCase();
+    const name = keyMap[k];
+    if (!name) return;
+    ev.preventDefault();
+    if (name === "@enter") enterVR();
+    else if (name === "@exit") { if (session) session.end(); }
+    else if (name === "@demo") runDemo();
+    else fire(name);
+  });
+
+  // --- Auto-demo: walk through all three overlay surfaces on a timer -------
+  const DEMO = [
+    { after: 1500, name: "camera",        note: "permission overlay" },
+    { after: 4500, name: "microphone",    note: "permission overlay" },
+    { after: 4500, name: "geolocation",   note: "permission overlay" },
+    { after: 4500, name: "notifications", note: "permission overlay" },
+    { after: 4500, name: "capVideo",      note: "capture indicator (stays live)" },
+    { after: 5000, name: "screen",        note: "media-picker overlay" },
+    { after: 6000, name: "stop",          note: "clear capture" },
+  ];
+  const runDemo = async () => {
+    if (demoTimer) return;
+    if (!session) { log("auto-demo: enter VR first"); return; }
+    $("#demo").disabled = true; $("#demo-stop").disabled = false;
+    log("auto-demo: starting");
+    let i = 0;
+    const step = () => {
+      if (i >= DEMO.length) {
+        if ($("#opt-loop").checked && session) { i = 0; }
+        else { stopDemo(); log("auto-demo: done"); return; }
+      }
+      const s = DEMO[i++];
+      demoTimer = setTimeout(() => {
+        if (!session) { stopDemo(); return; }
+        log(`auto-demo -> ${s.name} [${s.note}]`);
+        actions[s.name].run();
+        step();
+      }, s.after);
+    };
+    step();
+  };
+  const stopDemo = () => {
+    if (demoTimer) clearTimeout(demoTimer);
+    demoTimer = 0;
+    $("#demo").disabled = false; $("#demo-stop").disabled = true;
+  };
+  $("#demo").onclick = runDemo;
+  $("#demo-stop").onclick = () => { stopDemo(); log("auto-demo: stopped"); };
+
+  setHud();
 </script>
 </body>
 </html>

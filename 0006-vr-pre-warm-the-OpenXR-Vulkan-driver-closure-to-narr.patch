@@ -1,0 +1,229 @@
+From e23ea72f3e370753d303c59964873ad77f9f1118 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sat, 4 Jul 2026 23:19:36 +0800
+Subject: [PATCH 6/7] vr: pre-warm the OpenXR/Vulkan driver closure to narrow
+ the XR broker policy
+
+The Linux XR Device Service pre-sandbox hook granted the file broker recursive
+read over /usr/lib, /usr/local/lib and /lib so the OpenXR loader, the Vulkan
+loader and the Vulkan ICD could dlopen() their dependency closure after the
+sandbox seals. That is far broader than upstream norms.
+
+Mirror the GPU process pre-sandbox hook instead: after StartBrokerProcess()
+(which must fork while single-threaded), dlopen() the OpenXR runtime named by
+active_runtime.json plus the Vulkan loader, the Mesa ICDs and the Mesa implicit
+layers with RTLD_NOW | RTLD_GLOBAL. RTLD_NOW forces eager symbol resolution,
+pulling the whole transitive DT_NEEDED closure into the process while the
+filesystem is still directly reachable, so the loaders' later dlopen()s find
+everything already resident and never reach the broker.
+
+With the closure pre-warmed, the recursive system-library grants are replaced by
+a narrow allow-list naming only the libraries the loaders dlopen() by name
+(the Vulkan loader, the ICDs and the implicit layers), resolved against the
+standard library search directories with access() at hook time. The manifest,
+Vulkan ICD/layer config dirs and the GPU device/sysfs access are unchanged.
+
+This is Linux-only: the hook is compiled solely in content/utility's is_linux
+block and wired up only under BUILDFLAG(IS_LINUX); Windows kXrCompositing is
+untouched.
+
+Verified against Monado (AMD RADV, sandboxed, no --no-sandbox): the XR utility
+loads the OpenXR loader + Monado runtime, connects to Monado, creates its Vulkan
+instance/device, negotiates the swapchain (format 43) and submits frames with no
+library-load failures, no VK_ERROR_INCOMPATIBLE_DRIVER and no seccomp
+violations -- at parity with the recursive-grant version.
+---
+ content/utility/xr/xr_sandbox_hook_linux.cc | 130 ++++++++++++++++++--
+ 1 file changed, 118 insertions(+), 12 deletions(-)
+
+diff --git a/content/utility/xr/xr_sandbox_hook_linux.cc b/content/utility/xr/xr_sandbox_hook_linux.cc
+index 53d98e6ff70ba..08fee0bdb84ae 100644
+--- a/content/utility/xr/xr_sandbox_hook_linux.cc
++++ b/content/utility/xr/xr_sandbox_hook_linux.cc
+@@ -4,14 +4,20 @@
+ 
+ #include "content/utility/xr/xr_sandbox_hook_linux.h"
+ 
++#include <dlfcn.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ 
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/stringprintf.h"
++#include "base/values.h"
+ #include "sandbox/linux/syscall_broker/broker_command.h"
+ #include "sandbox/linux/syscall_broker/broker_file_permission.h"
+ 
+@@ -28,6 +34,66 @@ std::string GetEnv(const char* name) {
+   return (value && value[0]) ? std::string(value) : std::string();
+ }
+ 
++// The shared libraries the OpenXR loader, the Vulkan loader and the Vulkan ICD
++// dlopen() BY NAME at runtime (as opposed to being pulled in as a DT_NEEDED
++// dependency of something already loaded). These are pre-warmed in the hook so
++// they resolve without the broker, and also named in the broker allow-list
++// below as a fall-back. Their transitive dependency closure (LLVM, libGLX,
++// libX11, ...) is not listed: RTLD_NOW pre-warming maps that closure in while
++// the filesystem is still directly reachable, so it never reaches the broker.
++constexpr const char* kRuntimeLoadedSonames[] = {
++    // The Vulkan loader itself (the OpenXR runtime creates a VkInstance).
++    "libvulkan.so.1",
++    // Mesa ICDs: the installed GPU driver (radeon = RADV) and the software
++    // rasteriser the loader falls back to. Absent drivers are simply skipped.
++    "libvulkan_radeon.so",
++    "libvulkan_intel.so",
++    "libvulkan_lvp.so",
++    // Mesa implicit layers the Vulkan loader activates by default.
++    "libVkLayer_MESA_device_select.so",
++    "libVkLayer_MESA_anti_lag.so",
++};
++
++// Directories the dynamic loader searches for the sonames above. Probed with
++// access() at hook time (before the sandbox seals) so only paths that actually
++// exist on this system are added to the broker policy.
++constexpr const char* kLibrarySearchDirs[] = {
++    "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib64",
++    "/usr/lib",                  "/lib",                  "/usr/local/lib",
++};
++
++// Reads the OpenXR active-runtime manifest and returns the absolute path of the
++// runtime's shared library ("runtime"."library_path"), or an empty string. A
++// relative library_path is resolved against the manifest's directory, per the
++// OpenXR loader.
++std::string GetRuntimeLibraryPath(const std::string& manifest_path) {
++  if (manifest_path.empty()) {
++    return std::string();
++  }
++  std::string contents;
++  if (!base::ReadFileToString(base::FilePath(manifest_path), &contents)) {
++    return std::string();
++  }
++  std::optional<base::DictValue> root =
++      base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC);
++  if (!root) {
++    return std::string();
++  }
++  const base::DictValue* runtime = root->FindDict("runtime");
++  if (!runtime) {
++    return std::string();
++  }
++  const std::string* library_path = runtime->FindString("library_path");
++  if (!library_path || library_path->empty()) {
++    return std::string();
++  }
++  base::FilePath path(*library_path);
++  if (!path.IsAbsolute()) {
++    path = base::FilePath(manifest_path).DirName().Append(path);
++  }
++  return path.value();
++}
++
+ // Files and directories the OpenXR loader, the Vulkan loader, and the OpenXR
+ // runtime open()/stat() from inside the XR utility process. Everything is
+ // read-only: the swapchain images are shared with the compositor over the IPC
+@@ -55,6 +121,8 @@ std::vector<BrokerFilePermission> GetOpenXrFilePermissions() {
+   if (!runtime_json.empty()) {
+     base::FilePath manifest(runtime_json);
+     permissions.push_back(BrokerFilePermission::ReadOnly(manifest.value()));
++    // The runtime .so named by the manifest (and, for Monado, libmonado.so)
++    // lives beside it; the manifest directory grant makes it reachable.
+     add_dir(manifest.DirName().value());
+   }
+ 
+@@ -82,15 +150,22 @@ std::vector<BrokerFilePermission> GetOpenXrFilePermissions() {
+   add_dir("/usr/share/openxr");
+   add_dir("/usr/local/share/openxr");
+ 
+-  // The runtime .so (e.g. libopenxr_monado.so), the Vulkan loader, the Vulkan
+-  // ICD driver and their dependency closure live under the system library
+-  // directories. The dynamic loader open()s them via the broker after the
+-  // sandbox seals.
+-  add_dir("/usr/lib");
+-  add_dir("/usr/local/lib");
+-  add_dir("/lib");
++  // The runtime .so, the Vulkan loader and the Vulkan ICD are pre-warmed in the
++  // hook (see PrewarmGraphicsLibraries), so their whole dependency closure is
++  // resident before the sandbox seals and never reaches the broker. As a
++  // fall-back, name the specific libraries the loader dlopen()s by name so the
++  // broker can still serve them if a pre-warm was skipped -- WITHOUT granting
++  // recursive read over the entire system library tree.
++  for (const char* soname : kRuntimeLoadedSonames) {
++    for (const char* dir : kLibrarySearchDirs) {
++      std::string path = base::StringPrintf("%s/%s", dir, soname);
++      if (access(path.c_str(), R_OK) == 0) {
++        permissions.push_back(BrokerFilePermission::ReadOnly(path));
++      }
++    }
++  }
+ 
+-  // Vulkan ICD manifests describing the installed driver.
++  // Vulkan ICD and implicit-layer manifests describing the installed driver.
+   add_dir("/usr/share/vulkan");
+   add_dir("/etc/vulkan");
+ 
+@@ -113,13 +188,39 @@ std::vector<BrokerFilePermission> GetOpenXrFilePermissions() {
+   return permissions;
+ }
+ 
++// dlopen()s the OpenXR runtime and the graphics driver libraries so their whole
++// dependency closure is mapped into the process while the filesystem is still
++// directly reachable. RTLD_NOW forces eager symbol resolution, which pulls in
++// the transitive DT_NEEDED closure now instead of lazily (post-seal). After
++// this, the OpenXR loader's and Vulkan loader's own dlopen()s find everything
++// already resident, so the broker file policy needs no recursive library-tree
++// access. Mirrors the GPU process pre-sandbox hook (LoadLibrariesForGpu).
++//
++// MUST be called AFTER StartBrokerProcess(): the broker forks and therefore has
++// to run while the process is single-threaded, whereas the Vulkan loader / ICD
++// spawn worker threads during load.
++void PrewarmGraphicsLibraries(const std::string& runtime_library_path) {
++  constexpr int kFlags = RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE;
++  for (const char* soname : kRuntimeLoadedSonames) {
++    // Best-effort: a driver for another vendor simply isn't present.
++    dlopen(soname, kFlags);
++  }
++  // The runtime library (e.g. libopenxr_monado.so) drags in its own closure:
++  // libvulkan, libGLX, libX11 and friends. Loading it here means the OpenXR
++  // loader re-uses the already-resident copy after the sandbox seals.
++  if (!runtime_library_path.empty()) {
++    dlopen(runtime_library_path.c_str(), kFlags);
++  }
++}
++
+ }  // namespace
+ 
+ bool XrPreSandboxHook(sandbox::policy::SandboxLinux::Options options) {
+-  // The broker forks and therefore must run while single-threaded; do not load
+-  // any library here, as the Vulkan loader / ICD driver spawn worker threads.
+-  // The OpenXR loader and the Vulkan loader open everything they need through
+-  // the broker after the sandbox seals.
++  // Resolve the runtime library path before the broker forks (a plain file
++  // read, no threads); it is dlopen()ed afterwards.
++  const std::string runtime_library_path =
++      GetRuntimeLibraryPath(GetEnv("XR_RUNTIME_JSON"));
++
+   auto* instance = sandbox::policy::SandboxLinux::GetInstance();
+   instance->StartBrokerProcess(
+       MakeBrokerCommandSet({
+@@ -129,6 +230,11 @@ bool XrPreSandboxHook(sandbox::policy::SandboxLinux::Options options) {
+           sandbox::syscall_broker::COMMAND_STAT,
+       }),
+       GetOpenXrFilePermissions(), options);
++
++  // Pre-warm the runtime + graphics driver closure now that the broker has
++  // forked, so the recursive system-library grants are unnecessary.
++  PrewarmGraphicsLibraries(runtime_library_path);
++
+   // NOTE: intentionally do not call EngageNamespaceSandboxIfPossible() here.
+   // The OpenXR runtime connects to its compositor over a host AF_UNIX socket
+   // ($XDG_RUNTIME_DIR/<runtime>_comp_ipc); the network namespace the namespace
+-- 
+2.53.0
+
