@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- One-stop manual test for WebXR-over-OpenXR on Linux.
-     Covers two things in one page:
+     Covers three things in one page:
        1. Main WebXR: Enter VR -> immersive-vr session -> animated stereo
           clear-color frame (verifies projection-layer rendering).
        2. Browser overlay UI: while a session is active, the browser draws
@@ -17,8 +17,13 @@
      hands-free: a keyboard shortcut, a "fire after 5 s" delay so you can don
      the HMD first, an auto-demo that walks through all three overlay types on
      a timer, and the XR controller trigger ("select") which fires the next
-     armed action. The on-page log + HUD record every event so you can
-     correlate what the page asked for with what the headset displays. -->
+     armed action.
+       3. Stress: repeated enter/exit of the immersive session, to reproduce the
+          session-teardown crash (issue #2). Each click / "z" press is one
+          enter -> hold -> exit cycle; requestSession needs a user gesture so the
+          cycles cannot be fully automated from the page.
+     The on-page log + HUD record every event so you can correlate what the page
+     asked for with what the headset displays. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -100,6 +105,19 @@
   <p class="hint">Auto-demo walks through all three overlay types on a timer so you can watch the headset without touching anything.</p>
   <button id="demo">Run auto-demo<span class="k">d</span></button>
   <button id="demo-stop" disabled>Stop auto-demo</button>
+</div>
+
+<div class="section">
+  <h2>Stress: repeated enter/exit</h2>
+  <p class="hint">Reproduces the session-teardown crash (issue #2): each click (or
+    press <b>z</b>) runs one <b>enter &rarr; hold &rarr; exit</b> cycle and bumps the
+    counter. Click it repeatedly &mdash; the original report crashed after ~6&ndash;8
+    cycles. <code>requestSession</code> needs a user gesture, so each cycle is one
+    click/press; they cannot be driven fully hands-free from the page.</p>
+  <label class="opt">hold <input id="stress-hold" type="number" value="1500" min="0" step="250" style="width:5em"> ms</label>
+  <button id="stress-cycle">Enter/exit cycle<span class="k">z</span></button>
+  <button id="stress-reset">Reset count</button>
+  <b id="stress-count">cycles: 0</b>
 </div>
 
 <div id="log"></div>
@@ -269,6 +287,7 @@
     keyMap[a.key] = name;
   }
   keyMap["e"] = "@enter"; keyMap["q"] = "@exit"; keyMap["d"] = "@demo";
+  keyMap["z"] = "@stress";
 
   window.addEventListener("keydown", (ev) => {
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
@@ -279,6 +298,7 @@
     if (name === "@enter") enterVR();
     else if (name === "@exit") { if (session) session.end(); }
     else if (name === "@demo") runDemo();
+    else if (name === "@stress") stressOneCycle();
     else fire(name);
   });
 
@@ -320,6 +340,40 @@
   };
   $("#demo").onclick = runDemo;
   $("#demo-stop").onclick = () => { stopDemo(); log("auto-demo: stopped"); };
+
+  // --- Stress: repeated enter/exit (issue #2) -----------------------------
+  // Each invocation is one enter -> hold -> exit cycle. The caller (a click or
+  // keypress) supplies the user activation requestSession() needs; the hold and
+  // exit are then automated. Ends the session via end() and waits for teardown
+  // before returning so cycles do not overlap.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let stressCount = 0;
+  let stressBusy = false;
+  const endAndWait = async () => {
+    if (!session) return;
+    try { await session.end(); } catch (e) { log("stress: end() error " + e); }
+    for (let i = 0; i < 200 && session; i++) await sleep(10);  // await the 'end' event
+  };
+  const stressOneCycle = async () => {
+    if (stressBusy) { log("stress: cycle already running"); return; }
+    if (session) { log("stress: exit VR before starting a cycle"); return; }
+    stressBusy = true;
+    const hold = Math.max(0, parseInt($("#stress-hold").value, 10) || 0);
+    const n = ++stressCount;
+    $("#stress-count").textContent = `cycles: ${n}`;
+    log(`stress cycle ${n}: enter`);
+    await enterVR();                       // consumes this gesture's activation
+    if (!session) { log(`stress cycle ${n}: enter failed`); stressBusy = false; return; }
+    await sleep(hold);
+    log(`stress cycle ${n}: exit`);
+    await endAndWait();
+    log(`stress cycle ${n}: done (survived)`);
+    stressBusy = false;
+  };
+  $("#stress-cycle").onclick = stressOneCycle;
+  $("#stress-reset").onclick = () => {
+    stressCount = 0; $("#stress-count").textContent = "cycles: 0"; log("stress: count reset");
+  };
 
   setHud();
 </script>

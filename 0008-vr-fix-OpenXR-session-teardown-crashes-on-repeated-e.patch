@@ -1,0 +1,96 @@
+From 021d4585e214268857c05f71d5a9c1fe39e902a4 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Tue, 7 Jul 2026 23:06:28 +0800
+Subject: [PATCH] vr: fix OpenXR session-teardown crashes on repeated
+ enter/exit (Linux)
+
+Entering and exiting an immersive-vr session repeatedly crashed on Linux
+(Monado/WiVRn), taking down the XR utility process and, after a few cycles, the
+browser. Two independent bugs, both Linux-gated so other platforms are
+unchanged:
+
+1) Use-after-free of session-child handles on teardown.
+   OpenXrApiWrapper::Uninitialize() called xrDestroySession() and only afterwards
+   Reset(), which destroys the sub-objects that own handles parented to the
+   session: the input helper's controllers own action spaces (and hand trackers),
+   and the scene-understanding manager owns anchor spaces. xrDestroySession()
+   frees those child handles, so the later destructors called xrDestroySpace() /
+   xrDestroy*() on already-freed handles. The Monado/WiVRn OpenXR loader
+   dereferences that freed, poisoned handle state and GP-faults. It surfaced
+   intermittently (heap-reuse timing), hence after several cycles rather than the
+   first. Fix: reset input_helper_ and scene_understanding_manager_ before
+   xrDestroySession() so those handles are destroyed while the session is still
+   valid. Both are reset again by Reset(), a no-op.
+
+2) Fatal rebind of the WebXR-internals render listener.
+   WebXrLoggerManager::BindRenderListener() is called on every immersive session
+   start and its receiver is cleared in RecordSessionStopped(). A session that
+   ends abnormally -- the XR utility process exiting (as in bug 1), or a
+   streaming runtime like WiVRn dropping the headset -- skips that path, leaving
+   the receiver bound. The next session's BindNewPipeAndPassRemote() then fails
+   the !is_bound() DCHECK and aborts the browser. Fix: reset the receiver before
+   binding so a stale binding from the previous session cannot abort the browser.
+
+Verified against Monado (AMD RADV): before the change, enter/exit logged
+"XR_ERROR_HANDLE_INVALID: xrDestroySpace" plus a SIGSEGV every cycle; after it,
+0 crashes across 40 aggressive cycles and 12 in-page stress cycles, sessions
+confirmed entering and exiting.
+---
+ .../xr/webxr_internals/webxr_logger_manager.cc       | 10 ++++++++++
+ device/vr/openxr/openxr_api_wrapper.cc               | 12 ++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/content/browser/xr/webxr_internals/webxr_logger_manager.cc b/content/browser/xr/webxr_internals/webxr_logger_manager.cc
+index a439396caf81e..a8b9dd79ca5d5 100644
+--- a/content/browser/xr/webxr_internals/webxr_logger_manager.cc
++++ b/content/browser/xr/webxr_internals/webxr_logger_manager.cc
+@@ -5,6 +5,7 @@
+ #include "content/browser/xr/webxr_internals/webxr_logger_manager.h"
+ 
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ #include "content/browser/xr/webxr_internals/mojom/webxr_internals.mojom.h"
+ #include "device/vr/public/mojom/xr_device.mojom.h"
+ #include "device/vr/public/mojom/xr_session.mojom.h"
+@@ -97,6 +98,15 @@ void WebXrLoggerManager::SubscribeToEvents(
+ 
+ mojo::PendingRemote<device::mojom::WebXrInternalsRendererListener>
+ WebXrLoggerManager::BindRenderListener() {
++#if BUILDFLAG(IS_LINUX)
++  // Drop any binding left over from a previous session. It is normally cleared
++  // in RecordSessionStopped(), but a session that ends abnormally (e.g. the XR
++  // utility process exits, or a streaming runtime like WiVRn drops the headset)
++  // skips that path, leaving the receiver bound. BindNewPipeAndPassRemote()
++  // DCHECKs !is_bound() and would then fatally abort the browser when the next
++  // session starts.
++  renderer_listener_receiver_.reset();
++#endif  // BUILDFLAG(IS_LINUX)
+   return renderer_listener_receiver_.BindNewPipeAndPassRemote();
+ }
+ 
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index 7fdd2f6aa1312..ba7fa9ec7b362 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -236,6 +236,18 @@ XrResult OpenXrApiWrapper::ShutdownSession() {
+ void OpenXrApiWrapper::Uninitialize() {
+   // The instance is owned by the OpenXRDevice, so don't destroy it here.
+ 
++#if BUILDFLAG(IS_LINUX)
++  // Destroy everything that owns handles parented to the XrSession before
++  // xrDestroySession() frees them. The input helper's controllers own action
++  // spaces (and hand trackers) and the scene-understanding manager owns anchor
++  // spaces; their destructors call xrDestroySpace()/xrDestroy*(). Running those
++  // after xrDestroySession() operates on already-freed handles and crashes the
++  // OpenXR loader (a GP fault seen on Monado/WiVRn when repeatedly entering and
++  // exiting a session). Both are reset again by Reset() below, which is a no-op.
++  input_helper_.reset();
++  scene_understanding_manager_.reset();
++#endif  // BUILDFLAG(IS_LINUX)
++
+   // Destroying an session in OpenXr also destroys all child objects of that
+   // instance (including the swapchain, and spaces objects),
+   // so they don't need to be manually destroyed.
+-- 
+2.53.0
+

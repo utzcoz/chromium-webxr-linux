@@ -69,12 +69,17 @@ This is an eight-patch series — apply `0001` through `0008` in order.
   the filesystem is still reachable, mirroring the GPU process's hook, so
   the loaders' later `dlopen()`s never reach the broker. The recursive
   grants become a narrow allow-list. See *Sandbox note* below (`0006`).
-- Fixes a session-teardown crash: destroys the OpenXR input helper (whose
-  controllers own action spaces that are children of the session) before
-  `xrDestroySession`, so `xrDestroySpace` no longer runs on handles the
-  session destroy already freed. Without this, repeatedly entering and exiting
-  a session GP-faults the XR utility process on Monado and eventually takes
-  down the browser (`0008`).
+- Fixes two crashes seen when repeatedly entering and exiting a session on
+  Monado/WiVRn. (a) A use-after-free: the objects that own session-child handles
+  (the input helper's controller action spaces / hand trackers, and the
+  scene-understanding manager's anchor spaces) are now destroyed before
+  `xrDestroySession` frees them, so `xrDestroy*` no longer runs on dangling
+  handles and GP-faults the XR utility process. (b) A browser abort: the
+  WebXR-internals render listener is reset before rebinding, so a session that
+  ended abnormally (utility exit, or a streaming runtime dropping the headset)
+  no longer trips the `!is_bound()` DCHECK on the next session. The bundled
+  `tests/webxr-test.html` has a *Stress: repeated enter/exit* control to
+  reproduce it (`0008`).
 
 ## Chromium WebXR architecture across platforms
 
