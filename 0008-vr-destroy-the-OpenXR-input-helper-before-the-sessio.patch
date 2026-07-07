@@ -1,0 +1,54 @@
+From 5fd40f0eff5badc9977317e4d368070477fa4b6c Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Tue, 7 Jul 2026 23:06:28 +0800
+Subject: [PATCH] vr: destroy the OpenXR input helper before the session on
+ Linux
+
+Entering and exiting an immersive-vr session repeatedly crashed the XR utility
+process (SIGSEGV) on Linux/Monado, taking down the session and -- after enough
+cycles -- the browser.
+
+OpenXrApiWrapper::Uninitialize() called xrDestroySession() and only afterwards
+Reset(), which destroys the input helper. But each OpenXrController creates
+action spaces (and a hand tracker) via xrCreateActionSpace(session_, ...); those
+are children of the session. Destroying the session frees its child spaces, so
+the later ~OpenXrController then called xrDestroySpace() on already-freed
+handles. On the Monado OpenXR loader that use-after-free dereferences freed,
+poisoned handle state and GP-faults. It manifests intermittently (heap-reuse
+timing), which is why it took several enter/exit cycles to crash rather than the
+first.
+
+Destroy the input helper before xrDestroySession() so xrDestroySpace() runs
+while the session -- and its child spaces -- are still valid. Gated to Linux;
+other runtimes tolerate the original order, so Windows and Android are unchanged.
+
+Verified against Monado (AMD RADV): 15 enter/exit cycles logged
+"XR_ERROR_HANDLE_INVALID: xrDestroySpace" plus a SIGSEGV every cycle before the
+change; 0 crashes across 23 cycles after it, with sessions confirmed entering
+and exiting and the controllers active.
+---
+ device/vr/openxr/openxr_api_wrapper.cc | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index 7fdd2f6aa1312..a519f48b0105d 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -236,6 +236,14 @@ XrResult OpenXrApiWrapper::ShutdownSession() {
+ void OpenXrApiWrapper::Uninitialize() {
+   // The instance is owned by the OpenXRDevice, so don't destroy it here.
+ 
++#if BUILDFLAG(IS_LINUX)
++  // Destroy the input helper before xrDestroySession(): its controllers own
++  // action spaces that are children of the session, and xrDestroySession()
++  // frees them. Destroying it afterwards (via Reset() below) would call
++  // xrDestroySpace() on freed handles, which crashes the Monado loader.
++  input_helper_.reset();
++#endif  // BUILDFLAG(IS_LINUX)
++
+   // Destroying an session in OpenXr also destroys all child objects of that
+   // instance (including the swapchain, and spaces objects),
+   // so they don't need to be manually destroyed.
+-- 
+2.53.0
+

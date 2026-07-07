@@ -12,7 +12,7 @@ reference OpenXR runtime.
 
 ## What the patches do
 
-This is a seven-patch series — apply `0001` through `0007` in order.
+This is an eight-patch series — apply `0001` through `0008` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -69,6 +69,12 @@ This is a seven-patch series — apply `0001` through `0007` in order.
   the filesystem is still reachable, mirroring the GPU process's hook, so
   the loaders' later `dlopen()`s never reach the broker. The recursive
   grants become a narrow allow-list. See *Sandbox note* below (`0006`).
+- Fixes a session-teardown crash: destroys the OpenXR input helper (whose
+  controllers own action spaces that are children of the session) before
+  `xrDestroySession`, so `xrDestroySpace` no longer runs on handles the
+  session destroy already freed. Without this, repeatedly entering and exiting
+  a session GP-faults the XR utility process on Monado and eventually takes
+  down the browser (`0008`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -348,8 +354,8 @@ gclient sync
 
 ## 3. Apply the patches
 
-From inside `chromium/src`, apply the seven-patch series in order (the glob
-expands to `0001` through `0007`):
+From inside `chromium/src`, apply the eight-patch series in order (the glob
+expands to `0001` through `0008`):
 
 ```bash
 git am /path/to/chromium-webxr-linux/000*.patch
