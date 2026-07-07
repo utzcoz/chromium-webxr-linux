@@ -562,11 +562,22 @@ Common failure signatures:
 | `Failed to load libvulkan.so.1`                       | No Vulkan ICD installed                      | `sudo apt install libvulkan1 mesa-vulkan-drivers`       |
 | `xrGetSystem ... XR_ERROR_FORM_FACTOR_UNAVAILABLE`    | No HMD connected / no simulated driver       | Plug in HMD or start Monado with a simulated driver    |
 
-### `chrome://xr-internals`
+### `chrome://webxr-internals`
 
-While Chromium is running, open `chrome://xr-internals` in a normal tab.
-It lists registered runtimes and any errors reported by the isolated XR
-service.
+`chrome://webxr-internals` lists registered runtimes, active sessions, and
+errors reported by the isolated XR service. It is an internal debugging page, so
+it is gated twice and only becomes reachable after you enable **both**:
+
+1. **The feature flag.** Open `chrome://flags`, search for *WebXR Internals
+   Debugging Page* (`#webxr-internals`), set it to **Enabled**, and relaunch.
+   This registers the page (`device::features::kWebXrInternals`).
+2. **Internal debugging pages.** Open `chrome://chrome-urls`, scroll to the
+   bottom, and enable **Internal Debugging Pages**. Without this, internal
+   WebUIs redirect to `chrome://internal-debug-pages-disabled` instead of
+   loading.
+
+With both enabled, open `chrome://webxr-internals` in a normal tab (not
+`chrome://xr-internals`, which does not exist).
 
 ## Sandbox note
 
