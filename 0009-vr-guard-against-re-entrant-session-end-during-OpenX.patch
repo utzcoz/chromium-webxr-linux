@@ -1,0 +1,81 @@
+From cbd296d12ed20691efe6b41f3458882822efdb53 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 12 Jul 2026 18:07:45 +0800
+Subject: [PATCH 09/10] vr: guard against re-entrant session end during OpenXR
+ frame generation (Linux)
+
+GetNextFrameData() can synchronously end the session: when the OpenXR runtime reports no
+locatable views for kMaxInvalidViewFrames (for example an HMD that is present but never starts
+tracking), the API wrapper calls ShutdownSession() -> ExitPresent(), which resets pending_frame_.
+StartPendingFrame() and its callers (GetFrameData, RequestNextOverlayPose) then dereference the
+now-disengaged std::optional, aborting the browser on the hardened libc++ optional::operator->.
+
+Re-check pending_frame_ after GetNextFrameData() at those three sites and bail out cleanly if the
+session ended. Gated to Linux; other platforms keep the original path.
+---
+ device/vr/openxr/openxr_render_loop.cc | 34 ++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index 7d2aea48daaac..7b9193622bc8d 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -198,6 +198,14 @@ void OpenXrRenderLoop::GetFrameData(
+     depth->SetDepthActive(options->depth_active);
+   }
+   StartPendingFrame();
++#if BUILDFLAG(IS_LINUX)
++  // StartPendingFrame() -> GetNextFrameData() can synchronously end the session
++  // and reset `pending_frame_` (see StartPendingFrame). If that happened, stop
++  // here rather than dereferencing the disengaged optional below.
++  if (!pending_frame_) {
++    return;
++  }
++#endif  // BUILDFLAG(IS_LINUX)
+   webxr_has_pose_ = true;
+   pending_frame_->webxr_has_pose_ = true;
+   pending_frame_->sent_frame_data_time_ = base::TimeTicks::Now();
+@@ -338,7 +346,24 @@ void OpenXrRenderLoop::StartPendingFrame() {
+     pending_frame_.emplace();
+     pending_frame_->waiting_for_webxr_ = webxr_visible_;
+     pending_frame_->waiting_for_overlay_ = overlay_visible_;
++#if BUILDFLAG(IS_LINUX)
++    // GetNextFrameData() can synchronously end the session and tear this loop
++    // down: if the OpenXR runtime reports no locatable views for
++    // kMaxInvalidViewFrames (e.g. an HMD that is present but never starts
++    // tracking), the api wrapper calls ShutdownSession() -> ExitPresent(),
++    // and ExitPresent() resets `pending_frame_`. Compute the frame data into a
++    // local first, then bail if the session ended, instead of assigning into a
++    // now-disengaged optional (which aborts on the hardened libc++
++    // optional::operator->). Other platforms keep the original inline
++    // assignment.
++    mojom::XRFrameDataPtr next_frame_data = GetNextFrameData();
++    if (!pending_frame_) {
++      return;
++    }
++    pending_frame_->frame_data_ = std::move(next_frame_data);
++#else
+     pending_frame_->frame_data_ = GetNextFrameData();
++#endif  // BUILDFLAG(IS_LINUX)
+     // GetNextFrameData() should never return null:
+     DCHECK(pending_frame_->frame_data_);
+     pending_frame_->render_info_ = GetRenderInfo(*pending_frame_->frame_data_);
+@@ -674,6 +699,15 @@ void OpenXrRenderLoop::RequestNextOverlayPose(
+ 
+   // Ensure we have a pending frame.
+   StartPendingFrame();
++#if BUILDFLAG(IS_LINUX)
++  // StartPendingFrame() -> GetNextFrameData() can synchronously end the session
++  // and reset `pending_frame_` (see StartPendingFrame). Bail before
++  // dereferencing it; ExitPresent() has already reset `overlay_receiver_`, so
++  // dropping this callback during teardown is safe.
++  if (!pending_frame_) {
++    return;
++  }
++#endif  // BUILDFLAG(IS_LINUX)
+   pending_frame_->overlay_has_pose_ = true;
+ 
+ #if BUILDFLAG(IS_LINUX)
+-- 
+2.53.0
+
