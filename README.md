@@ -752,6 +752,12 @@ sequenceDiagram
 - The in-headset overlay shows the **generic** permission notification ("this
   site needs more permissions"), not per-permission wording. This matches
   Windows; the actual allow/deny happens in the desktop dialog.
+- The in-headset overlay is **world-locked**, not head-tracked: it is placed at
+  a fixed forward position when it appears and does not re-orient as you turn
+  your head, so on a real HMD it drifts out of view with large head movement
+  (and the overlay frame loop can stall). It looks correct with a static/
+  simulated HMD. This is an overlay-placement follow-up, independent of the
+  frame-sharing path.
 - **NVIDIA proprietary driver: Wayland only** (`0010`). The shared buffer is
   allocated GPU-process-side via Ozone/GBM and imported into the XR-process
   Vulkan. On Wayland the GBM device is scanout-capable, so a renderable native
