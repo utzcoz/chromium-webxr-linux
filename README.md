@@ -12,7 +12,7 @@ reference OpenXR runtime.
 
 ## What the patches do
 
-This is a ten-patch series — apply `0001` through `0010` in order.
+This is a nine-patch series — apply `0001` through `0009` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -88,15 +88,6 @@ This is a ten-patch series — apply `0001` through `0010` in order.
   now-disengaged `std::optional` and aborted the browser. `pending_frame_`
   is re-checked after `GetNextFrameData()` so the session ends cleanly
   instead (`0009`).
-- Renders on the **NVIDIA proprietary driver** without `--use-angle=vulkan`
-  on Wayland. The intermediate image was always `VK_IMAGE_TILING_LINEAR`
-  (`modifier 0`), which NVIDIA's GL/EGL cannot render into as an imported
-  DMA-BUF (`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`). On NVIDIA the image is
-  now allocated with a driver-chosen renderable, single-plane, non-linear
-  DRM format modifier via `VK_EXT_image_drm_format_modifier`, passed
-  through the `NativePixmapHandle`; every other vendor keeps the `LINEAR`
-  path unchanged, and it falls back to `LINEAR` if no renderable modifier
-  is available. See *NVIDIA GPUs* below (`0010`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -258,10 +249,6 @@ backed by that DMA-BUF, and the Vulkan binding imports the *same* buffer as a
 GL → Vulkan ordering is a sync-FD fence, or a CPU `glFinish` fallback when the
 GL backend lacks `GL_CHROMIUM_gpu_fence` (see *GPU backend* below). Only the
 DMA-BUF handle and a sync primitive cross the API boundary — never pixels.
-(On the NVIDIA proprietary driver the intermediate image uses a renderable
-non-linear DRM modifier instead of `LINEAR` — GL there cannot render into a
-linear import — but the zero-copy sharing is otherwise identical. See *NVIDIA
-GPUs* below.)
 
 ```mermaid
 flowchart LR
@@ -380,17 +367,17 @@ gclient sync
 
 ## 3. Apply the patches
 
-From inside `chromium/src`, apply the ten-patch series in order (the glob
-expands to `0001` through `0010`):
+From inside `chromium/src`, apply the nine-patch series in order (the glob
+expands to `0001` through `0009`):
 
 ```bash
-git am /path/to/chromium-webxr-linux/0*.patch
+git am /path/to/chromium-webxr-linux/000*.patch
 ```
 
 If `git am` fails because of a newer Chromium base, try a 3-way merge:
 
 ```bash
-git am --3way /path/to/chromium-webxr-linux/0*.patch
+git am --3way /path/to/chromium-webxr-linux/000*.patch
 # resolve any conflicts, then:
 git add -A && git am --continue
 ```
@@ -534,41 +521,14 @@ talks to Chromium over the IPC socket plus DMA-BUF FDs.
 The patch shares each frame as a **linear, `modifier = 0`
 (`DRM_FORMAT_MOD_LINEAR`)** DMA-BUF imported as a `gfx::NativePixmapHandle`.
 Ozone/X11 imports it through the DRM render node; Ozone/Wayland imports the
-same buffer through `zwp_linux_dmabuf`. Modifier 0 is correct on both **for
-GPUs whose GL can render into a linear import** (AMD, Intel) because the
-intermediate image is `VK_IMAGE_TILING_LINEAR`; NVIDIA cannot, and uses a
-renderable non-linear modifier instead (see *NVIDIA GPUs* below). Wayland needs
-no special flags and works with the default GL backend (no `--use-angle=vulkan`);
-it logs a few harmless `NOTIMPLEMENTED_LOG_ONCE()` lines (`OnTrancheFlags`,
-`OnName`, …) for optional Wayland protocol callbacks that do not affect
-rendering.
+same buffer through `zwp_linux_dmabuf`. Modifier 0 is correct on both because
+the intermediate image is `VK_IMAGE_TILING_LINEAR`. Wayland needs no special
+flags and works with the default GL backend (no `--use-angle=vulkan`); it logs
+a few harmless `NOTIMPLEMENTED_LOG_ONCE()` lines (`OnTrancheFlags`, `OnName`,
+…) for optional Wayland protocol callbacks that do not affect rendering.
 
-### NVIDIA GPUs — renderable DRM modifier
-
-On the NVIDIA proprietary driver, GL/EGL cannot render into a `LINEAR`
-(`modifier 0`) DMA-BUF import — WebGL reports
-`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` and the session aborts on a DCHECK
-build. So immersive-vr historically required `--use-angle=vulkan`, whose
-ANGLE/Vulkan backing imports the buffer differently.
-
-As of `0010`, on NVIDIA the runtime allocates the intermediate image with a
-driver-chosen renderable, single-plane, **non-linear** DRM format modifier
-(`VK_EXT_image_drm_format_modifier`) instead of `LINEAR`, so native-GL Wayland
-renders without the flag. Selection is automatic and vendor-gated: AMD, Intel
-and everything else keep the `LINEAR` path byte-for-byte, and if no renderable
-modifier is available the allocation falls back to `LINEAR`. Grep the log for
-`chose modifier 0x…` to confirm the modifier path engaged.
-
-Two caveats:
-
-- **X11 still needs `--use-angle=vulkan` on NVIDIA.** That failure is upstream
-  of this patch: Chromium's Ozone/X11 GPU process only registers a native-pixmap
-  `SharedImage` backing when its GBM probe (DRI3 → `gbm_create_device`)
-  succeeds, which it does not on NVIDIA — so no modifier is ever reached. The
-  modifier path only helps the Wayland native-GL case.
-- **Verification hook.** `WEBXR_OPENXR_FORCE_RENDERABLE_MODIFIER=1` forces the
-  modifier path on any GPU (still falling back to `LINEAR` on failure), so it
-  can be exercised on non-NVIDIA hardware.
+This LINEAR-modifier sharing is why the **NVIDIA proprietary driver is not
+supported** — see *Known limitations* below.
 
 On the page:
 
@@ -777,6 +737,19 @@ sequenceDiagram
 - The in-headset overlay shows the **generic** permission notification ("this
   site needs more permissions"), not per-permission wording. This matches
   Windows; the actual allow/deny happens in the desktop dialog.
+- **The NVIDIA proprietary driver is not supported.** The frame-sharing path has
+  the XR utility process allocate a DMA-BUF with Vulkan and the GPU process
+  render WebGL into it. NVIDIA can do neither half of that across the process
+  boundary: it cannot render into a `LINEAR` (`modifier 0`) import
+  (`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` / no native-pixmap backing on X11),
+  and a renderable block-linear modifier **hangs the GPU** when the other
+  process renders into it (`VK_ERROR_DEVICE_LOST` / `GL_GUILTY_CONTEXT_RESET`).
+  A Vulkan-side export/import round-trip does not catch the bad modifier because
+  Vulkan and GL/EGL disagree about which modifiers are importable on NVIDIA.
+  Making this work would require allocating the shared buffer via Ozone/GBM in
+  the **GPU process** (the path normal Chromium rendering uses on NVIDIA) rather
+  than via Vulkan in the XR process — a larger change not done here. AMD/RADV
+  and Intel/Mesa work because their GL renders into a `LINEAR` import directly.
 
 ## Reporting issues
 
