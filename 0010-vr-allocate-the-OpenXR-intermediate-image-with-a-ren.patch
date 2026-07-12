@@ -1,4 +1,4 @@
-From d1ad4fbac1e5d87a5af0838690be7670469b3bac Mon Sep 17 00:00:00 2001
+From 1cbb252e7a60f64ceaeb15fb8541f3d14cbdb9b5 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 12 Jul 2026 18:07:46 +0800
 Subject: [PATCH 10/10] vr: allocate the OpenXR intermediate image with a
@@ -18,12 +18,12 @@ byte-for-byte unchanged.
 Setting WEBXR_OPENXR_FORCE_RENDERABLE_MODIFIER=1 forces the modifier path on any GPU, so it can
 be exercised on non-NVIDIA hardware for verification.
 ---
- .../linux/openxr_graphics_binding_vulkan.cc   | 269 +++++++++++++++++-
- .../linux/openxr_graphics_binding_vulkan.h    |  38 ++-
- 2 files changed, 302 insertions(+), 5 deletions(-)
+ .../linux/openxr_graphics_binding_vulkan.cc   | 330 +++++++++++++++++-
+ .../linux/openxr_graphics_binding_vulkan.h    |  38 +-
+ 2 files changed, 363 insertions(+), 5 deletions(-)
 
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
-index daef5a1843faf..a7639ab1f6c54 100644
+index daef5a1843faf..a2d223d592e8b 100644
 --- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 @@ -13,6 +13,7 @@
@@ -107,7 +107,7 @@ index daef5a1843faf..a7639ab1f6c54 100644
    CHECK(vk_get_device_proc_addr_);
    CHECK(vk_device_ != VK_NULL_HANDLE);
  
-@@ -793,6 +836,222 @@ bool OpenXrGraphicsBindingVulkan::CreateIntermediateImage(
+@@ -793,6 +836,283 @@ bool OpenXrGraphicsBindingVulkan::CreateIntermediateImage(
    out_image->stride = static_cast<uint32_t>(layout.rowPitch);
    out_image->offset = static_cast<uint32_t>(layout.offset);
    out_image->allocation_size = layout.size;
@@ -147,6 +147,16 @@ index daef5a1843faf..a7639ab1f6c54 100644
 +        reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
 +            vk_get_instance_proc_addr_(
 +                vk_instance_, "vkGetPhysicalDeviceFormatProperties2KHR"));
++  }
++  auto pfn_get_image_format_props2 =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
++          vk_get_instance_proc_addr_(
++              vk_instance_, "vkGetPhysicalDeviceImageFormatProperties2"));
++  if (!pfn_get_image_format_props2) {
++    pfn_get_image_format_props2 =
++        reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
++            vk_get_instance_proc_addr_(
++                vk_instance_, "vkGetPhysicalDeviceImageFormatProperties2KHR"));
 +  }
 +  auto pfn_get_modifier_props =
 +      reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
@@ -214,6 +224,57 @@ index daef5a1843faf..a7639ab1f6c54 100644
 +                "single-plane non-linear modifier for format "
 +             << format;
 +    return false;
++  }
++
++  // Validate each candidate against the actual usage and DMA-BUF export before
++  // offering it. A modifier appearing in the format's tiling-feature list is
++  // not guaranteed to be valid for this image's usage *combined with* external
++  // DMA-BUF export; vkCreateImage may still accept it and produce a buffer that
++  // faults the GPU once rendered into and shared across processes (observed as
++  // VK_ERROR_DEVICE_LOST on NVIDIA). Keep only modifiers the driver confirms
++  // support the usage and are exportable as a DMA-BUF.
++  if (pfn_get_image_format_props2) {
++    std::vector<uint64_t> validated;
++    for (uint64_t mod : candidates) {
++      VkPhysicalDeviceExternalImageFormatInfo ext_fmt_info{};
++      ext_fmt_info.sType =
++          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
++      ext_fmt_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++      VkPhysicalDeviceImageDrmFormatModifierInfoEXT drm_info{};
++      drm_info.sType =
++          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
++      drm_info.pNext = &ext_fmt_info;
++      drm_info.drmFormatModifier = mod;
++      drm_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++      VkPhysicalDeviceImageFormatInfo2 fmt_info{};
++      fmt_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
++      fmt_info.pNext = &drm_info;
++      fmt_info.format = format;
++      fmt_info.type = VK_IMAGE_TYPE_2D;
++      fmt_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      fmt_info.usage = usage;
++
++      VkExternalImageFormatProperties ext_props{};
++      ext_props.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
++      VkImageFormatProperties2 props2{};
++      props2.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
++      props2.pNext = &ext_props;
++
++      if (pfn_get_image_format_props2(binding_.physicalDevice, &fmt_info,
++                                      &props2) == VK_SUCCESS &&
++          (ext_props.externalMemoryProperties.externalMemoryFeatures &
++           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
++        validated.push_back(mod);
++      }
++    }
++    candidates.swap(validated);
++    if (candidates.empty()) {
++      DVLOG(1) << "CreateIntermediateImageWithModifier: no modifier is valid "
++                  "for external DMA-BUF export with the requested usage";
++      return false;
++    }
 +  }
 +
 +  // Create the image with DRM-modifier tiling, offering the candidate list; the
@@ -330,7 +391,7 @@ index daef5a1843faf..a7639ab1f6c54 100644
    return true;
  }
  
-@@ -1012,9 +1271,13 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+@@ -1012,9 +1332,13 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
        return;
      }
  
