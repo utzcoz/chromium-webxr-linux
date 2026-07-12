@@ -1,4 +1,4 @@
-From 1cbb252e7a60f64ceaeb15fb8541f3d14cbdb9b5 Mon Sep 17 00:00:00 2001
+From 61deb0bd22f69b365245570c7803ceac141efc5a Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 12 Jul 2026 18:07:46 +0800
 Subject: [PATCH 10/10] vr: allocate the OpenXR intermediate image with a
@@ -18,12 +18,12 @@ byte-for-byte unchanged.
 Setting WEBXR_OPENXR_FORCE_RENDERABLE_MODIFIER=1 forces the modifier path on any GPU, so it can
 be exercised on non-NVIDIA hardware for verification.
 ---
- .../linux/openxr_graphics_binding_vulkan.cc   | 330 +++++++++++++++++-
- .../linux/openxr_graphics_binding_vulkan.h    |  38 +-
- 2 files changed, 363 insertions(+), 5 deletions(-)
+ .../linux/openxr_graphics_binding_vulkan.cc   | 561 +++++++++++++++++-
+ .../linux/openxr_graphics_binding_vulkan.h    |  50 +-
+ 2 files changed, 606 insertions(+), 5 deletions(-)
 
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
-index daef5a1843faf..a2d223d592e8b 100644
+index daef5a1843faf..d6be4d4fa629e 100644
 --- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 @@ -13,6 +13,7 @@
@@ -107,12 +107,218 @@ index daef5a1843faf..a2d223d592e8b 100644
    CHECK(vk_get_device_proc_addr_);
    CHECK(vk_device_ != VK_NULL_HANDLE);
  
-@@ -793,6 +836,283 @@ bool OpenXrGraphicsBindingVulkan::CreateIntermediateImage(
+@@ -793,6 +836,514 @@ bool OpenXrGraphicsBindingVulkan::CreateIntermediateImage(
    out_image->stride = static_cast<uint32_t>(layout.rowPitch);
    out_image->offset = static_cast<uint32_t>(layout.offset);
    out_image->allocation_size = layout.size;
 +  out_image->modifier = 0;  // DRM_FORMAT_MOD_LINEAR
 +  return true;
++}
++
++bool OpenXrGraphicsBindingVulkan::ModifierRoundTrips(VkFormat format,
++                                                     VkImageUsageFlags usage,
++                                                     uint64_t modifier) {
++  auto pfn_create_image = reinterpret_cast<PFN_vkCreateImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkCreateImage"));
++  auto pfn_get_memory_reqs = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
++      vk_get_device_proc_addr_(vk_device_, "vkGetImageMemoryRequirements"));
++  auto pfn_allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkAllocateMemory"));
++  auto pfn_bind_image_memory = reinterpret_cast<PFN_vkBindImageMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkBindImageMemory"));
++  auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++  auto pfn_free_memory = reinterpret_cast<PFN_vkFreeMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkFreeMemory"));
++  auto pfn_get_memory_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
++      vk_get_device_proc_addr_(vk_device_, "vkGetMemoryFdKHR"));
++  auto pfn_get_memory_fd_props =
++      reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
++          vk_get_device_proc_addr_(vk_device_, "vkGetMemoryFdPropertiesKHR"));
++  auto pfn_get_subresource_layout =
++      reinterpret_cast<PFN_vkGetImageSubresourceLayout>(
++          vk_get_device_proc_addr_(vk_device_, "vkGetImageSubresourceLayout"));
++  auto pfn_get_phys_mem_props =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
++          vk_get_instance_proc_addr_(vk_instance_,
++                                     "vkGetPhysicalDeviceMemoryProperties"));
++  if (!pfn_create_image || !pfn_get_memory_reqs || !pfn_allocate_memory ||
++      !pfn_bind_image_memory || !pfn_destroy_image || !pfn_free_memory ||
++      !pfn_get_memory_fd || !pfn_get_memory_fd_props ||
++      !pfn_get_subresource_layout || !pfn_get_phys_mem_props) {
++    return false;
++  }
++
++  // A small verification size keeps this cheap; modifier round-trip validity is
++  // independent of the exact dimensions (matches gbm_wrapper's 1x1 approach).
++  constexpr uint32_t kVerifyDim = 64;
++
++  VkPhysicalDeviceMemoryProperties mem_props{};
++  pfn_get_phys_mem_props(binding_.physicalDevice, &mem_props);
++  auto pick_device_local = [&](uint32_t type_bits) -> uint32_t {
++    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++      if ((type_bits & (1u << i)) &&
++          (UNSAFE_TODO(mem_props.memoryTypes[i]).propertyFlags &
++           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++        return i;
++      }
++    }
++    return UINT32_MAX;
++  };
++  auto make_image_ci = [&](void* pnext) {
++    VkImageCreateInfo ci{};
++    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    ci.pNext = pnext;
++    ci.imageType = VK_IMAGE_TYPE_2D;
++    ci.format = format;
++    ci.extent = {kVerifyDim, kVerifyDim, 1};
++    ci.mipLevels = 1;
++    ci.arrayLayers = 1;
++    ci.samples = VK_SAMPLE_COUNT_1_BIT;
++    ci.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++    ci.usage = usage;
++    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    return ci;
++  };
++
++  // Source: create with the modifier, allocate exportable memory, export a FD.
++  VkExternalMemoryImageCreateInfo src_ext{};
++  src_ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++  src_ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++  VkImageDrmFormatModifierListCreateInfoEXT src_mod_list{};
++  src_mod_list.sType =
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
++  src_mod_list.pNext = &src_ext;
++  src_mod_list.drmFormatModifierCount = 1;
++  src_mod_list.pDrmFormatModifiers = &modifier;
++  VkImageCreateInfo src_ci = make_image_ci(&src_mod_list);
++
++  VkImage src_image = VK_NULL_HANDLE;
++  if (pfn_create_image(vk_device_, &src_ci, nullptr, &src_image) !=
++      VK_SUCCESS) {
++    return false;
++  }
++
++  VkMemoryRequirements src_reqs{};
++  pfn_get_memory_reqs(vk_device_, src_image, &src_reqs);
++  uint32_t src_type = pick_device_local(src_reqs.memoryTypeBits);
++  if (src_type == UINT32_MAX) {
++    pfn_destroy_image(vk_device_, src_image, nullptr);
++    return false;
++  }
++  VkMemoryDedicatedAllocateInfo src_dedicated{};
++  src_dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++  src_dedicated.image = src_image;
++  VkExportMemoryAllocateInfo src_export{};
++  src_export.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++  src_export.pNext = &src_dedicated;
++  src_export.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++  VkMemoryAllocateInfo src_alloc{};
++  src_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++  src_alloc.pNext = &src_export;
++  src_alloc.allocationSize = src_reqs.size;
++  src_alloc.memoryTypeIndex = src_type;
++  VkDeviceMemory src_memory = VK_NULL_HANDLE;
++  if (pfn_allocate_memory(vk_device_, &src_alloc, nullptr, &src_memory) !=
++          VK_SUCCESS ||
++      pfn_bind_image_memory(vk_device_, src_image, src_memory, 0) !=
++          VK_SUCCESS) {
++    if (src_memory != VK_NULL_HANDLE) {
++      pfn_free_memory(vk_device_, src_memory, nullptr);
++    }
++    pfn_destroy_image(vk_device_, src_image, nullptr);
++    return false;
++  }
++
++  int raw_fd = -1;
++  VkMemoryGetFdInfoKHR fd_info{};
++  fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
++  fd_info.memory = src_memory;
++  fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++  const bool got_fd =
++      pfn_get_memory_fd(vk_device_, &fd_info, &raw_fd) == VK_SUCCESS &&
++      raw_fd >= 0;
++  base::ScopedFD fd(raw_fd);
++
++  VkImageSubresource sub{};
++  sub.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;
++  VkSubresourceLayout src_layout{};
++  pfn_get_subresource_layout(vk_device_, src_image, &sub, &src_layout);
++
++  bool round_trips = false;
++  if (got_fd) {
++    // Dest: re-import the FD into a fresh image with the explicit modifier +
++    // the source's plane layout. Failure here is exactly what blocklists a
++    // modifier (the NVIDIA export/import bug gbm_wrapper works around).
++    VkExternalMemoryImageCreateInfo dst_ext{};
++    dst_ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++    dst_ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++    VkSubresourceLayout dst_plane = src_layout;
++    VkImageDrmFormatModifierExplicitCreateInfoEXT dst_explicit{};
++    dst_explicit.sType =
++        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
++    dst_explicit.pNext = &dst_ext;
++    dst_explicit.drmFormatModifier = modifier;
++    dst_explicit.drmFormatModifierPlaneCount = 1;
++    dst_explicit.pPlaneLayouts = &dst_plane;
++    VkImageCreateInfo dst_ci = make_image_ci(&dst_explicit);
++
++    VkImage dst_image = VK_NULL_HANDLE;
++    if (pfn_create_image(vk_device_, &dst_ci, nullptr, &dst_image) ==
++        VK_SUCCESS) {
++      VkMemoryRequirements dst_reqs{};
++      pfn_get_memory_reqs(vk_device_, dst_image, &dst_reqs);
++      uint32_t type_bits = dst_reqs.memoryTypeBits;
++      VkMemoryFdPropertiesKHR fd_props{};
++      fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
++      if (pfn_get_memory_fd_props(
++              vk_device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++              fd.get(), &fd_props) == VK_SUCCESS) {
++        type_bits &= fd_props.memoryTypeBits;
++      }
++      uint32_t dst_type = pick_device_local(type_bits);
++      if (dst_type == UINT32_MAX) {
++        for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++          if (type_bits & (1u << i)) {
++            dst_type = i;
++            break;
++          }
++        }
++      }
++      if (dst_type != UINT32_MAX) {
++        VkMemoryDedicatedAllocateInfo dst_dedicated{};
++        dst_dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++        dst_dedicated.image = dst_image;
++        VkImportMemoryFdInfoKHR import_info{};
++        import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
++        import_info.pNext = &dst_dedicated;
++        import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++        import_info.fd = fd.get();
++        VkMemoryAllocateInfo dst_alloc{};
++        dst_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        dst_alloc.pNext = &import_info;
++        dst_alloc.allocationSize = dst_reqs.size;
++        dst_alloc.memoryTypeIndex = dst_type;
++        VkDeviceMemory dst_memory = VK_NULL_HANDLE;
++        if (pfn_allocate_memory(vk_device_, &dst_alloc, nullptr, &dst_memory) ==
++            VK_SUCCESS) {
++          // A successful import transfers FD ownership to Vulkan.
++          [[maybe_unused]] int owned_by_vulkan = fd.release();
++          if (pfn_bind_image_memory(vk_device_, dst_image, dst_memory, 0) ==
++              VK_SUCCESS) {
++            round_trips = true;
++          }
++          pfn_free_memory(vk_device_, dst_memory, nullptr);
++        }
++      }
++      pfn_destroy_image(vk_device_, dst_image, nullptr);
++    }
++  }
++
++  pfn_free_memory(vk_device_, src_memory, nullptr);
++  pfn_destroy_image(vk_device_, src_image, nullptr);
++  return round_trips;
 +}
 +
 +bool OpenXrGraphicsBindingVulkan::CreateIntermediateImageWithModifier(
@@ -277,6 +483,31 @@ index daef5a1843faf..a2d223d592e8b 100644
 +    }
 +  }
 +
++  // Authoritative filter: keep only modifiers that survive a DMA-BUF
++  // export/import round trip. vkGetPhysicalDeviceImageFormatProperties2 can
++  // report a modifier as exportable that still cannot actually be shared across
++  // the DMA-BUF boundary (NVIDIA), which hangs the GPU when the other process
++  // renders into it. This mirrors gbm_wrapper.cc's create/export/re-import
++  // validation, which blocklists exactly those modifiers.
++  {
++    std::vector<uint64_t> round_tripped;
++    for (uint64_t mod : candidates) {
++      if (ModifierRoundTrips(format, usage, mod)) {
++        round_tripped.push_back(mod);
++      } else {
++        DVLOG(1) << "CreateIntermediateImageWithModifier: modifier 0x"
++                 << std::hex << mod << std::dec
++                 << " failed the DMA-BUF round trip; blocklisted";
++      }
++    }
++    candidates.swap(round_tripped);
++    if (candidates.empty()) {
++      DVLOG(1) << "CreateIntermediateImageWithModifier: no modifier survived "
++                  "the DMA-BUF export/import round trip";
++      return false;
++    }
++  }
++
 +  // Create the image with DRM-modifier tiling, offering the candidate list; the
 +  // driver picks one it can allocate.
 +  VkExternalMemoryImageCreateInfo external_image_info{};
@@ -391,7 +622,7 @@ index daef5a1843faf..a2d223d592e8b 100644
    return true;
  }
  
-@@ -1012,9 +1332,13 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+@@ -1012,9 +1563,13 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
        return;
      }
  
@@ -408,7 +639,7 @@ index daef5a1843faf..a2d223d592e8b 100644
          /*stride=*/intermediate_images_[i].stride,
          /*offset=*/intermediate_images_[i].offset,
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
-index 2d567f27b7a23..3f6d1ddfacd64 100644
+index 2d567f27b7a23..eaacb49a57481 100644
 --- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
 @@ -83,6 +83,10 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
@@ -422,7 +653,7 @@ index 2d567f27b7a23..3f6d1ddfacd64 100644
      // Tracks the current Vulkan image layout so RenderLayer can supply the
      // correct oldLayout in pipeline barriers across frames.
      VkImageLayout current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-@@ -94,13 +98,33 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+@@ -94,13 +98,45 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
    // Cleans up the command pool and command buffer.
    void DestroyCommandPool();
  
@@ -455,10 +686,22 @@ index 2d567f27b7a23..3f6d1ddfacd64 100644
 +                                           VkImageUsageFlags usage,
 +                                           IntermediateImage* out_image);
 +
++  // Returns true only if `modifier` survives a DMA-BUF export/import round trip
++  // for `format`+`usage`: a throwaway image is created with the modifier, its
++  // memory is exported as a DMA-BUF FD, and that FD is re-imported into a fresh
++  // image. This mirrors the create/export/re-import validation loop in
++  // ui/gfx/linux/gbm_wrapper.cc, which exists specifically to blocklist NVIDIA
++  // modifiers that create fine but cannot be shared across the DMA-BUF boundary
++  // (using such a modifier hangs the GPU when the other process renders into
++  // it). Only round-trip-safe modifiers are offered to the real allocation.
++  bool ModifierRoundTrips(VkFormat format,
++                          VkImageUsageFlags usage,
++                          uint64_t modifier);
++
    // Destroys all intermediate images and frees their Vulkan memory.
    void DestroyIntermediateImages();
  
-@@ -174,6 +198,16 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+@@ -174,6 +210,16 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
    // creation.
    bool has_external_semaphore_fd_ = false;
  
