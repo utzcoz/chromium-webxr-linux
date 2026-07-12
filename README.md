@@ -94,10 +94,13 @@ This is a ten-patch series — apply `0001` through `0010` in order.
   blocklist in `gbm_wrapper.cc`) via `SharedImageInterface::CreateSharedImage`
   with `BufferUsage::SCANOUT`, and the XR process imports the returned DMA-BUF
   into Vulkan (handling multi-plane modifiers such as AMD DCC) for the
-  `RenderLayer` blit. This is what lets the **NVIDIA proprietary driver** render
-  WebXR on Wayland, where the old XR-process LINEAR/Vulkan allocation could not.
-  Falls back to the LINEAR export path where GBM native pixmaps are unavailable
-  (X11 DRI3 render nodes, headless), so no configuration regresses (`0010`).
+  `RenderLayer` blit. The in-headset overlay-UI image (`GetExportedOverlayImage`)
+  is allocated the same way and imported as a `SAMPLED` image, since NVIDIA GL
+  cannot render into a LINEAR overlay import either. This is what lets the
+  **NVIDIA proprietary driver** render WebXR on Wayland, where the old
+  XR-process LINEAR/Vulkan allocation could not. Falls back to the LINEAR export
+  path where GBM native pixmaps are unavailable (X11 DRI3 render nodes,
+  headless), so no configuration regresses (`0010`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -768,10 +771,12 @@ GPU-process GL/EGL importer accepts. So the buffer is instead allocated the way
 normal Chromium rendering does: the GPU process allocates an Ozone/GBM native
 pixmap (which runs the driver's own modifier validation, including the NVIDIA
 blocklist), and the XR process imports that DMA-BUF into Vulkan for the blit
-(`0010`). Grep the log for `via GBM native pixmap` (add
-`--vmodule='openxr_graphics_binding_vulkan=1'`) to confirm the path engaged; a
-`falling back to LINEAR export` line means the GBM allocation was unavailable
-(e.g. X11).
+(`0010`). The in-headset overlay-UI image is allocated the same way (imported as
+a `SAMPLED` image), so the overlay renders on NVIDIA too rather than reporting
+`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` (`0x8CD6`). Grep the log for
+`via GBM native pixmap` (add `--vmodule='openxr_graphics_binding_vulkan=1'`) to
+confirm the path engaged; a `falling back to LINEAR export` line means the GBM
+allocation was unavailable (e.g. X11).
 
 ## Reporting issues
 
