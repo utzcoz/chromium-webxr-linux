@@ -12,7 +12,7 @@ reference OpenXR runtime.
 
 ## What the patches do
 
-This is a nine-patch series — apply `0001` through `0009` in order.
+This is a ten-patch series — apply `0001` through `0010` in order.
 
 - Implements `OpenXrPlatformHelperLinux` and `OpenXrGraphicsBindingVulkan`
   under `device/vr/openxr/linux/`.
@@ -88,6 +88,16 @@ This is a nine-patch series — apply `0001` through `0009` in order.
   now-disengaged `std::optional` and aborted the browser. `pending_frame_`
   is re-checked after `GetNextFrameData()` so the session ends cleanly
   instead (`0009`).
+- Allocates the shared frame buffer the way normal Chromium rendering does —
+  the GPU process allocates an Ozone/GBM native pixmap (which runs the driver's
+  own create/export/re-import modifier validation, including the explicit NVIDIA
+  blocklist in `gbm_wrapper.cc`) via `SharedImageInterface::CreateSharedImage`
+  with `BufferUsage::SCANOUT`, and the XR process imports the returned DMA-BUF
+  into Vulkan (handling multi-plane modifiers such as AMD DCC) for the
+  `RenderLayer` blit. This is what lets the **NVIDIA proprietary driver** render
+  WebXR on Wayland, where the old XR-process LINEAR/Vulkan allocation could not.
+  Falls back to the LINEAR export path where GBM native pixmaps are unavailable
+  (X11 DRI3 render nodes, headless), so no configuration regresses (`0010`).
 
 ## Chromium WebXR architecture across platforms
 
@@ -367,17 +377,17 @@ gclient sync
 
 ## 3. Apply the patches
 
-From inside `chromium/src`, apply the nine-patch series in order (the glob
-expands to `0001` through `0009`):
+From inside `chromium/src`, apply the ten-patch series in order (the glob
+expands to `0001` through `0010`):
 
 ```bash
-git am /path/to/chromium-webxr-linux/000*.patch
+git am /path/to/chromium-webxr-linux/0*.patch
 ```
 
 If `git am` fails because of a newer Chromium base, try a 3-way merge:
 
 ```bash
-git am --3way /path/to/chromium-webxr-linux/000*.patch
+git am --3way /path/to/chromium-webxr-linux/0*.patch
 # resolve any conflicts, then:
 git add -A && git am --continue
 ```
@@ -527,8 +537,10 @@ flags and works with the default GL backend (no `--use-angle=vulkan`); it logs
 a few harmless `NOTIMPLEMENTED_LOG_ONCE()` lines (`OnTrancheFlags`, `OnName`,
 …) for optional Wayland protocol callbacks that do not affect rendering.
 
-This LINEAR-modifier sharing is why the **NVIDIA proprietary driver is not
-supported** — see *Known limitations* below.
+This LINEAR path is the fallback. On NVIDIA (whose GL cannot render into a
+LINEAR import) the buffer is instead allocated GPU-process-side via Ozone/GBM
+and imported into Vulkan (`0010`), which works on Wayland — see *NVIDIA GPUs*
+below.
 
 On the page:
 
@@ -737,19 +749,29 @@ sequenceDiagram
 - The in-headset overlay shows the **generic** permission notification ("this
   site needs more permissions"), not per-permission wording. This matches
   Windows; the actual allow/deny happens in the desktop dialog.
-- **The NVIDIA proprietary driver is not supported.** The frame-sharing path has
-  the XR utility process allocate a DMA-BUF with Vulkan and the GPU process
-  render WebGL into it. NVIDIA can do neither half of that across the process
-  boundary: it cannot render into a `LINEAR` (`modifier 0`) import
-  (`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` / no native-pixmap backing on X11),
-  and a renderable block-linear modifier **hangs the GPU** when the other
-  process renders into it (`VK_ERROR_DEVICE_LOST` / `GL_GUILTY_CONTEXT_RESET`).
-  A Vulkan-side export/import round-trip does not catch the bad modifier because
-  Vulkan and GL/EGL disagree about which modifiers are importable on NVIDIA.
-  Making this work would require allocating the shared buffer via Ozone/GBM in
-  the **GPU process** (the path normal Chromium rendering uses on NVIDIA) rather
-  than via Vulkan in the XR process — a larger change not done here. AMD/RADV
-  and Intel/Mesa work because their GL renders into a `LINEAR` import directly.
+- **NVIDIA proprietary driver: Wayland only** (`0010`). The shared buffer is
+  allocated GPU-process-side via Ozone/GBM and imported into the XR-process
+  Vulkan. On Wayland the GBM device is scanout-capable, so a renderable native
+  pixmap is allocated and NVIDIA renders WebXR. On **X11** the GPU process's GBM
+  device is a DRI3 render node that cannot allocate `SCANOUT` buffers, so it
+  falls back to the LINEAR path, which NVIDIA's GL cannot render into — X11 on
+  NVIDIA is therefore unsupported. AMD/RADV and Intel/Mesa work on both. Visual
+  correctness on NVIDIA is community-verified; see issue #4.
+
+## NVIDIA GPUs
+
+On the NVIDIA proprietary driver, GL/EGL cannot render into a `LINEAR`
+(`modifier 0`) DMA-BUF import, and a hand-picked renderable modifier hangs the
+GPU when shared across processes (`VK_ERROR_DEVICE_LOST` /
+`GL_GUILTY_CONTEXT_RESET`) — the XR-process Vulkan cannot pick a modifier the
+GPU-process GL/EGL importer accepts. So the buffer is instead allocated the way
+normal Chromium rendering does: the GPU process allocates an Ozone/GBM native
+pixmap (which runs the driver's own modifier validation, including the NVIDIA
+blocklist), and the XR process imports that DMA-BUF into Vulkan for the blit
+(`0010`). Grep the log for `via GBM native pixmap` (add
+`--vmodule='openxr_graphics_binding_vulkan=1'`) to confirm the path engaged; a
+`falling back to LINEAR export` line means the GBM allocation was unavailable
+(e.g. X11).
 
 ## Reporting issues
 

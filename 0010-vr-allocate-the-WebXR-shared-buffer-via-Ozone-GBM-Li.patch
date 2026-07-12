@@ -1,0 +1,396 @@
+From 15447d8d56495fb98c652bbf1c8254f505dc2b20 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Mon, 13 Jul 2026 00:10:32 +0800
+Subject: [PATCH 10/10] vr: allocate the WebXR shared buffer via Ozone/GBM
+ (Linux)
+
+The XR utility process hand-allocated the intermediate image as a LINEAR DMA-BUF in Vulkan and
+exported it. The NVIDIA proprietary driver cannot render into that across the process boundary:
+LINEAR is not GL-renderable, and a hand-picked renderable modifier hangs the GPU (VK_ERROR_-
+DEVICE_LOST / GL_GUILTY_CONTEXT_RESET), because the XR-process Vulkan cannot pick a modifier the
+GPU-process GL/EGL importer accepts.
+
+Instead, allocate the buffer the way normal Chromium rendering does: the GPU process allocates an
+Ozone/GBM native pixmap -- which runs the driver's own create/export/re-import modifier
+validation loop, including the explicit NVIDIA blocklist in gbm_wrapper.cc -- via
+SharedImageInterface::CreateSharedImage with BufferUsage::SCANOUT, and the XR process imports the
+returned DMA-BUF into Vulkan (handling multi-plane modifiers such as AMD DCC) as the RenderLayer
+blit source. Falls back to the previous LINEAR export path where GBM native pixmaps are
+unavailable (e.g. X11 DRI3 render nodes, headless Ozone), so no configuration regresses.
+
+Verified on AMD/RADV Wayland: frames render through a GBM 3-plane DCC modifier with no fallback.
+---
+ .../linux/openxr_graphics_binding_vulkan.cc   | 263 +++++++++++++++---
+ .../linux/openxr_graphics_binding_vulkan.h    |  19 +-
+ 2 files changed, 241 insertions(+), 41 deletions(-)
+
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+index daef5a1843faf..d4653a34eea28 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+@@ -15,6 +15,7 @@
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+ #include "base/files/scoped_file.h"
++#include "base/posix/eintr_wrapper.h"
+ #include "base/logging.h"
+ #include "base/memory/shared_memory_mapping.h"
+ #include "base/memory/unsafe_shared_memory_region.h"
+@@ -28,6 +29,8 @@
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
++#include "gpu/ipc/common/surface_handle.h"
++#include "ui/gfx/buffer_types.h"
+ #include "third_party/openxr/src/include/openxr/openxr.h"
+ #include "ui/gfx/color_space.h"
+ #include "ui/gfx/gpu_fence.h"
+@@ -938,6 +941,171 @@ bool OpenXrGraphicsBindingVulkan::CanUseSharedImages() const {
+   return initialized_;
+ }
+ 
++bool OpenXrGraphicsBindingVulkan::ImportDmaBufIntoVulkan(
++    const gfx::NativePixmapHandle& handle,
++    const gfx::Size& size,
++    VkFormat format,
++    VkImageUsageFlags usage,
++    IntermediateImage* out_image) {
++  CHECK(vk_get_device_proc_addr_);
++  CHECK(vk_device_ != VK_NULL_HANDLE);
++
++  DVLOG(1) << "ImportDmaBufIntoVulkan: planes=" << handle.planes.size()
++           << " modifier=0x" << std::hex << handle.modifier << std::dec;
++  // Multi-plane modifiers are common for renderable GBM allocations (e.g. AMD
++  // DCC adds compression-metadata planes). All planes live in the single BO
++  // referenced by planes[0].fd at the given offsets (non-disjoint import).
++  if (handle.planes.empty() || handle.planes.size() > 4 ||
++      !handle.planes[0].fd.is_valid()) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: unsupported plane count "
++             << handle.planes.size() << " / invalid fd";
++    return false;
++  }
++
++  auto pfn_create_image = reinterpret_cast<PFN_vkCreateImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkCreateImage"));
++  auto pfn_get_memory_reqs = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
++      vk_get_device_proc_addr_(vk_device_, "vkGetImageMemoryRequirements"));
++  auto pfn_allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkAllocateMemory"));
++  auto pfn_bind_image_memory = reinterpret_cast<PFN_vkBindImageMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkBindImageMemory"));
++  auto pfn_get_memory_fd_props =
++      reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
++          vk_get_device_proc_addr_(vk_device_, "vkGetMemoryFdPropertiesKHR"));
++  auto pfn_destroy_image = reinterpret_cast<PFN_vkDestroyImage>(
++      vk_get_device_proc_addr_(vk_device_, "vkDestroyImage"));
++  auto pfn_free_memory = reinterpret_cast<PFN_vkFreeMemory>(
++      vk_get_device_proc_addr_(vk_device_, "vkFreeMemory"));
++  auto pfn_get_phys_mem_props =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
++          vk_get_instance_proc_addr_(vk_instance_,
++                                     "vkGetPhysicalDeviceMemoryProperties"));
++  if (!pfn_create_image || !pfn_get_memory_reqs || !pfn_allocate_memory ||
++      !pfn_bind_image_memory || !pfn_get_memory_fd_props || !pfn_destroy_image ||
++      !pfn_free_memory || !pfn_get_phys_mem_props) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: missing Vulkan functions"
++             << " fd_props=" << !!pfn_get_memory_fd_props;
++    return false;
++  }
++
++  // Create the image with the handle's explicit modifier + per-plane layout.
++  // VkImageDrmFormatModifierExplicitCreateInfoEXT uses each layout's offset and
++  // rowPitch; size/arrayPitch/depthPitch must be 0.
++  std::vector<VkSubresourceLayout> plane_layouts(handle.planes.size());
++  for (size_t p = 0; p < handle.planes.size(); ++p) {
++    plane_layouts[p].offset = handle.planes[p].offset;
++    plane_layouts[p].rowPitch = handle.planes[p].stride;
++  }
++
++  VkExternalMemoryImageCreateInfo external_info{};
++  external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++  external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++  VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_info{};
++  explicit_info.sType =
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
++  explicit_info.pNext = &external_info;
++  explicit_info.drmFormatModifier = handle.modifier;
++  explicit_info.drmFormatModifierPlaneCount =
++      static_cast<uint32_t>(plane_layouts.size());
++  explicit_info.pPlaneLayouts = plane_layouts.data();
++
++  VkImageCreateInfo image_ci{};
++  image_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_ci.pNext = &explicit_info;
++  image_ci.imageType = VK_IMAGE_TYPE_2D;
++  image_ci.format = format;
++  image_ci.extent = {static_cast<uint32_t>(size.width()),
++                     static_cast<uint32_t>(size.height()), 1};
++  image_ci.mipLevels = 1;
++  image_ci.arrayLayers = 1;
++  image_ci.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_ci.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++  image_ci.usage = usage;
++  image_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++  VkImage image = VK_NULL_HANDLE;
++  if (pfn_create_image(vk_device_, &image_ci, nullptr, &image) != VK_SUCCESS) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: vkCreateImage failed";
++    return false;
++  }
++
++  // Dup the plane FD for the import (the handle keeps ownership of its own copy;
++  // Vulkan takes ownership of the dup on a successful import).
++  base::ScopedFD import_fd(HANDLE_EINTR(dup(handle.planes[0].fd.get())));
++  if (!import_fd.is_valid()) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: dup(fd) failed";
++    pfn_destroy_image(vk_device_, image, nullptr);
++    return false;
++  }
++
++  VkMemoryRequirements mem_reqs{};
++  pfn_get_memory_reqs(vk_device_, image, &mem_reqs);
++  uint32_t type_bits = mem_reqs.memoryTypeBits;
++  VkMemoryFdPropertiesKHR fd_props{};
++  fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
++  if (pfn_get_memory_fd_props(vk_device_,
++                              VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++                              import_fd.get(), &fd_props) == VK_SUCCESS) {
++    type_bits &= fd_props.memoryTypeBits;
++  }
++  VkPhysicalDeviceMemoryProperties mem_props{};
++  pfn_get_phys_mem_props(binding_.physicalDevice, &mem_props);
++  uint32_t memory_type_index = UINT32_MAX;
++  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++    if (type_bits & (1u << i)) {
++      memory_type_index = i;
++      break;
++    }
++  }
++  if (memory_type_index == UINT32_MAX) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: no memory type (reqs=0x" << std::hex
++             << mem_reqs.memoryTypeBits << " fd=0x" << fd_props.memoryTypeBits
++             << std::dec << ")";
++    pfn_destroy_image(vk_device_, image, nullptr);
++    return false;
++  }
++
++  VkMemoryDedicatedAllocateInfo dedicated{};
++  dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++  dedicated.image = image;
++  VkImportMemoryFdInfoKHR import_info{};
++  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
++  import_info.pNext = &dedicated;
++  import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++  import_info.fd = import_fd.get();
++  VkMemoryAllocateInfo alloc_info{};
++  alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++  alloc_info.pNext = &import_info;
++  alloc_info.allocationSize = mem_reqs.size;
++  alloc_info.memoryTypeIndex = memory_type_index;
++
++  VkDeviceMemory memory = VK_NULL_HANDLE;
++  if (pfn_allocate_memory(vk_device_, &alloc_info, nullptr, &memory) !=
++      VK_SUCCESS) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: vkAllocateMemory (import) failed";
++    pfn_destroy_image(vk_device_, image, nullptr);
++    return false;
++  }
++  // A successful import transfers FD ownership to Vulkan.
++  [[maybe_unused]] int owned_by_vulkan = import_fd.release();
++  if (pfn_bind_image_memory(vk_device_, image, memory, 0) != VK_SUCCESS) {
++    DVLOG(1) << "ImportDmaBufIntoVulkan: vkBindImageMemory failed";
++    pfn_free_memory(vk_device_, memory, nullptr);
++    pfn_destroy_image(vk_device_, image, nullptr);
++    return false;
++  }
++
++  out_image->image = image;
++  out_image->memory = memory;
++  out_image->stride = handle.planes[0].stride;
++  out_image->offset = handle.planes[0].offset;
++  out_image->allocation_size = mem_reqs.size;
++  out_image->modifier = handle.modifier;
++  return true;
++}
++
+ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+     OpenXrCompositionLayer& layer,
+     gpu::SharedImageInterface* sii) {
+@@ -985,76 +1153,91 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+     return;
+   }
+ 
++  // Match the SharedImage channel order to the negotiated swapchain format so
++  // colors are not swizzled. Both SRGB and UNORM BGRA map to kBGRA_8888.
++  const viz::SharedImageFormat si_format =
++      (swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
++       swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM)
++          ? viz::SinglePlaneFormat::kBGRA_8888
++          : viz::SinglePlaneFormat::kRGBA_8888;
++  const gpu::SharedImageUsageSet shared_image_usage =
++      gpu::SHARED_IMAGE_USAGE_DISPLAY_READ | gpu::SHARED_IMAGE_USAGE_GLES2_READ |
++      gpu::SHARED_IMAGE_USAGE_GLES2_WRITE;
++  const gpu::SharedImageInfo si_info{si_format, size,
++                                     gfx::ColorSpace::CreateSRGB(),
++                                     shared_image_usage, "OpenXrVulkanBinding"};
++  constexpr VkImageUsageFlags kIntermediateUsage =
++      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++
+   auto swapchain_images = layer.GetSwapchainImages();
+   intermediate_images_.resize(swapchain_images.size());
+ 
+   for (size_t i = 0; i < swapchain_images.size(); ++i) {
+-    if (!CreateIntermediateImage(size, swapchain_format_,
+-                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+-                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+-                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++    // Preferred path: have the GPU process allocate the buffer via Ozone/GBM --
++    // the same path normal Chromium rendering uses, including the driver's
++    // create/export/re-import modifier validation that blocklists NVIDIA
++    // modifiers which cannot be shared. SCANOUT buffer usage forces a
++    // renderable (GBM_BO_USE_RENDERING) allocation. We import the returned
++    // DMA-BUF into Vulkan for the RenderLayer blit.
++    scoped_refptr<gpu::ClientSharedImage> client_si = sii->CreateSharedImage(
++        si_info, gpu::kNullSurfaceHandle, gfx::BufferUsage::SCANOUT);
++    if (client_si) {
++      gfx::GpuMemoryBufferHandle handle =
++          client_si->CloneGpuMemoryBufferHandle();
++      if (handle.type == gfx::NATIVE_PIXMAP &&
++          ImportDmaBufIntoVulkan(handle.native_pixmap_handle(), size,
++                                 swapchain_format_, kIntermediateUsage,
++                                 &intermediate_images_[i])) {
++        DVLOG(1) << "CreateSharedImages: slot " << i
++                 << " via GBM native pixmap, modifier=0x" << std::hex
++                 << intermediate_images_[i].modifier << std::dec;
++        swapchain_images[i].shared_image = std::move(client_si);
++        swapchain_images[i].sync_token = sii->GenVerifiedSyncToken();
++        continue;
++      }
++      // The GBM buffer could not be imported into Vulkan; drop it and fall back.
++      sii->DestroySharedImage(gpu::SyncToken(), std::move(client_si));
++      DVLOG(1) << "CreateSharedImages: slot " << i
++               << " GBM path unusable; falling back to LINEAR export";
++    }
++
++    // Fallback: allocate a LINEAR image in Vulkan and export its DMA-BUF. Works
++    // where GL renders into a linear import (AMD/Intel) and is the only path in
++    // headless, where no GBM device is available. NOTE: no
++    // SHARED_IMAGE_USAGE_SCANOUT here -- a LINEAR (modifier 0) NativePixmap has
++    // no backing factory that satisfies SCANOUT, so CreateSharedImage would
++    // return null.
++    if (!CreateIntermediateImage(size, swapchain_format_, kIntermediateUsage,
+                                  &intermediate_images_[i])) {
+       LOG(ERROR) << "Failed to create intermediate image " << i;
+       DestroyIntermediateImages();
+       return;
+     }
+-
+-    // Export the VkDeviceMemory as a DMA-BUF file descriptor.
+     int fd = -1;
+     VkMemoryGetFdInfoKHR fd_info{};
+     fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+     fd_info.memory = intermediate_images_[i].memory;
+     fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+-
+     if (pfn_get_memory_fd(vk_device_, &fd_info, &fd) != VK_SUCCESS || fd < 0) {
+       LOG(ERROR) << "vkGetMemoryFdKHR (DMA_BUF) failed for image " << i;
+       DestroyIntermediateImages();
+       return;
+     }
+-
+-    // Wrap the DMA-BUF FD with proper stride from VkSubresourceLayout.
+     gfx::NativePixmapHandle pixmap_handle;
+     pixmap_handle.modifier = 0;  // DRM_FORMAT_MOD_LINEAR
+     pixmap_handle.planes.emplace_back(
+         /*stride=*/intermediate_images_[i].stride,
+         /*offset=*/intermediate_images_[i].offset,
+-        /*size=*/intermediate_images_[i].allocation_size,
+-        base::ScopedFD(fd));
+-
++        /*size=*/intermediate_images_[i].allocation_size, base::ScopedFD(fd));
+     gfx::GpuMemoryBufferHandle gmb_handle(std::move(pixmap_handle));
+-
+-    // The SharedImages created here will be transferred to other processes to
+-    // have their contents written by WebGL or WebGPU. Readback by OpenXR is
+-    // via the blit in RenderLayer. NOTE: no SHARED_IMAGE_USAGE_SCANOUT — these
+-    // images are blitted into the OpenXR swapchain, never scanned out to a
+-    // display. Requesting SCANOUT on a LINEAR (modifier 0) NativePixmap leaves
+-    // no backing factory able to satisfy it, so CreateSharedImage returns null.
+-    gpu::SharedImageUsageSet shared_image_usage =
+-        gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
+-        gpu::SHARED_IMAGE_USAGE_GLES2_READ |
+-        gpu::SHARED_IMAGE_USAGE_GLES2_WRITE;
+-
+-    // Map the Vulkan swapchain format to the matching SharedImage format so
+-    // the GPU process imports the DMA-BUF with the correct channel layout.
+-    // Match the SharedImage channel order to the negotiated swapchain format so
+-    // colors are not swizzled. Both SRGB and UNORM BGRA map to kBGRA_8888.
+-    viz::SharedImageFormat si_format =
+-        (swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
+-         swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM)
+-            ? viz::SinglePlaneFormat::kBGRA_8888
+-            : viz::SinglePlaneFormat::kRGBA_8888;
+-
+-    swapchain_images[i].shared_image = sii->CreateSharedImage(
+-        {si_format, size, gfx::ColorSpace::CreateSRGB(), shared_image_usage,
+-         "OpenXrVulkanBinding"},
+-        std::move(gmb_handle));
+-
++    swapchain_images[i].shared_image =
++        sii->CreateSharedImage(si_info, std::move(gmb_handle));
+     if (!swapchain_images[i].shared_image) {
+       LOG(ERROR) << "CreateSharedImage failed for slot " << i;
+       DestroyIntermediateImages();
+       return;
+     }
+-
+     swapchain_images[i].sync_token = sii->GenVerifiedSyncToken();
+   }
+ }
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+index 2d567f27b7a23..1606d546ffeef 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+@@ -83,6 +83,9 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+     uint32_t stride = 0;       // Row pitch from VkSubresourceLayout
+     uint32_t offset = 0;       // Plane offset
+     uint64_t allocation_size = 0;  // Total allocation size
++    // DRM format modifier of the backing DMA-BUF: 0 (LINEAR) for the fallback
++    // export path, the GBM-chosen modifier for the imported native-pixmap path.
++    uint64_t modifier = 0;
+     // Tracks the current Vulkan image layout so RenderLayer can supply the
+     // correct oldLayout in pipeline barriers across frames.
+     VkImageLayout current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+@@ -95,12 +98,26 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+   void DestroyCommandPool();
+ 
+   // Creates a single exportable (LINEAR, DMA-BUF) VkImage + VkDeviceMemory
+-  // pair with the given image usage flags.
++  // pair with the given image usage flags. Used as the fallback path when the
++  // GPU-process/GBM allocation path is unavailable.
+   bool CreateIntermediateImage(const gfx::Size& size,
+                                VkFormat format,
+                                VkImageUsageFlags usage,
+                                IntermediateImage* out_image);
+ 
++  // Imports an existing DMA-BUF (allocated GPU-process-side via Ozone/GBM and
++  // handed back through ClientSharedImage::CloneGpuMemoryBufferHandle()) into a
++  // VkImage the RenderLayer blit can read. The image is created with the
++  // handle's explicit DRM modifier + plane layout and the FD is imported as
++  // dedicated memory. Returns false (caller falls back to the LINEAR export
++  // path) if the handle is not a single-plane native pixmap or any Vulkan call
++  // fails.
++  bool ImportDmaBufIntoVulkan(const gfx::NativePixmapHandle& handle,
++                              const gfx::Size& size,
++                              VkFormat format,
++                              VkImageUsageFlags usage,
++                              IntermediateImage* out_image);
++
+   // Destroys all intermediate images and frees their Vulkan memory.
+   void DestroyIntermediateImages();
+ 
+-- 
+2.53.0
+
