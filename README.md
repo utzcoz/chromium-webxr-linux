@@ -379,8 +379,9 @@ on 2026-11-03), with `--enable-features=OpenXR`. It has the backend, the
 sandbox and the frame synchronization, but not the features of the patches
 here: no WebXR Layers, frame rate, WebGPU or in-headset overlay.
 
-Verified with the Chromium snapshot r1721517 (158.0.8111.0) against Monado.
-Google Chrome builds were not tested.
+Verified with the Chromium snapshot r1721517 (158.0.8111.0) against Monado,
+with Chromium's sandbox on: the OpenXR service ran in its own `xr_compositing`
+sandbox. Google Chrome M157 and newer were not tested.
 
 1. Get a Chromium snapshot built from main:
 
@@ -390,10 +391,14 @@ Google Chrome builds were not tested.
    unzip chrome-linux.zip
    ```
 
-2. Let it use Chromium's sandbox. On Ubuntu 23.10 and newer, a downloaded
-   Chromium stops with *No usable sandbox!* because AppArmor blocks
-   unprivileged user namespaces for binaries without a profile. Give it one,
-   with the path where you unpacked it:
+2. Let it use Chromium's sandbox. On Ubuntu 23.10 and newer, AppArmor blocks
+   unprivileged user namespaces for binaries without a profile, and Chromium
+   then stops with *No usable sandbox!*.
+   - Installed browsers are covered: Ubuntu's `apparmor` package ships
+     profiles for Google Chrome (`/opt/google/chrome/chrome`) and for packaged
+     Chromium (`/usr/lib/chromium/chromium` and similar).
+   - A downloaded snapshot is not. Give it a profile, with the path where you
+     unpacked it:
 
    ```bash
    sudo tee /etc/apparmor.d/chromium-snapshot <<'EOF'
@@ -408,7 +413,13 @@ Google Chrome builds were not tested.
    ```
 
    `--no-sandbox` also gets past this, but it turns off every sandbox,
-   including the OpenXR service's own; use it only for a quick check.
+   including the OpenXR service's own; use it only for a quick check. To
+   confirm the OpenXR service's sandbox while a session runs (`Seccomp: 2`
+   means its seccomp filter is on):
+
+   ```bash
+   grep Seccomp: /proc/$(pgrep -f -- '--service-sandbox-type=xr_compositing')/status
+   ```
 
 3. Start the OpenXR runtime (see [Build and run Monado](#1-build-and-run-monado)).
    Then start Chromium with OpenXR enabled:
