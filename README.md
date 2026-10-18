@@ -98,11 +98,11 @@ under `device/vr/`:
 
 ```mermaid
 flowchart TB
-    Blink["Blink — navigator.xr<br/><i>third_party/blink/renderer/modules/xr</i>"]
-    Browser["Browser — XRRuntimeManagerImpl<br/><i>content/browser/xr</i>"]
-    Utility["XR device service<br/><i>content/services/isolated_xr_device</i>"]
-    Backend["OpenXR backend<br/><i>device/vr/openxr</i>"]
-    Native["OpenXR runtime<br/><i>Monado, SteamVR, …</i>"]
+    Blink["Blink: navigator.xr<br/>third_party/blink/renderer/modules/xr"]
+    Browser["Browser: XRRuntimeManagerImpl<br/>content/browser/xr"]
+    Utility["XR device service<br/>content/services/isolated_xr_device"]
+    Backend["OpenXR backend<br/>device/vr/openxr"]
+    Native["OpenXR runtime<br/>Monado, SteamVR, ..."]
 
     Blink -->|blink.mojom.VRService| Browser
     Browser -->|device.mojom.XRRuntime| Utility
@@ -140,16 +140,16 @@ The Linux-specific code is in `device/vr/openxr/linux/`:
 ```mermaid
 flowchart LR
     subgraph Chromium
-      R["Renderer<br/>Blink · WebXR · WebGL"]
+      R["Renderer<br/>Blink, WebXR, WebGL"]
       B["Browser<br/>XRRuntimeManagerImpl<br/>VR overlay UI (0006)"]
       G["GPU process<br/>SharedImages"]
-      U["XR device service<br/>(sandboxed utility)<br/>OpenXR · Vulkan"]
+      U["XR device service<br/>(sandboxed utility)<br/>OpenXR, Vulkan"]
     end
     M["OpenXR runtime<br/>monado-service"]
 
     R <-->|VRService| B
-    B <-->|XRRuntime · ImmersiveOverlay| U
-    R <-->|"XRFrameDataProvider · XRPresentationProvider<br/>XRLayerManager (direct pipes)"| U
+    B <-->|XRRuntime, ImmersiveOverlay| U
+    R <-->|"XRFrameDataProvider, XRPresentationProvider<br/>XRLayerManager (direct pipes)"| U
     R -->|WebGL draws| G
     B -->|overlay draws| G
     U <-->|"SharedImages (DMA-BUF)"| G
@@ -185,7 +185,7 @@ sequenceDiagram
     P->>P: WebGL draws into the SharedImages
     P->>L: SubmitFrameDrawnIntoTexture (sync token)
     L->>L: wait for the page's GPU writes
-    L->>L: Vulkan copy: SharedImage → swapchain image (+ overlay)
+    L->>L: Vulkan copy: SharedImage to swapchain image (+ overlay)
     L->>X: xrReleaseSwapchainImage, xrEndFrame (layers)
 ```
 
