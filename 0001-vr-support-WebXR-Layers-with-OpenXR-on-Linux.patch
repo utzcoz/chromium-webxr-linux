@@ -1,0 +1,489 @@
+From cd181ec604f0c26e61f19942e330ae5b85dcfda5 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sat, 26 Sep 2026 16:48:05 +0800
+Subject: [PATCH 1/7] vr: support WebXR Layers with OpenXR on Linux
+
+The Vulkan graphics binding kept one set of intermediate images for the
+whole session, so it could only drive a single projection layer. Keep
+them per layer instead, in the layer's graphics binding data, and let
+the binding report layer support.
+
+WebGL content is bottom-up and Vulkan swapchains are top-down. The
+runtime flips projection layers, as it did for the base layer, and the
+other layer types too if it supports
+XR_FB_composition_layer_image_layout. Otherwise the binding flips those
+while copying them into the swapchain. It does not support cube layers,
+whose six faces its single intermediate image cannot hold.
+
+WebXR Layers also requires the runtime to support cylinder, equirect2
+and cube layers all at once. Few Linux runtimes do: SteamVR supports
+none of them and Monado has no cube layers. So on Linux, offer the
+feature whenever the binding supports layers, since projection and quad
+layers are core OpenXR, and refuse to create a layer only when its type
+is not supported. Blink then keeps that layer inactive. The other
+platforms are unchanged.
+
+Bug: 506004811
+Change-Id: I02db6550ecd1126bcef4bf4130c3195d1c6c1656
+---
+ .../linux/openxr_graphics_binding_vulkan.cc   | 129 +++++++++++++-----
+ .../linux/openxr_graphics_binding_vulkan.h    |  12 +-
+ ...openxr_graphics_binding_vulkan_unittest.cc |   4 +-
+ .../vr/openxr/linux/openxr_vulkan_context.cc  |  20 ++-
+ .../vr/openxr/linux/openxr_vulkan_context.h   |   4 +-
+ device/vr/openxr/openxr_composition_layer.h   |   1 +
+ device/vr/openxr/openxr_extension_helper.cc   |   6 +
+ device/vr/openxr/openxr_graphics_binding.cc   |   7 +
+ device/vr/openxr/openxr_graphics_binding.h    |   5 +
+ 9 files changed, 143 insertions(+), 45 deletions(-)
+
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+index 455060a8721c4..5cade10c2bad5 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+@@ -12,6 +12,7 @@
+ #include "base/containers/span.h"
+ #include "base/files/scoped_file.h"
+ #include "base/logging.h"
++#include "base/memory/raw_ptr.h"
+ #include "components/viz/common/resources/shared_image_format.h"
+ #include "device/vr/openxr/openxr_composition_layer.h"
+ #include "device/vr/openxr/openxr_extension_helper.h"
+@@ -41,6 +42,35 @@ constexpr VkFormat kSupportedFormats[] = {
+     VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB,
+     VK_FORMAT_R8G8B8A8_UNORM};
+ 
++// The intermediate images of one layer, one per swapchain image, which the
++// page renders into and RenderLayer() copies to the swapchain.
++struct VulkanLayerData : public OpenXrCompositionLayer::GraphicsBindingData {
++  explicit VulkanLayerData(OpenXrVulkanContext* vulkan) : vulkan(vulkan) {
++    type = kVulkan;
++  }
++  ~VulkanLayerData() override { DestroyIntermediateImages(); }
++
++  void DestroyIntermediateImages() {
++    if (vulkan && vulkan->valid()) {
++      for (auto& image : intermediate_images) {
++        vulkan->DestroyIntermediateImage(image);
++      }
++    }
++    intermediate_images.clear();
++  }
++
++  raw_ptr<OpenXrVulkanContext> vulkan;
++  std::vector<OpenXrVulkanContext::IntermediateImage> intermediate_images;
++};
++
++VulkanLayerData& GetVulkanLayerData(OpenXrCompositionLayer& layer) {
++  auto* data = static_cast<VulkanLayerData*>(layer.graphics_binding_data());
++  // Layers are always created by OpenXrGraphicsBindingVulkan.
++  CHECK(data);
++  CHECK_EQ(data->type, OpenXrCompositionLayer::GraphicsBindingData::kVulkan);
++  return *data;
++}
++
+ }  // namespace
+ 
+ // static
+@@ -51,12 +81,35 @@ void OpenXrGraphicsBinding::GetRequiredExtensions(
+ 
+ OpenXrGraphicsBindingVulkan::OpenXrGraphicsBindingVulkan(
+     const OpenXrExtensionEnumeration* extension_enum)
+-    : OpenXrGraphicsBinding(extension_enum) {}
++    : OpenXrGraphicsBinding(extension_enum) {
++  // The intermediate images are single 2D images, so a cube layer's six faces
++  // cannot be filled. The other types beyond projection and quad need their
++  // extension.
++  unsupported_layer_types_.insert(OpenXrCompositionLayer::Type::kCube);
++  if (!extension_enum->ExtensionSupported(
++          XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME)) {
++    unsupported_layer_types_.insert(OpenXrCompositionLayer::Type::kCylinder);
++  }
++  if (!extension_enum->ExtensionSupported(
++          XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME)) {
++    unsupported_layer_types_.insert(OpenXrCompositionLayer::Type::kEquirect);
++  }
++}
+ 
+ OpenXrGraphicsBindingVulkan::~OpenXrGraphicsBindingVulkan() {
+-  // Free the intermediate images (which reference the VkDevice) before the
+-  // OpenXrVulkanContext that owns that device is destroyed with vulkan_.
+-  DestroyIntermediateImages();
++  // The layers outlive vulkan_, so free their intermediate images (which
++  // reference the VkDevice) and drop their pointer to it now.
++  auto release = [](OpenXrCompositionLayer& layer) {
++    VulkanLayerData& data = GetVulkanLayerData(layer);
++    data.DestroyIntermediateImages();
++    data.vulkan = nullptr;
++  };
++  if (base_layer_) {
++    release(*base_layer_);
++  }
++  for (auto& [_, layer] : layers_) {
++    release(*layer);
++  }
+ }
+ 
+ bool OpenXrGraphicsBindingVulkan::Initialize(XrInstance instance,
+@@ -133,15 +186,6 @@ XrResult OpenXrGraphicsBindingVulkan::EnumerateSwapchainImages(
+   return XR_SUCCESS;
+ }
+ 
+-void OpenXrGraphicsBindingVulkan::DestroyIntermediateImages() {
+-  if (vulkan_ && vulkan_->valid()) {
+-    for (auto& img : intermediate_images_) {
+-      vulkan_->DestroyIntermediateImage(img);
+-    }
+-  }
+-  intermediate_images_.clear();
+-}
+-
+ scoped_refptr<gpu::ClientSharedImage>
+ OpenXrGraphicsBindingVulkan::ImportGbmImageAsSharedImage(
+     gpu::SharedImageInterface* sii,
+@@ -225,7 +269,10 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+   CHECK_NE(swapchain_format_, VK_FORMAT_UNDEFINED);
+ 
+   // Destroy any previously created intermediate images.
+-  DestroyIntermediateImages();
++  VulkanLayerData& layer_data = GetVulkanLayerData(layer);
++  layer_data.DestroyIntermediateImages();
++  std::vector<OpenXrVulkanContext::IntermediateImage>& intermediate_images =
++      layer_data.intermediate_images;
+ 
+   // Match the SharedImage channel order to the negotiated swapchain format so
+   // colors are not swizzled. Both SRGB and UNORM BGRA map to kBGRA_8888.
+@@ -245,7 +292,7 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+ 
+   auto swapchain_images = layer.GetSwapchainImages();
+-  intermediate_images_.resize(swapchain_images.size());
++  intermediate_images.resize(swapchain_images.size());
+ 
+   // Preferred path: let the GPU process allocate via Ozone/GBM, which applies
+   // the driver's modifier validation. SCANOUT usage forces a renderable
+@@ -255,13 +302,13 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+     scoped_refptr<gpu::ClientSharedImage> client_si =
+         ImportGbmImageAsSharedImage(sii, si_info, size, swapchain_format_,
+                                     kIntermediateUsage,
+-                                    &intermediate_images_[i]);
++                                    &intermediate_images[i]);
+     if (!client_si) {
+       // All slots must share one allocation path; restart with LINEAR.
+       DVLOG(1) << __func__ << ": slot " << i
+                << " GBM path unusable; falling back to LINEAR export";
+-      DestroyIntermediateImages();
+-      intermediate_images_.resize(swapchain_images.size());
++      layer_data.DestroyIntermediateImages();
++      intermediate_images.resize(swapchain_images.size());
+       for (size_t j = 0; j < i; ++j) {
+         swapchain_images[j].shared_image.reset();
+         swapchain_images[j].sync_token = gpu::SyncToken();
+@@ -283,16 +330,16 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+   for (size_t i = 0; i < swapchain_images.size(); ++i) {
+     if (!vulkan_->CreateExportableImage(size, swapchain_format_,
+                                         kIntermediateUsage,
+-                                        &intermediate_images_[i])) {
++                                        &intermediate_images[i])) {
+       DLOG(ERROR) << "Failed to create intermediate image " << i;
+-      DestroyIntermediateImages();
++      layer_data.DestroyIntermediateImages();
+       return;
+     }
+     swapchain_images[i].shared_image =
+-        ExportLinearImageAsSharedImage(sii, si_info, intermediate_images_[i]);
++        ExportLinearImageAsSharedImage(sii, si_info, intermediate_images[i]);
+     if (!swapchain_images[i].shared_image) {
+       DLOG(ERROR) << "LINEAR export failed for slot " << i;
+-      DestroyIntermediateImages();
++      layer_data.DestroyIntermediateImages();
+       return;
+     }
+     swapchain_images[i].sync_token = sii->GenVerifiedSyncToken();
+@@ -312,22 +359,26 @@ bool OpenXrGraphicsBindingVulkan::WaitOnFence(OpenXrCompositionLayer& layer,
+ 
+ bool OpenXrGraphicsBindingVulkan::WaitOnImplicitFence(
+     OpenXrCompositionLayer& layer) {
++  std::vector<OpenXrVulkanContext::IntermediateImage>& intermediate_images =
++      GetVulkanLayerData(layer).intermediate_images;
+   OpenXrSwapchainInfo* active_info = layer.GetActiveSwapchainImage();
+   if (!active_info) {
+     return false;
+   }
+   const size_t active_index =
+       static_cast<size_t>(active_info - layer.GetSwapchainImages().data());
+-  if (active_index >= intermediate_images_.size()) {
++  if (active_index >= intermediate_images.size()) {
+     return false;
+   }
+-  return vulkan_->WaitOnWriteFence(intermediate_images_[active_index]);
++  return vulkan_->WaitOnWriteFence(intermediate_images[active_index]);
+ }
+ 
+ bool OpenXrGraphicsBindingVulkan::RenderLayer(
+     OpenXrCompositionLayer& layer,
+     const scoped_refptr<viz::ContextProvider>& context_provider) {
+-  if (!vulkan_->has_external_memory_fd() || intermediate_images_.empty()) {
++  std::vector<OpenXrVulkanContext::IntermediateImage>& intermediate_images =
++      GetVulkanLayerData(layer).intermediate_images;
++  if (!vulkan_->has_external_memory_fd() || intermediate_images.empty()) {
+     return true;  // No intermediate images — nothing to blit.
+   }
+ 
+@@ -341,18 +392,26 @@ bool OpenXrGraphicsBindingVulkan::RenderLayer(
+   base::span<OpenXrSwapchainInfo> swapchain_images = layer.GetSwapchainImages();
+   size_t active_index =
+       static_cast<size_t>(active_info - swapchain_images.data());
+-  if (active_index >= intermediate_images_.size()) {
++  if (active_index >= intermediate_images.size()) {
+     return false;
+   }
+ 
+   OpenXrVulkanContext::IntermediateImage& src =
+-      intermediate_images_[active_index];
++      intermediate_images[active_index];
+   VkImage dst = active_info->vk_image;
+   if (src.image == VK_NULL_HANDLE || dst == VK_NULL_HANDLE) {
+     return false;
+   }
+ 
+-  return vulkan_->CopyToSwapchainImage(src, dst, layer.GetSwapchainImageSize());
++  // The runtime flips projection layers, and the other types too if it has
++  // XR_FB_composition_layer_image_layout (GetFlipLayerLayout()). Otherwise
++  // the copy flips them.
++  const bool flip_y =
++      ShouldFlipSubmittedImage(layer) &&
++      layer.type() != OpenXrCompositionLayer::Type::kProjection &&
++      !GetFlipLayerLayout(layer);
++  return vulkan_->CopyToSwapchainImage(src, dst, layer.GetSwapchainImageSize(),
++                                       flip_y);
+ }
+ 
+ void OpenXrGraphicsBindingVulkan::CleanupWithoutSubmit() {
+@@ -385,7 +444,12 @@ void OpenXrGraphicsBindingVulkan::OnSwapchainImageReady(
+ }
+ 
+ bool OpenXrGraphicsBindingVulkan::SupportsLayers() const {
+-  return false;
++  return true;
++}
++
++bool OpenXrGraphicsBindingVulkan::SupportsLayerType(
++    OpenXrCompositionLayer::Type type) const {
++  return !unsupported_layer_types_.contains(type);
+ }
+ 
+ void OpenXrGraphicsBindingVulkan::ResizeSharedBuffer(
+@@ -393,7 +457,6 @@ void OpenXrGraphicsBindingVulkan::ResizeSharedBuffer(
+     OpenXrSwapchainInfo& swap_chain_info,
+     gpu::SharedImageInterface* sii) {
+   // Re-create all shared images for the layer at the new size.
+-  DestroyIntermediateImages();
+   CreateSharedImages(layer, sii);
+ }
+ 
+@@ -401,13 +464,13 @@ bool OpenXrGraphicsBindingVulkan::ShouldFlipSubmittedImage(
+     OpenXrCompositionLayer& layer) const {
+   // GL has bottom-left origin; Vulkan/OpenXR has top-left origin.
+   // The submitted image needs to be flipped vertically.
+-  return true;
++  // Content that is already flipped (flip_y) is submitted as it is.
++  return !layer.flip_y();
+ }
+ 
+ std::unique_ptr<OpenXrCompositionLayer::GraphicsBindingData>
+ OpenXrGraphicsBindingVulkan::CreateLayerGraphicsBindingData() const {
+-  // No per-layer Vulkan state needed for the single-layer MVP.
+-  return nullptr;
++  return std::make_unique<VulkanLayerData>(vulkan_.get());
+ }
+ 
+ }  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+index 9f58d3e15eb6e..8b508071443bc 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <vector>
+ 
++#include "base/containers/flat_set.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "device/vr/openxr/linux/openxr_vulkan_context.h"
+ #include "device/vr/openxr/openxr_graphics_binding.h"
+@@ -54,6 +55,7 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+   void OnSwapchainImageReady(OpenXrCompositionLayer& layer,
+                              gpu::SharedImageInterface* sii) override;
+   bool SupportsLayers() const override;
++  bool SupportsLayerType(OpenXrCompositionLayer::Type type) const override;
+   void ResizeSharedBuffer(OpenXrCompositionLayer& layer,
+                           OpenXrSwapchainInfo& swap_chain_info,
+                           gpu::SharedImageInterface* sii) override;
+@@ -92,19 +94,17 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+       const gpu::SharedImageInfo& si_info,
+       const OpenXrVulkanContext::IntermediateImage& image);
+ 
+-  // Destroys all intermediate images and frees their Vulkan memory.
+-  void DestroyIntermediateImages();
+-
+   // Owns the Vulkan instance/device/queue plus the image create/import/copy
+   // logic; created in Initialize(). All raw Vulkan calls happen inside it.
+   std::unique_ptr<OpenXrVulkanContext> vulkan_;
+ 
+-  // Intermediate images owned by Chromium for SharedImage export.
+-  std::vector<OpenXrVulkanContext::IntermediateImage> intermediate_images_;
+-
+   // The format negotiated by GetSwapchainFormat(), cached so that
+   // CreateSharedImages() creates matching intermediate images.
+   mutable VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
++
++  // Layer types this binding cannot create, e.g. as the runtime lacks their
++  // extension.
++  base::flat_set<OpenXrCompositionLayer::Type> unsupported_layer_types_;
+ };
+ 
+ }  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+index 05197f76096a6..94c37ea65d959 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+@@ -189,10 +189,10 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, GetSwapchainFormatBeforeSession) {
+   EXPECT_EQ(format, 0);
+ }
+ 
+-TEST_F(OpenXrGraphicsBindingVulkanTest, SupportsLayersReturnsFalse) {
++TEST_F(OpenXrGraphicsBindingVulkanTest, SupportsLayers) {
+   ASSERT_TRUE(CreateXrInstanceAndSystem());
+   ASSERT_TRUE(InitializeBinding());
+-  EXPECT_FALSE(binding_->SupportsLayers());
++  EXPECT_TRUE(binding_->SupportsLayers());
+ }
+ 
+ TEST_F(OpenXrGraphicsBindingVulkanTest, GetMaxTextureSize) {
+diff --git a/device/vr/openxr/linux/openxr_vulkan_context.cc b/device/vr/openxr/linux/openxr_vulkan_context.cc
+index fc321c5b5cbb6..bb6e4ab9a743e 100644
+--- a/device/vr/openxr/linux/openxr_vulkan_context.cc
++++ b/device/vr/openxr/linux/openxr_vulkan_context.cc
+@@ -723,7 +723,8 @@ bool OpenXrVulkanContext::WaitOnSyncFd(int fence_fd) {
+ 
+ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
+                                                VkImage dst,
+-                                               const gfx::Size& size) {
++                                               const gfx::Size& size,
++                                               bool flip_y) {
+   VkImage src = src_image.image;
+   vkResetCommandBuffer(vk_command_buffer_, 0);
+ 
+@@ -766,13 +767,26 @@ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
+                        nullptr, 2, pre_copy_barriers);
+ 
+   // Copy the intermediate image to the swapchain image.
++  // vkCmdCopyImage cannot mirror, so a flipped copy moves one row per region.
+   VkImageCopy region{};
+   region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+   region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+   region.extent = {static_cast<uint32_t>(size.width()),
+-                   static_cast<uint32_t>(size.height()), 1};
++                   static_cast<uint32_t>(flip_y ? 1 : size.height()), 1};
++  std::vector<VkImageCopy> regions;
++  if (flip_y) {
++    regions.reserve(size.height());
++    for (int row = 0; row < size.height(); ++row) {
++      region.srcOffset.y = row;
++      region.dstOffset.y = size.height() - 1 - row;
++      regions.push_back(region);
++    }
++  } else {
++    regions.push_back(region);
++  }
+   vkCmdCopyImage(vk_command_buffer_, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                 dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++                 dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions.size(),
++                 regions.data());
+ 
+   {
+     // Transition dst back: TRANSFER_DST_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL.
+diff --git a/device/vr/openxr/linux/openxr_vulkan_context.h b/device/vr/openxr/linux/openxr_vulkan_context.h
+index 70180bdd35376..f07e64eb200e8 100644
+--- a/device/vr/openxr/linux/openxr_vulkan_context.h
++++ b/device/vr/openxr/linux/openxr_vulkan_context.h
+@@ -100,9 +100,11 @@ class DEVICE_VR_EXPORT OpenXrVulkanContext {
+   // Records and submits the src -> dst blit and waits for it. dst must be an
+   // OpenXR swapchain image: it is left in COLOR_ATTACHMENT_OPTIMAL as
+   // xrReleaseSwapchainImage expects; src returns to GENERAL for the next frame.
++  // With `flip_y`, the rows are copied in reverse order.
+   bool CopyToSwapchainImage(IntermediateImage& src,
+                             VkImage dst,
+-                            const gfx::Size& size);
++                            const gfx::Size& size,
++                            bool flip_y);
+ 
+  private:
+   // Cleans up the command pool and command buffer.
+diff --git a/device/vr/openxr/openxr_composition_layer.h b/device/vr/openxr/openxr_composition_layer.h
+index e340d1fb64f37..471b41d14b91f 100644
+--- a/device/vr/openxr/openxr_composition_layer.h
++++ b/device/vr/openxr/openxr_composition_layer.h
+@@ -38,6 +38,7 @@ class OpenXrCompositionLayer {
+       kInvalid,
+       kOpenGLES,
+       kD3D,
++      kVulkan,
+     };
+ 
+     virtual ~GraphicsBindingData() = default;
+diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
+index acf46589b6df7..d495fc8d07d64 100644
+--- a/device/vr/openxr/openxr_extension_helper.cc
++++ b/device/vr/openxr/openxr_extension_helper.cc
+@@ -227,10 +227,16 @@ bool OpenXrExtensionHelper::IsFeatureSupported(
+       return IsExtensionSupported(
+           XR_MSFT_SECONDARY_VIEW_CONFIGURATION_EXTENSION_NAME);
+     case device::mojom::XRSessionFeature::LAYERS:
++#if BUILDFLAG(IS_LINUX)
++      // Few Linux runtimes support all of these, so the graphics binding
++      // refuses the layer types it cannot create instead.
++      return true;
++#else
+       return std::ranges::all_of(GetRequiredExtensionsForLayers(),
+                                  [this](const char* extension) {
+                                    return IsExtensionSupported(extension);
+                                  });
++#endif
+     default:
+       // By default we assume a feature doesn't need to be supported by an
+       // extension unless customized above.
+diff --git a/device/vr/openxr/openxr_graphics_binding.cc b/device/vr/openxr/openxr_graphics_binding.cc
+index 3026e94dd6f1e..4dd2d5ceb96bc 100644
+--- a/device/vr/openxr/openxr_graphics_binding.cc
++++ b/device/vr/openxr/openxr_graphics_binding.cc
+@@ -561,6 +561,13 @@ bool OpenXrGraphicsBinding::CreateCompositionLayer(
+   if (!SupportsLayers()) {
+     return false;
+   }
++#if BUILDFLAG(IS_LINUX)
++  // The page's layer of an unsupported type never becomes active.
++  if (!SupportsLayerType(OpenXrCompositionLayer::GetTypeFromMojomData(
++          *layer_data->mutable_data->layer_data))) {
++    return false;
++  }
++#endif
+ 
+   auto layer_id = layer_data->read_only_data->layer_id;
+   CHECK(!layers_.contains(layer_id));
+diff --git a/device/vr/openxr/openxr_graphics_binding.h b/device/vr/openxr/openxr_graphics_binding.h
+index d1b3762c370f8..546b52c21a5e2 100644
+--- a/device/vr/openxr/openxr_graphics_binding.h
++++ b/device/vr/openxr/openxr_graphics_binding.h
+@@ -142,6 +142,11 @@ class OpenXrGraphicsBinding {
+   // Return if the graphics binding supports multiple XR layers.
+   virtual bool SupportsLayers() const = 0;
+ 
++#if BUILDFLAG(IS_LINUX)
++  // Return if the graphics binding can create layers of the given type.
++  virtual bool SupportsLayerType(OpenXrCompositionLayer::Type type) const = 0;
++#endif
++
+   // Resizes the shared buffer for the given swapchain info if the transfer size
+   // has changed.
+   virtual void ResizeSharedBuffer(OpenXrCompositionLayer& layer,

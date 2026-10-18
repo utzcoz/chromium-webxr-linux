@@ -1,0 +1,686 @@
+From 1a95125ff0ebe788993f98f8d9fff29b9edf49fc Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 27 Sep 2026 21:05:28 +0800
+Subject: [PATCH 4/7] webxr: add XRSession.trackedSources and
+ XRInputSource.skipRendering
+
+Implement both behind WebXRSpecParity.
+
+trackedSources lists the input sources without a primary action, which
+devices already mark as auxiliary. They are only reported to sessions
+that request the new "tracked-sources" feature, and fire
+trackedsourceschange instead of inputsourceschange. A source that gains
+or loses its primary action moves between the two lists as a new
+XRInputSource. OpenXR sessions support the feature. ARCore does not
+yet, so with the flag on its auxiliary sources leave inputSources.
+
+skipRendering is true when the display is see-through, where the user
+already sees their real controllers and hands.
+
+Bug: 506004811
+Change-Id: I095380b06df462f85d468ec397fdb8b8861e426a
+---
+ .../xr/metrics/webxr_session_tracker.cc       |  2 +
+ device/vr/openxr/openxr_api_wrapper.cc        |  6 +-
+ device/vr/openxr/openxr_device.cc             |  3 +-
+ device/vr/openxr/openxr_util.cc               |  1 +
+ device/vr/public/mojom/xr_session.mojom       |  1 +
+ .../core/events/event_type_names.json5        |  1 +
+ .../renderer/modules/xr/xr_input_source.cc    |  8 ++
+ .../renderer/modules/xr/xr_input_source.h     |  1 +
+ .../renderer/modules/xr/xr_input_source.idl   |  1 +
+ .../blink/renderer/modules/xr/xr_session.cc   | 97 ++++++++++++++++---
+ .../blink/renderer/modules/xr/xr_session.h    |  7 ++
+ .../blink/renderer/modules/xr/xr_session.idl  |  1 +
+ .../blink/renderer/modules/xr/xr_system.cc    |  2 +
+ .../blink/renderer/modules/xr/xr_utils.cc     |  6 ++
+ .../wpt/resources/chromium/webxr-test.js      |  1 +
+ .../idlharness.https.window-expected.txt      |  8 +-
+ .../global-interface-listing-expected.txt     |  2 +
+ .../resources/xr-internal-device-mocking.js   | 12 +++
+ .../xrInputSource_skipRendering.https.html    | 35 +++++++
+ .../webxr/xrSession_trackedSources.https.html | 97 +++++++++++++++++++
+ 20 files changed, 268 insertions(+), 24 deletions(-)
+ create mode 100644 third_party/blink/web_tests/wpt_internal/webxr/xrInputSource_skipRendering.https.html
+ create mode 100644 third_party/blink/web_tests/wpt_internal/webxr/xrSession_trackedSources.https.html
+
+diff --git a/content/browser/xr/metrics/webxr_session_tracker.cc b/content/browser/xr/metrics/webxr_session_tracker.cc
+index 24ab23c48c5b8..c9d88cb034ec7 100644
+--- a/content/browser/xr/metrics/webxr_session_tracker.cc
++++ b/content/browser/xr/metrics/webxr_session_tracker.cc
+@@ -88,6 +88,7 @@ void WebXRSessionTracker::ReportFeatureUsed(
+     case XRSessionFeature::LAYERS:
+     case XRSessionFeature::FRONT_FACING:
+     case XRSessionFeature::WEBGPU:
++    case XRSessionFeature::TRACKED_SOURCES:
+       // Not recording metrics for these features currently.
+       break;
+   }
+@@ -133,6 +134,7 @@ void WebXRSessionTracker::SetFeatureRequest(
+     case XRSessionFeature::LAYERS:
+     case XRSessionFeature::FRONT_FACING:
+     case XRSessionFeature::WEBGPU:
++    case XRSessionFeature::TRACKED_SOURCES:
+       // Not recording metrics for these features currently.
+       break;
+   }
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index a92cbc4cb245c..f4e32bc822955 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -612,8 +612,10 @@ XrResult OpenXrApiWrapper::EnableSupportedFeatures(
+ 
+       case mojom::XRSessionFeature::SECONDARY_VIEWS:
+       case mojom::XRSessionFeature::WEBGPU:
+-        // SECONDARY_VIEWS and WEBGPU support can't be checked beyond just the
+-        // mode/extension check. If we passed that, then it's enabled.
++      case mojom::XRSessionFeature::TRACKED_SOURCES:
++        // SECONDARY_VIEWS, WEBGPU and TRACKED_SOURCES support can't be checked
++        // beyond just the mode/extension check. If we passed that, then it's
++        // enabled.
+         is_enabled = true;
+         break;
+ 
+diff --git a/device/vr/openxr/openxr_device.cc b/device/vr/openxr/openxr_device.cc
+index dbea0352ce92f..42fb2070e6124 100644
+--- a/device/vr/openxr/openxr_device.cc
++++ b/device/vr/openxr/openxr_device.cc
+@@ -35,7 +35,8 @@ const std::vector<mojom::XRSessionFeature>& GetSupportedFeatures() {
+                           mojom::XRSessionFeature::SECONDARY_VIEWS,
+                           mojom::XRSessionFeature::HIT_TEST,
+                           mojom::XRSessionFeature::LIGHT_ESTIMATION,
+-                          mojom::XRSessionFeature::DEPTH}};
++                          mojom::XRSessionFeature::DEPTH,
++                          mojom::XRSessionFeature::TRACKED_SOURCES}};
+ 
+   return *kSupportedFeatures;
+ }
+diff --git a/device/vr/openxr/openxr_util.cc b/device/vr/openxr/openxr_util.cc
+index 81b32cbafc2b2..6520545f12d9c 100644
+--- a/device/vr/openxr/openxr_util.cc
++++ b/device/vr/openxr/openxr_util.cc
+@@ -120,6 +120,7 @@ bool IsArOnlyFeature(device::mojom::XRSessionFeature feature) {
+     case device::mojom::XRSessionFeature::HAND_INPUT:
+     case device::mojom::XRSessionFeature::SECONDARY_VIEWS:
+     case device::mojom::XRSessionFeature::WEBGPU:
++    case device::mojom::XRSessionFeature::TRACKED_SOURCES:
+       return false;
+     case device::mojom::XRSessionFeature::DOM_OVERLAY:
+     case device::mojom::XRSessionFeature::HIT_TEST:
+diff --git a/device/vr/public/mojom/xr_session.mojom b/device/vr/public/mojom/xr_session.mojom
+index 2b9377469b8dc..5d2e29f2db193 100644
+--- a/device/vr/public/mojom/xr_session.mojom
++++ b/device/vr/public/mojom/xr_session.mojom
+@@ -64,6 +64,7 @@ enum XRSessionFeature {
+   FRONT_FACING = 17,
+   WEBGPU = 18,
+   MESH_DETECTION = 19,
++  TRACKED_SOURCES = 20,
+ };
+ 
+ // These values are persisted to logs. Entries should not be renumbered and
+diff --git a/third_party/blink/renderer/core/events/event_type_names.json5 b/third_party/blink/renderer/core/events/event_type_names.json5
+index 33896619fb2ef..dba100aea8685 100644
+--- a/third_party/blink/renderer/core/events/event_type_names.json5
++++ b/third_party/blink/renderer/core/events/event_type_names.json5
+@@ -322,6 +322,7 @@
+     "touchmove",
+     "touchstart",
+     "track",
++    "trackedsourceschange",
+     "transitioncancel",
+     "transitionend",
+     "transitionrun",
+diff --git a/third_party/blink/renderer/modules/xr/xr_input_source.cc b/third_party/blink/renderer/modules/xr/xr_input_source.cc
+index e5c3695318f35..4cf23219261f3 100644
+--- a/third_party/blink/renderer/modules/xr/xr_input_source.cc
++++ b/third_party/blink/renderer/modules/xr/xr_input_source.cc
+@@ -7,6 +7,7 @@
+ #include "base/time/time.h"
+ #include "third_party/blink/public/mojom/frame/user_activation_notification_type.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/frozen_array.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_xr_environment_blend_mode.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_handedness.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_target_ray_mode.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+@@ -158,6 +159,13 @@ V8XRHandedness XRInputSource::handedness() const {
+   NOTREACHED();
+ }
+ 
++bool XRInputSource::skipRendering() const {
++  // On a see-through display the user already sees their real controllers and
++  // hands, so the page need not draw them.
++  return session_->environmentBlendMode().AsEnum() !=
++         V8XREnvironmentBlendMode::Enum::kOpaque;
++}
++
+ V8XRTargetRayMode XRInputSource::targetRayMode() const {
+   switch (state_.target_ray_mode) {
+     case device::mojom::XRTargetRayMode::GAZING:
+diff --git a/third_party/blink/renderer/modules/xr/xr_input_source.h b/third_party/blink/renderer/modules/xr/xr_input_source.h
+index a8c9a3c475444..3f665e87d2f2e 100644
+--- a/third_party/blink/renderer/modules/xr/xr_input_source.h
++++ b/third_party/blink/renderer/modules/xr/xr_input_source.h
+@@ -70,6 +70,7 @@ class XRInputSource : public ScriptWrappable, public Gamepad::Client {
+   Gamepad* gamepad() const { return gamepad_.Get(); }
+   XRHand* hand() const { return hand_.Get(); }
+   const FrozenArray<IDLString>& profiles() const { return *profiles_.Get(); }
++  bool skipRendering() const;
+ 
+   uint32_t source_id() const { return state_.source_id; }
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_input_source.idl b/third_party/blink/renderer/modules/xr/xr_input_source.idl
+index 9cc5d6882bf37..cb3901440a798 100644
+--- a/third_party/blink/renderer/modules/xr/xr_input_source.idl
++++ b/third_party/blink/renderer/modules/xr/xr_input_source.idl
+@@ -26,4 +26,5 @@ enum XRTargetRayMode {
+   [SameObject, Measure] readonly attribute Gamepad? gamepad;
+   [SameObject] readonly attribute XRHand? hand;
+   [SameObject] readonly attribute FrozenArray<DOMString> profiles;
++  [RuntimeEnabled=WebXRSpecParity] readonly attribute boolean skipRendering;
+ };
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 3f15ab13ef15d..28ee6e6a4a7ea 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -360,6 +360,7 @@ void XRSession::MetricsReporter::ReportFeatureUsed(
+     case XRSessionFeature::LAYERS:
+     case XRSessionFeature::FRONT_FACING:
+     case XRSessionFeature::WEBGPU:
++    case XRSessionFeature::TRACKED_SOURCES:
+       // Not recording metrics for these features currently.
+       break;
+   }
+@@ -392,6 +393,7 @@ XRSession::XRSession(
+           MakeGarbageCollected<XRPlaneManager>(base::PassKey<XRSession>{},
+                                                this)),
+       input_sources_(MakeGarbageCollected<XRInputSourceArray>()),
++      tracked_sources_(MakeGarbageCollected<XRInputSourceArray>()),
+       empty_input_sources_(MakeGarbageCollected<XRInputSourceArray>()),
+       client_receiver_(this, xr->GetExecutionContext()),
+       callback_collection_(
+@@ -1090,6 +1092,13 @@ XRInputSourceArray* XRSession::inputSources(ScriptState* script_state) const {
+   return input_sources_.Get();
+ }
+ 
++XRInputSourceArray* XRSession::trackedSources() const {
++  if (!CanReportInputPoses()) {
++    return empty_input_sources_.Get();
++  }
++  return tracked_sources_.Get();
++}
++
+ ScriptPromise<XRHitTestSource> XRSession::requestHitTestSource(
+     ScriptState* script_state,
+     XRHitTestOptionsInit* options_init,
+@@ -1659,8 +1668,13 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
+     auto* input_source = (*input_sources_)[i];
+     input_source->OnRemoved();
+   }
++  for (unsigned i = 0; i < tracked_sources_->length(); i++) {
++    auto* input_source = (*tracked_sources_)[i];
++    input_source->OnRemoved();
++  }
+ 
+   input_sources_ = empty_input_sources_;
++  tracked_sources_ = empty_input_sources_;
+ 
+   if (canvas_input_provider_) {
+     canvas_input_provider_->Stop();
+@@ -2579,8 +2593,18 @@ void XRSession::OnInputStateChangeInternal(
+         input_states) {
+   HeapVector<Member<XRInputSource>> added;
+   HeapVector<Member<XRInputSource>> removed;
++  HeapVector<Member<XRInputSource>> added_tracked;
++  HeapVector<Member<XRInputSource>> removed_tracked;
+   last_frame_id_ = frame_id;
+ 
++  // Auxiliary input sources have no primary action, which makes them tracked
++  // sources: https://immersive-web.github.io/webxr/#tracked-input-source.
++  // Pages only see them if they asked for "tracked-sources".
++  const bool separate_tracked_sources =
++      RuntimeEnabledFeatures::WebXRSpecParityEnabled(GetExecutionContext());
++  const bool report_tracked_sources =
++      IsFeatureEnabled(device::mojom::XRSessionFeature::TRACKED_SOURCES);
++
+   DVLOG(2) << __func__ << ": frame_id=" << frame_id
+            << " input_states.size()=" << input_states.size();
+   // Build up our added array, and update the frame id of any active input
+@@ -2592,11 +2616,42 @@ void XRSession::OnInputStateChangeInternal(
+              << input_state->primary_input_pressed
+              << " clicked=" << input_state->primary_input_clicked;
+ 
++    const bool is_tracked_source =
++        separate_tracked_sources && input_state->is_auxiliary;
++    if (is_tracked_source && !report_tracked_sources) {
++      continue;
++    }
++    XRInputSourceArray* sources =
++        is_tracked_source ? tracked_sources_.Get() : input_sources_.Get();
++    XRInputSourceArray* other_sources =
++        is_tracked_source ? input_sources_.Get() : tracked_sources_.Get();
++    auto& added_sources = is_tracked_source ? added_tracked : added;
++    auto& removed_sources = is_tracked_source ? removed_tracked : removed;
++    auto& other_removed_sources = is_tracked_source ? removed : removed_tracked;
++
+     XRInputSource* stored_input_source =
+-        input_sources_->GetWithSourceId(input_state->source_id);
++        sources->GetWithSourceId(input_state->source_id);
+     DVLOG(2) << __func__ << ": stored_input_source=" << stored_input_source;
++
++    // A source that becomes a tracked source, or stops being one, moves to the
++    // other list as a new XRInputSource. Start from the old one, since this
++    // state may not describe the source again.
++    XRInputSource* moved_input_source = nullptr;
++    if (!stored_input_source) {
++      moved_input_source =
++          other_sources->GetWithSourceId(input_state->source_id);
++      if (moved_input_source) {
++        other_sources->RemoveWithSourceId(input_state->source_id);
++        moved_input_source->OnRemoved();
++        other_removed_sources.push_back(moved_input_source);
++      }
++    }
++
+     XRInputSource* input_source = XRInputSource::CreateOrUpdateFrom(
+-        stored_input_source, this, input_state);
++        moved_input_source
++            ? MakeGarbageCollected<XRInputSource>(*moved_input_source)
++            : stored_input_source,
++        this, input_state);
+ 
+     // Input sources should use DOM overlay hit test to check if they intersect
+     // cross-origin content. If that's the case, the input source is set as
+@@ -2615,8 +2670,8 @@ void XRSession::OnInputStateChangeInternal(
+     if (stored_input_source != input_source) {
+       DVLOG(2) << __func__ << ": stored_input_source != input_source";
+       if (!hide_input_source) {
+-        input_sources_->SetWithSourceId(input_state->source_id, input_source);
+-        added.push_back(input_source);
++        sources->SetWithSourceId(input_state->source_id, input_source);
++        added_sources.push_back(input_source);
+         DVLOG(2) << __func__ << ": ADDED input_source "
+                  << input_state->source_id;
+       }
+@@ -2626,13 +2681,32 @@ void XRSession::OnInputStateChangeInternal(
+       if (stored_input_source) {
+         stored_input_source->SetGamepadConnected(false);
+         DVLOG(2) << __func__ << ": REMOVED stored_input_source";
+-        removed.push_back(stored_input_source);
++        removed_sources.push_back(stored_input_source);
+       }
+     }
+ 
+     input_source->setActiveFrameId(frame_id);
+   }
+ 
++  RemoveInactiveInputSources(*input_sources_, frame_id, removed);
++  RemoveInactiveInputSources(*tracked_sources_, frame_id, removed_tracked);
++
++  // If there have been any changes, fire the input sources change event.
++  if (!added.empty() || !removed.empty()) {
++    DispatchEvent(*XRInputSourcesChangeEvent::Create(
++        event_type_names::kInputsourceschange, this, added, removed));
++  }
++  if (!added_tracked.empty() || !removed_tracked.empty()) {
++    DispatchEvent(*XRInputSourcesChangeEvent::Create(
++        event_type_names::kTrackedsourceschange, this, added_tracked,
++        removed_tracked));
++  }
++}
++
++void XRSession::RemoveInactiveInputSources(
++    XRInputSourceArray& sources,
++    int16_t frame_id,
++    HeapVector<Member<XRInputSource>>& removed) {
+   // Remove any input sources that are inactive, and disconnect their gamepad.
+   // Note that this is done in two passes because HeapHashMap makes no
+   // guarantees about iterators on removal.
+@@ -2640,8 +2714,8 @@ void XRSession::OnInputStateChangeInternal(
+   // processing removed, because if we replaced any input sources, they would
+   // also be in removed, and we'd remove our newly added source.
+   Vector<uint32_t> inactive_sources;
+-  for (unsigned i = 0; i < input_sources_->length(); i++) {
+-    auto* input_source = (*input_sources_)[i];
++  for (unsigned i = 0; i < sources.length(); i++) {
++    auto* input_source = sources[i];
+     if (input_source->activeFrameId() != frame_id) {
+       inactive_sources.push_back(input_source->source_id());
+       input_source->OnRemoved();
+@@ -2650,13 +2724,7 @@ void XRSession::OnInputStateChangeInternal(
+   }
+ 
+   for (uint32_t source_id : inactive_sources) {
+-    input_sources_->RemoveWithSourceId(source_id);
+-  }
+-
+-  // If there have been any changes, fire the input sources change event.
+-  if (!added.empty() || !removed.empty()) {
+-    DispatchEvent(*XRInputSourcesChangeEvent::Create(
+-        event_type_names::kInputsourceschange, this, added, removed));
++    sources.RemoveWithSourceId(source_id);
+   }
+ }
+ 
+@@ -2852,6 +2920,7 @@ void XRSession::Trace(Visitor* visitor) const {
+   visitor->Trace(animation_frame_);
+   visitor->Trace(empty_input_sources_);
+   visitor->Trace(input_sources_);
++  visitor->Trace(tracked_sources_);
+   visitor->Trace(resize_observer_);
+   visitor->Trace(canvas_input_provider_);
+   visitor->Trace(overlay_element_);
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 6c9e4fc7a85cd..2a3301ab80627 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -262,6 +262,7 @@ class XRSession final : public EventTarget,
+   void cancelAnimationFrame(uint32_t id);
+ 
+   XRInputSourceArray* inputSources(ScriptState*) const;
++  XRInputSourceArray* trackedSources() const;
+ 
+   ScriptPromise<XRHitTestSource> requestHitTestSource(
+       ScriptState* script_state,
+@@ -474,6 +475,11 @@ class XRSession final : public EventTarget,
+       int16_t frame_id,
+       base::span<const device::mojom::blink::XRInputSourceStatePtr>
+           input_states);
++  // Removes the sources that were not updated in |frame_id| and appends them
++  // to |removed|.
++  void RemoveInactiveInputSources(XRInputSourceArray& sources,
++                                  int16_t frame_id,
++                                  HeapVector<Member<XRInputSource>>& removed);
+   void ProcessInputSourceEvents(
+       base::span<const device::mojom::blink::XRInputSourceStatePtr>
+           input_states);
+@@ -646,6 +652,7 @@ class XRSession final : public EventTarget,
+ 
+   Member<XRFrame> animation_frame_ = nullptr;
+   Member<XRInputSourceArray> input_sources_;
++  Member<XRInputSourceArray> tracked_sources_;
+   Member<XRInputSourceArray> empty_input_sources_;
+   Member<XRFrameTransportDelegate> prev_transport_delegate_ = nullptr;
+   Member<ResizeObserver> resize_observer_;
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.idl b/third_party/blink/renderer/modules/xr/xr_session.idl
+index e74946b7747b4..2533b182d8606 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.idl
++++ b/third_party/blink/renderer/modules/xr/xr_session.idl
+@@ -50,6 +50,7 @@ enum XRReflectionFormat {
+   [RuntimeEnabled=WebXRFrameRate] readonly attribute Float32Array? supportedFrameRates;
+   [SameObject] readonly attribute XRRenderState renderState;
+   [CallWith=ScriptState, MeasureAs=XRSessionGetInputSources, SameObject] readonly attribute XRInputSourceArray inputSources;
++  [RuntimeEnabled=WebXRSpecParity, SameObject] readonly attribute XRInputSourceArray trackedSources;
+   [SameObject] readonly attribute XRDOMOverlayState domOverlayState;
+   readonly attribute XRReflectionFormat preferredReflectionFormat;
+   [RuntimeEnabled=WebXREnabledFeatures] readonly attribute FrozenArray<DOMString> enabledFeatures;
+diff --git a/third_party/blink/renderer/modules/xr/xr_system.cc b/third_party/blink/renderer/modules/xr/xr_system.cc
+index b85aeece08c50..b5b28acc5bd3c 100644
+--- a/third_party/blink/renderer/modules/xr/xr_system.cc
++++ b/third_party/blink/renderer/modules/xr/xr_system.cc
+@@ -170,6 +170,7 @@ bool IsFeatureValidForMode(device::mojom::XRSessionFeature feature,
+     case device::mojom::XRSessionFeature::SECONDARY_VIEWS:
+     case device::mojom::XRSessionFeature::LAYERS:
+     case device::mojom::XRSessionFeature::WEBGPU:
++    case device::mojom::XRSessionFeature::TRACKED_SOURCES:
+       return mode == device::mojom::blink::XRSessionMode::kImmersiveVr ||
+              mode == device::mojom::blink::XRSessionMode::kImmersiveAr;
+     case device::mojom::XRSessionFeature::DOM_OVERLAY:
+@@ -237,6 +238,7 @@ bool HasRequiredPermissionsPolicy(ExecutionContext* context,
+     case device::mojom::XRSessionFeature::LAYERS:
+     case device::mojom::XRSessionFeature::FRONT_FACING:
+     case device::mojom::XRSessionFeature::WEBGPU:
++    case device::mojom::XRSessionFeature::TRACKED_SOURCES:
+       return context->IsFeatureEnabled(
+           network::mojom::PermissionsPolicyFeature::kWebXr,
+           ReportOptions::kReportOnFailure);
+diff --git a/third_party/blink/renderer/modules/xr/xr_utils.cc b/third_party/blink/renderer/modules/xr/xr_utils.cc
+index 20c3d0957beed..fcdae128d506f 100644
+--- a/third_party/blink/renderer/modules/xr/xr_utils.cc
++++ b/third_party/blink/renderer/modules/xr/xr_utils.cc
+@@ -214,6 +214,8 @@ std::optional<device::mojom::XRSessionFeature> StringToXRSessionFeature(
+     return device::mojom::XRSessionFeature::FRONT_FACING;
+   } else if (feature_string == "webgpu") {
+     return device::mojom::XRSessionFeature::WEBGPU;
++  } else if (feature_string == "tracked-sources") {
++    return device::mojom::XRSessionFeature::TRACKED_SOURCES;
+   }
+ 
+   return std::nullopt;
+@@ -259,6 +261,8 @@ StringView XRSessionFeatureToString(device::mojom::XRSessionFeature feature) {
+       return "front-facing";
+     case device::mojom::XRSessionFeature::WEBGPU:
+       return "webgpu";
++    case device::mojom::XRSessionFeature::TRACKED_SOURCES:
++      return "tracked-sources";
+   }
+ 
+   return "";
+@@ -279,6 +283,8 @@ bool IsFeatureEnabledForContext(device::mojom::XRSessionFeature feature,
+       return RuntimeEnabledFeatures::WebXRGPUBindingEnabled(context);
+     case device::mojom::XRSessionFeature::FRONT_FACING:
+       return RuntimeEnabledFeatures::WebXRFrontFacingEnabled(context);
++    case device::mojom::XRSessionFeature::TRACKED_SOURCES:
++      return RuntimeEnabledFeatures::WebXRSpecParityEnabled(context);
+     case device::mojom::XRSessionFeature::HAND_INPUT:
+     case device::mojom::XRSessionFeature::HIT_TEST:
+     case device::mojom::XRSessionFeature::LIGHT_ESTIMATION:
+diff --git a/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js b/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js
+index 707919a81e3b2..df28ea4ed6952 100644
+--- a/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js
++++ b/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js
+@@ -337,6 +337,7 @@ class MockRuntime {
+     'camera-access': xrSessionMojom.XRSessionFeature.CAMERA_ACCESS,
+     'layers': xrSessionMojom.XRSessionFeature.LAYERS,
+     'plane-detection': xrSessionMojom.XRSessionFeature.PLANE_DETECTION,
++    'tracked-sources': xrSessionMojom.XRSessionFeature.TRACKED_SOURCES,
+   };
+ 
+   static _sessionModeToMojoMap = {
+diff --git a/third_party/blink/web_tests/external/wpt/webxr/idlharness.https.window-expected.txt b/third_party/blink/web_tests/external/wpt/webxr/idlharness.https.window-expected.txt
+index d602350641cbb..a423b6b92087d 100644
+--- a/third_party/blink/web_tests/external/wpt/webxr/idlharness.https.window-expected.txt
++++ b/third_party/blink/web_tests/external/wpt/webxr/idlharness.https.window-expected.txt
+@@ -1,17 +1,11 @@
+ This is a testharness.js-based test.
+-Found 15 FAIL, 0 TIMEOUT, 0 NOTRUN.
++Found 12 FAIL, 0 TIMEOUT, 0 NOTRUN.
+ [FAIL] WebGLRenderingContext includes WebGLRenderingContextOverloads: member names are unique
+   assert_true: member bufferData is unique expected true got false
+-[FAIL] XRSession interface: attribute trackedSources
+-  assert_true: The prototype object must have a property "trackedSources" expected true got false
+-[FAIL] XRSession interface: xrSession must inherit property "trackedSources" with the proper type
+-  assert_inherits: property "trackedSources" not found in prototype chain
+ [FAIL] XRRenderState interface: attribute passthroughFullyObscured
+   assert_true: The prototype object must have a property "passthroughFullyObscured" expected true got false
+ [FAIL] XRRenderState interface: xrRenderState must inherit property "passthroughFullyObscured" with the proper type
+   assert_inherits: property "passthroughFullyObscured" not found in prototype chain
+-[FAIL] XRInputSource interface: attribute skipRendering
+-  assert_true: The prototype object must have a property "skipRendering" expected true got false
+ [FAIL] XRWebGLLayer interface: attribute fixedFoveation
+   assert_true: The prototype object must have a property "fixedFoveation" expected true got false
+ [FAIL] XRWebGLLayer interface: xrWebGLLayer must inherit property "fixedFoveation" with the proper type
+diff --git a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
+index 1492d29c9bff2..029608f3b384c 100644
+--- a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
++++ b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
+@@ -13196,6 +13196,7 @@ interface XRInputSource
+     getter hand
+     getter handedness
+     getter profiles
++    getter skipRendering
+     getter targetRayMode
+     getter targetRaySpace
+     method constructor
+@@ -13379,6 +13380,7 @@ interface XRSession : EventTarget
+     getter preferredReflectionFormat
+     getter renderState
+     getter supportedFrameRates
++    getter trackedSources
+     getter visibilityState
+     method cancelAnimationFrame
+     method constructor
+diff --git a/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js b/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
+index fc91e4b13b6cd..9bbe0f1363ba4 100644
+--- a/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
++++ b/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
+@@ -176,3 +176,15 @@ MockRuntime.prototype._injectAdditionalFrameData = function(options,
+     this.next_predicted_display_time_ += this.predicted_display_time_step_;
+   }
+ };
++
++// Marks |inputSource|, as returned by simulateInputSourceConnection(), as
++// auxiliary: it has no primary action, which makes it a tracked source.
++function setInputSourceAuxiliary(inputSource, auxiliary) {
++  inputSource._getInputSourceState_preAuxiliary ??=
++      inputSource._getInputSourceState;
++  inputSource._getInputSourceState = function() {
++    const state = this._getInputSourceState_preAuxiliary();
++    state.isAuxiliary = auxiliary;
++    return state;
++  };
++}
+diff --git a/third_party/blink/web_tests/wpt_internal/webxr/xrInputSource_skipRendering.https.html b/third_party/blink/web_tests/wpt_internal/webxr/xrInputSource_skipRendering.https.html
+new file mode 100644
+index 0000000000000..ca9c01ca79dc4
+--- /dev/null
++++ b/third_party/blink/web_tests/wpt_internal/webxr/xrInputSource_skipRendering.https.html
+@@ -0,0 +1,35 @@
++<!DOCTYPE html>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/webxr/resources/webxr_util.js"></script>
++<script src="/webxr/resources/webxr_test_constants.js"></script>
++
++<script>
++// skipRendering follows whether the display is see-through, which is up to the
++// user agent, so this test is chromium specific.
++
++function connectedSource(session, fakeDeviceController) {
++  // Input sources are only updated while the page asks for frames.
++  const onFrame = () => session.requestAnimationFrame(onFrame);
++  session.requestAnimationFrame(onFrame);
++  fakeDeviceController.simulateInputSourceConnection(RIGHT_CONTROLLER);
++  return new Promise(resolve => session.addEventListener(
++      'inputsourceschange', e => resolve(e.added[0]), {once: true}));
++}
++
++xr_session_promise_test(
++    'Input sources must be rendered on an opaque display',
++    async (session, fakeDeviceController) => {
++      assert_equals(session.environmentBlendMode, 'opaque');
++      const source = await connectedSource(session, fakeDeviceController);
++      assert_false(source.skipRendering);
++    }, TRACKED_IMMERSIVE_DEVICE, 'immersive-vr');
++
++xr_session_promise_test(
++    'Input sources need not be rendered on a see-through display',
++    async (session, fakeDeviceController) => {
++      assert_equals(session.environmentBlendMode, 'additive');
++      const source = await connectedSource(session, fakeDeviceController);
++      assert_true(source.skipRendering);
++    }, IMMERSIVE_AR_DEVICE, 'immersive-ar');
++</script>
+diff --git a/third_party/blink/web_tests/wpt_internal/webxr/xrSession_trackedSources.https.html b/third_party/blink/web_tests/wpt_internal/webxr/xrSession_trackedSources.https.html
+new file mode 100644
+index 0000000000000..3bcce723a3429
+--- /dev/null
++++ b/third_party/blink/web_tests/wpt_internal/webxr/xrSession_trackedSources.https.html
+@@ -0,0 +1,97 @@
++<!DOCTYPE html>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>let additionalChromiumResources = ["resources/xr-internal-device-mocking.js"];</script>
++<script src="/webxr/resources/webxr_util.js"></script>
++<script src="/webxr/resources/webxr_test_constants.js"></script>
++
++<script>
++// The WebXR Test API cannot create tracked sources, so this test marks input
++// sources as auxiliary through the chromium mock.
++
++const fakeDeviceInitParams = {
++  ...TRACKED_IMMERSIVE_DEVICE,
++  supportedFeatures: ALL_FEATURES.concat(['tracked-sources']),
++};
++
++function nextEvent(session, type) {
++  return new Promise(resolve =>
++      session.addEventListener(type, resolve, {once: true}));
++}
++
++// Input sources are only updated while the page asks for frames.
++function runFrameLoop(session) {
++  const onFrame = () => session.requestAnimationFrame(onFrame);
++  session.requestAnimationFrame(onFrame);
++}
++
++function skipFrames(session) {
++  return new Promise(resolve => requestSkipAnimationFrame(session, resolve));
++}
++
++xr_session_promise_test(
++    'Tracked sources are hidden without the tracked-sources feature',
++    async (session, fakeDeviceController) => {
++      const primary =
++          fakeDeviceController.simulateInputSourceConnection(VALID_CONTROLLER);
++      const tracked =
++          fakeDeviceController.simulateInputSourceConnection(RIGHT_CONTROLLER);
++      setInputSourceAuxiliary(tracked, true);
++      session.addEventListener('trackedsourceschange',
++                               () => assert_unreached('trackedsourceschange'));
++      await skipFrames(session);
++
++      assert_equals(session.inputSources.length, 1);
++      assert_equals(session.inputSources[0].handedness, 'none');
++      assert_equals(session.trackedSources.length, 0);
++    }, fakeDeviceInitParams, 'immersive-vr');
++
++xr_session_promise_test(
++    'Tracked sources are reported with the tracked-sources feature',
++    async (session, fakeDeviceController) => {
++      assert_true(session.enabledFeatures.includes('tracked-sources'));
++      runFrameLoop(session);
++      const tracked =
++          fakeDeviceController.simulateInputSourceConnection(RIGHT_CONTROLLER);
++      setInputSourceAuxiliary(tracked, true);
++
++      const added = await nextEvent(session, 'trackedsourceschange');
++      assert_true(added instanceof XRInputSourcesChangeEvent);
++      assert_equals(added.added.length, 1);
++      assert_equals(added.removed.length, 0);
++      assert_equals(added.added[0].handedness, 'right');
++      assert_equals(session.trackedSources.length, 1);
++      assert_equals(session.trackedSources[0], added.added[0]);
++      assert_equals(session.inputSources.length, 0);
++
++      tracked.disconnect();
++      const removed = await nextEvent(session, 'trackedsourceschange');
++      assert_equals(removed.added.length, 0);
++      assert_equals(removed.removed.length, 1);
++      assert_equals(removed.removed[0], added.added[0]);
++      assert_equals(session.trackedSources.length, 0);
++    }, fakeDeviceInitParams, 'immersive-vr',
++    {requiredFeatures: ['tracked-sources']});
++
++xr_session_promise_test(
++    'A source that loses its primary action moves to trackedSources',
++    async (session, fakeDeviceController) => {
++      runFrameLoop(session);
++      const source =
++          fakeDeviceController.simulateInputSourceConnection(RIGHT_CONTROLLER);
++      const connected = await nextEvent(session, 'inputsourceschange');
++      const primary = connected.added[0];
++      assert_equals(session.inputSources.length, 1);
++
++      const removed = nextEvent(session, 'inputsourceschange');
++      const added = nextEvent(session, 'trackedsourceschange');
++      setInputSourceAuxiliary(source, true);
++      assert_equals((await removed).removed[0], primary);
++      const tracked = (await added).added[0];
++      assert_not_equals(tracked, primary);
++      assert_equals(tracked.handedness, 'right');
++      assert_equals(session.inputSources.length, 0);
++      assert_equals(session.trackedSources.length, 1);
++    }, fakeDeviceInitParams, 'immersive-vr',
++    {requiredFeatures: ['tracked-sources']});
++</script>

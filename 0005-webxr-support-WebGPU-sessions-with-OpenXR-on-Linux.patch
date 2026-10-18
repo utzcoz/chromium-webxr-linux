@@ -1,0 +1,349 @@
+From bdb7e7ebb5f0f3116b55a77d4d16b4fe18a85f4c Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 4 Oct 2026 14:27:38 +0800
+Subject: [PATCH 5/7] webxr: support WebGPU sessions with OpenXR on Linux
+
+WebGPU cannot write to the DMA-BUF shared images that the OpenXR
+backend uses on Linux (crbug.com/330385376), so the backend did not
+offer the "webgpu" session feature.
+
+On Linux, the projection layers of XRGPUBinding now draw into a shared
+image of their own, in a new XRGPUCopySwapChain built on Linux only. At
+the end of the frame it is copied, and scaled, into the layer's shared
+image over the raster interface, as media layers do. Its width is
+rounded down to a multiple of the layer count, as an odd width hits a
+CHECK in XRGPUTextureArraySwapChain.
+
+The Vulkan binding gives the shared images of WebGPU sessions raster
+access and does not flip WebGPU frames, which are already top-down.
+
+The copy can be removed once WebGPU can write to DMA-BUF shared images
+on Linux.
+
+Bug: 506004811
+Change-Id: Ib3ec0aa75ea4917430c2ab40a9e2a5a45b5525c6
+---
+ .../linux/openxr_graphics_binding_vulkan.cc   | 11 ++-
+ device/vr/openxr/openxr_device.cc             |  5 +-
+ .../blink/renderer/modules/xr/BUILD.gn        |  7 ++
+ third_party/blink/renderer/modules/xr/DEPS    |  4 +
+ .../renderer/modules/xr/xr_gpu_binding.cc     | 21 ++++-
+ .../modules/xr/xr_gpu_copy_swap_chain.cc      | 94 +++++++++++++++++++
+ .../modules/xr/xr_gpu_copy_swap_chain.h       | 44 +++++++++
+ .../presubmit/audit_non_blink_usage.py        |  1 +
+ 8 files changed, 179 insertions(+), 8 deletions(-)
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.cc
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.h
+
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+index 5cade10c2bad5..a3d93e95b8ae8 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+@@ -281,9 +281,15 @@ void OpenXrGraphicsBindingVulkan::CreateSharedImages(
+        swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM)
+           ? viz::SinglePlaneFormat::kBGRA_8888
+           : viz::SinglePlaneFormat::kRGBA_8888;
+-  const gpu::SharedImageUsageSet shared_image_usage =
++  gpu::SharedImageUsageSet shared_image_usage =
+       gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
+       gpu::SHARED_IMAGE_USAGE_GLES2_READ | gpu::SHARED_IMAGE_USAGE_GLES2_WRITE;
++  // WebGPU layers are copied in over the raster interface
++  // (XRGPUCopySwapChain).
++  if (layer.read_only_data().needs_raster_access || IsWebGPUSession()) {
++    shared_image_usage |= gpu::SHARED_IMAGE_USAGE_RASTER_READ |
++                          gpu::SHARED_IMAGE_USAGE_RASTER_WRITE;
++  }
+   const gpu::SharedImageInfo si_info{si_format, size,
+                                      gfx::ColorSpace::CreateSRGB(),
+                                      shared_image_usage, "OpenXrVulkanBinding"};
+@@ -465,7 +471,8 @@ bool OpenXrGraphicsBindingVulkan::ShouldFlipSubmittedImage(
+   // GL has bottom-left origin; Vulkan/OpenXR has top-left origin.
+   // The submitted image needs to be flipped vertically.
+   // Content that is already flipped (flip_y) is submitted as it is.
+-  return !layer.flip_y();
++  // So is WebGPU content, which has a top-left origin.
++  return !IsWebGPUSession() && !layer.flip_y();
+ }
+ 
+ std::unique_ptr<OpenXrCompositionLayer::GraphicsBindingData>
+diff --git a/device/vr/openxr/openxr_device.cc b/device/vr/openxr/openxr_device.cc
+index 42fb2070e6124..3740459ebc8bf 100644
+--- a/device/vr/openxr/openxr_device.cc
++++ b/device/vr/openxr/openxr_device.cc
+@@ -89,14 +89,11 @@ OpenXrDevice::OpenXrDevice(
+         mojom::XRSessionFeature::LAYERS);
+   }
+ 
+-  // Only support WebGPU sessions if the feature flag is enabled; the Linux
+-  // Vulkan binding does not support WebGPU sessions yet.
+-#if !BUILDFLAG(IS_LINUX)
++  // Only support WebGPU sessions if the feature flag is enabled.
+   if (base::FeatureList::IsEnabled(features::kWebXRWebGPUBinding)) {
+     device_data.supported_features.emplace_back(
+         mojom::XRSessionFeature::WEBGPU);
+   }
+-#endif
+ 
+   // Only support Plane Detection if the feature flag is enabled.
+   if (base::FeatureList::IsEnabled(features::kWebXRPlaneDetection)) {
+diff --git a/third_party/blink/renderer/modules/xr/BUILD.gn b/third_party/blink/renderer/modules/xr/BUILD.gn
+index a42b807aa265e..9a36fce2aa9e6 100644
+--- a/third_party/blink/renderer/modules/xr/BUILD.gn
++++ b/third_party/blink/renderer/modules/xr/BUILD.gn
+@@ -186,6 +186,13 @@ blink_modules_sources("xr") {
+     "xr_webgl_texture_array_swap_chain.h",
+   ]
+ 
++  if (is_linux) {
++    sources += [
++      "xr_gpu_copy_swap_chain.cc",
++      "xr_gpu_copy_swap_chain.h",
++    ]
++  }
++
+   deps = [
+     "//device/vr/buildflags",
+     "//device/vr/public/mojom:vr_service_blink",
+diff --git a/third_party/blink/renderer/modules/xr/DEPS b/third_party/blink/renderer/modules/xr/DEPS
+index 085eff78a7a75..259ce7cb62076 100644
+--- a/third_party/blink/renderer/modules/xr/DEPS
++++ b/third_party/blink/renderer/modules/xr/DEPS
+@@ -1,5 +1,6 @@
+ include_rules = [
+     "+mojo/public/cpp/system/platform_handle.h",
++    "+components/viz/common/resources/shared_image_format.h",
+     "+device/vr/buildflags/buildflags.h",
+     "+device/vr/public/cpp/features.h",
+     "+device/vr/public/mojom/pose.h",
+@@ -17,10 +18,13 @@ include_rules = [
+     "+gpu/command_buffer/client/client_shared_image.h",
+     "+gpu/command_buffer/client/gles2_interface.h",
+     "+gpu/command_buffer/client/raster_interface.h",
++    "+gpu/command_buffer/client/shared_image_interface.h",
++    "+gpu/command_buffer/common/shared_image_usage.h",
+     "+gpu/command_buffer/common/sync_token.h",
+     "+media/gfx/paint_canvas_video_renderer.h",
+     "+services/metrics/public/cpp/ukm_builders.h",
+     "+ui/display/display.h",
++    "+ui/gfx/color_space.h",
+     "+ui/gfx/geometry",
+     "+ui/gfx/transform.h",
+ ]
+diff --git a/third_party/blink/renderer/modules/xr/xr_gpu_binding.cc b/third_party/blink/renderer/modules/xr/xr_gpu_binding.cc
+index bdeb5822d2dac..a2c90ebda2d0e 100644
+--- a/third_party/blink/renderer/modules/xr/xr_gpu_binding.cc
++++ b/third_party/blink/renderer/modules/xr/xr_gpu_binding.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/xr/xr_gpu_binding.h"
+ 
++#include "build/build_config.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_gpu_projection_layer_init.h"
+ #include "third_party/blink/renderer/modules/webgpu/dawn_conversions.h"
+ #include "third_party/blink/renderer/modules/webgpu/dawn_enum_conversions.h"
+@@ -27,6 +28,10 @@
+ #include "ui/gfx/geometry/size_conversions.h"
+ #include "ui/gfx/geometry/size_f.h"
+ 
++#if BUILDFLAG(IS_LINUX)
++#include "third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.h"
++#endif
++
+ namespace blink {
+ 
+ namespace {
+@@ -132,9 +137,22 @@ XRProjectionLayer* XRGPUBinding::createProjectionLayer(
+   color_desc.dimension = wgpu::TextureDimension::e2D;
+ 
+   XRGPUSwapChain* color_swap_chain;
++  V8XRTextureType::Enum texture_type = V8XRTextureType::Enum::kTextureArray;
+   if (session()->xr()->frameProvider()->DrawingIntoSharedBuffer()) {
++#if BUILDFLAG(IS_LINUX)
++    // WebGPU cannot write to the DMA-BUF shared buffers of Linux
++    // (crbug.com/330385376), so the side-by-side texture is copied into them.
++    // Every layer gets the same share of the width.
++    const uint32_t layers =
++        base::checked_cast<uint32_t>(session()->array_texture_layers());
++    color_desc.size.width -= color_desc.size.width % layers;
++    color_swap_chain =
++        MakeGarbageCollected<XRGPUCopySwapChain>(device_, color_desc);
++    texture_type = V8XRTextureType::Enum::kTexture;
++#else
+     color_swap_chain =
+         MakeGarbageCollected<XRGPUMailboxSwapChain>(device_, color_desc);
++#endif
+   } else {
+     // TODO(crbug.com/359418629): Replace with a shared image swap chain.
+     color_swap_chain =
+@@ -171,8 +189,7 @@ XRProjectionLayer* XRGPUBinding::createProjectionLayer(
+                                            : V8XRLayerLayout::Enum::kMono;
+ 
+   return MakeGarbageCollected<XRProjectionLayer>(
+-      session(), this, drawing_context, layout,
+-      V8XRTextureType::Enum::kTextureArray);
++      session(), this, drawing_context, layout, texture_type);
+ }
+ 
+ XRGPUSubImage* XRGPUBinding::getViewSubImage(XRProjectionLayer* layer,
+diff --git a/third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.cc b/third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.cc
+new file mode 100644
+index 0000000000000..0200505255c88
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.cc
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.h"
++
++#include "components/viz/common/resources/shared_image_format.h"
++#include "gpu/command_buffer/client/raster_interface.h"
++#include "gpu/command_buffer/client/shared_image_interface.h"
++#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "third_party/blink/renderer/modules/webgpu/gpu_device.h"
++#include "third_party/blink/renderer/modules/xr/xr_composition_layer.h"
++#include "third_party/blink/renderer/modules/xr/xr_layer_shared_image_manager.h"
++#include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
++#include "third_party/blink/renderer/platform/graphics/web_graphics_context_3d_provider_wrapper.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace blink {
++
++XRGPUCopySwapChain::XRGPUCopySwapChain(GPUDevice* device,
++                                       const wgpu::TextureDescriptor& desc)
++    : XRGPUSwapChain(device) {
++  descriptor_ = desc;
++
++  // TODO(crbug.com/359418629): Internal Usage will not be necessary once we can
++  // use texture array mailboxes directly.
++  texture_internal_usage_ = {{
++      .internalUsage = wgpu::TextureUsage::CopyDst,
++  }};
++  descriptor_.nextInChain = &texture_internal_usage_;
++}
++
++GPUTexture* XRGPUCopySwapChain::ProduceTexture() {
++  auto wrapper = SharedGpuContext::ContextProviderWrapper();
++  if (!shared_image_ && wrapper) {
++    gpu::SharedImageUsageSet usage = gpu::SHARED_IMAGE_USAGE_WEBGPU_READ |
++                                     gpu::SHARED_IMAGE_USAGE_WEBGPU_WRITE |
++                                     gpu::SHARED_IMAGE_USAGE_RASTER_READ;
++    gpu::SharedImageInterface* sii =
++        wrapper->ContextProvider().SharedImageInterface();
++    shared_image_ = sii->CreateSharedImage(
++        {viz::SinglePlaneFormat::kRGBA_8888,
++         gfx::Size(descriptor_.size.width, descriptor_.size.height),
++         gfx::ColorSpace::CreateSRGB(), usage, "XRGPUCopySwapChain"},
++        gpu::kNullSurfaceHandle);
++    sync_token_ = sii->GenVerifiedSyncToken();
++  }
++  if (!shared_image_) {
++    return GPUTexture::Create(device(), &descriptor_);
++  }
++
++  scoped_refptr<WebGPUMailboxTexture> mailbox_texture =
++      WebGPUMailboxTexture::FromExistingSharedImage(
++          device()->GetDawnControlClient(), device()->GetHandle(), descriptor_,
++          shared_image_, sync_token_);
++
++  return MakeGarbageCollected<GPUTexture>(
++      device(), descriptor_.format, descriptor_.usage,
++      std::move(mailbox_texture), "WebXR Copy Swap Chain");
++}
++
++void XRGPUCopySwapChain::OnFrameEnd() {
++  GPUTexture* texture = ResetCurrentTexture();
++  if (!texture || !shared_image_) {
++    return;
++  }
++  sync_token_ = texture->DissociateMailbox();
++
++  auto wrapper = SharedGpuContext::ContextProviderWrapper();
++  const XRSharedImageData& dest = layer()->SharedImage();
++  if (!wrapper || !dest.shared_image) {
++    return;
++  }
++
++  gpu::raster::RasterInterface* raster_interface =
++      wrapper->ContextProvider().RasterInterface();
++  std::unique_ptr<gpu::RasterScopedAccess> src_access =
++      shared_image_->BeginRasterAccess(raster_interface, sync_token_,
++                                       /*readonly=*/true);
++  std::unique_ptr<gpu::RasterScopedAccess> dst_access =
++      dest.shared_image->BeginRasterAccess(raster_interface, dest.sync_token,
++                                           /*readonly=*/false);
++  // The layer's shared image keeps its size whatever the layer's scale factor.
++  raster_interface->CopySharedImage(
++      shared_image_->mailbox(), dest.shared_image->mailbox(),
++      gfx::Rect(shared_image_->size()), gfx::Rect(dest.shared_image->size()));
++  gpu::RasterScopedAccess::EndAccess(std::move(dst_access));
++  sync_token_ = gpu::RasterScopedAccess::EndAccess(std::move(src_access));
++  raster_interface->Flush();
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.h b/third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.h
+new file mode 100644
+index 0000000000000..849013fb6a29e
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_gpu_copy_swap_chain.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_GPU_COPY_SWAP_CHAIN_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_GPU_COPY_SWAP_CHAIN_H_
++
++#include "base/memory/scoped_refptr.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/common/sync_token.h"
++#include "third_party/blink/renderer/modules/xr/xr_gpu_swap_chain.h"
++
++namespace blink {
++
++class GPUDevice;
++class GPUTexture;
++
++// Has the page draw into a shared image of its own, and copies that into the
++// layer's shared image, for when WebGPU cannot write to the latter.
++class XRGPUCopySwapChain final : public XRGPUSwapChain {
++ public:
++  XRGPUCopySwapChain(GPUDevice* device, const wgpu::TextureDescriptor& desc);
++  ~XRGPUCopySwapChain() override = default;
++
++  GPUTexture* ProduceTexture() override;
++
++  void OnFrameEnd() override;
++
++  const wgpu::TextureDescriptor& descriptor() const override {
++    return descriptor_;
++  }
++
++  gpu::SyncToken GetSyncToken() const override { return sync_token_; }
++
++ private:
++  wgpu::TextureDescriptor descriptor_;
++  wgpu::DawnTextureInternalUsageDescriptor texture_internal_usage_;
++  scoped_refptr<gpu::ClientSharedImage> shared_image_;
++  gpu::SyncToken sync_token_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_GPU_COPY_SWAP_CHAIN_H_
+diff --git a/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py b/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py
+index 0fd6153467d1c..3c7bd30101389 100755
+--- a/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py
++++ b/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py
+@@ -1863,6 +1863,7 @@ _CONFIG = [
+             'gpu::ClientSharedImage',
+             'gpu::ContextSupport',
+             'gpu::gles2::GLES2Interface',
++            'gpu::kNullSurfaceHandle',
+             'gpu::Mailbox',
+             'gpu::raster::RasterInterface',
+             'gpu::RasterScopedAccess',

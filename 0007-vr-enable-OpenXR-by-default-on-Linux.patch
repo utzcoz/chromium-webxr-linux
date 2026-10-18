@@ -1,0 +1,31 @@
+From 52339e45ca7e27b055325b41493c327d21b23aee Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 18 Oct 2026 20:35:15 +0800
+Subject: [PATCH 7/7] vr: enable OpenXR by default on Linux
+
+Enable the OpenXR feature by default on Linux, as on Windows, so that
+immersive-vr sessions work with an installed OpenXR runtime without
+--enable-features=OpenXR.
+
+Bug: 506004811
+Change-Id: Ia997ab2a21ba06f09bd87ae4eb190ebfa3ec1d2a
+---
+ device/vr/public/cpp/features.cc | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/device/vr/public/cpp/features.cc b/device/vr/public/cpp/features.cc
+index 16fa1f448a7a5..020f33cc7f10c 100644
+--- a/device/vr/public/cpp/features.cc
++++ b/device/vr/public/cpp/features.cc
+@@ -49,8 +49,9 @@ BASE_FEATURE(kOpenXrAndroidSystemKeyboard, base::FEATURE_ENABLED_BY_DEFAULT);
+ #if BUILDFLAG(ENABLE_OPENXR)
+ // Controls WebXR support for the OpenXR Runtime.
+ BASE_FEATURE(kOpenXR,
+-             BUILDFLAG(IS_WIN) ? base::FEATURE_ENABLED_BY_DEFAULT
+-                               : base::FEATURE_DISABLED_BY_DEFAULT);
++             BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
++                 ? base::FEATURE_ENABLED_BY_DEFAULT
++                 : base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Controls whether the spatial entities framework is allowed to use depth-based
+ // hit tests or only plane-based ones.

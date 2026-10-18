@@ -1,0 +1,1259 @@
+From 4981c712f43d53eed3a5f386001e84f79ceae113 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 18 Oct 2026 20:35:14 +0800
+Subject: [PATCH 6/7] vr: show the WebXR browser overlay on Linux
+
+The in-headset browser overlay (permission prompts and capture
+indicators) was turned off on Linux: OpenXrDevice dropped the
+ImmersiveOverlay remote, so the browser never created a VrUiHost.
+Turn it on:
+
+- Add GraphicsDelegateLinux, which draws the overlay like
+  GraphicsDelegateWin, into a GPU-only SharedImage: Ozone/X11 has no
+  native buffers to share by default. It clears the image every frame,
+  as WebXR frames without overlay elements draw nothing, and it
+  allocates the gles2_lib thread-local key that the VR UI's GL calls
+  use.
+- The Vulkan binding copies each new overlay frame into an image of
+  its own, exported like the LINEAR intermediate images, and
+  alpha-blends each eye's part of it into the projection layer it
+  shows with a small graphics pipeline. While the overlay hides
+  WebXR, and in the base layer above the page's own layers, it is
+  drawn over a cleared image instead.
+- SendFrameData() keeps the shared images of a frame it suppresses.
+  A frame started just before the overlay hid WebXR had them, and
+  Blink DCHECKs that every frame with an id does.
+
+Bug: 506004811
+Change-Id: Id815250e4c1b40132e9fb4e0fa43c42df7db571f
+---
+ chrome/browser/vr/BUILD.gn                    |   9 +
+ chrome/browser/vr/graphics_delegate.cc        |   4 +
+ chrome/browser/vr/graphics_delegate_linux.cc  | 177 +++++++
+ chrome/browser/vr/graphics_delegate_linux.h   |  68 +++
+ .../linux/openxr_graphics_binding_vulkan.cc   | 147 +++++-
+ .../linux/openxr_graphics_binding_vulkan.h    |  34 ++
+ ...openxr_graphics_binding_vulkan_unittest.cc |   6 +-
+ .../vr/openxr/linux/openxr_vulkan_context.cc  | 469 ++++++++++++++++++
+ .../vr/openxr/linux/openxr_vulkan_context.h   |  42 ++
+ device/vr/openxr/openxr_device.cc             |   4 -
+ device/vr/openxr/openxr_render_loop.cc        |   7 +
+ 11 files changed, 956 insertions(+), 11 deletions(-)
+ create mode 100644 chrome/browser/vr/graphics_delegate_linux.cc
+ create mode 100644 chrome/browser/vr/graphics_delegate_linux.h
+
+diff --git a/chrome/browser/vr/BUILD.gn b/chrome/browser/vr/BUILD.gn
+index 10be38661ad0d..23672467a3d47 100644
+--- a/chrome/browser/vr/BUILD.gn
++++ b/chrome/browser/vr/BUILD.gn
+@@ -282,6 +282,15 @@ if (enable_vr) {
+       deps += [ "//services/viz/public/cpp/gpu" ]
+     }
+ 
++    if (is_linux) {
++      sources += [
++        "graphics_delegate_linux.cc",
++        "graphics_delegate_linux.h",
++      ]
++
++      deps += [ "//services/viz/public/cpp/gpu" ]
++    }
++
+     if (is_android) {
+       sources += [
+         "graphics_delegate_android.cc",
+diff --git a/chrome/browser/vr/graphics_delegate.cc b/chrome/browser/vr/graphics_delegate.cc
+index 53d63485a0772..29fea1de373c4 100644
+--- a/chrome/browser/vr/graphics_delegate.cc
++++ b/chrome/browser/vr/graphics_delegate.cc
+@@ -26,6 +26,8 @@
+ #include "chrome/browser/vr/graphics_delegate_win.h"
+ #elif BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/vr/graphics_delegate_android.h"
++#elif BUILDFLAG(IS_LINUX)
++#include "chrome/browser/vr/graphics_delegate_linux.h"
+ #endif
+ 
+ namespace vr {
+@@ -123,6 +125,8 @@ std::unique_ptr<GraphicsDelegate> GraphicsDelegate::Create() {
+   return std::make_unique<GraphicsDelegateWin>();
+ #elif BUILDFLAG(IS_ANDROID)
+   return std::make_unique<GraphicsDelegateAndroid>();
++#elif BUILDFLAG(IS_LINUX)
++  return std::make_unique<GraphicsDelegateLinux>();
+ #else
+   NOTIMPLEMENTED();
+   return nullptr;
+diff --git a/chrome/browser/vr/graphics_delegate_linux.cc b/chrome/browser/vr/graphics_delegate_linux.cc
+new file mode 100644
+index 0000000000000..b598fdaf165d8
+--- /dev/null
++++ b/chrome/browser/vr/graphics_delegate_linux.cc
+@@ -0,0 +1,177 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/vr/graphics_delegate_linux.h"
++
++#include "components/viz/common/resources/shared_image_format.h"
++#include "content/public/browser/gpu_utils.h"
++#include "content/public/common/gpu_stream_constants.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/client/gles2_interface.h"
++#include "gpu/command_buffer/client/gles2_lib.h"
++#include "gpu/command_buffer/client/shared_image_interface.h"
++#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "gpu/ipc/common/surface_handle.h"
++#include "ui/gfx/color_space.h"
++#include "url/gurl.h"
++
++namespace vr {
++
++GraphicsDelegateLinux::GraphicsDelegateLinux() = default;
++GraphicsDelegateLinux::~GraphicsDelegateLinux() = default;
++
++void GraphicsDelegateLinux::Initialize(base::OnceClosure on_initialized) {
++  gpu::GpuChannelEstablishFactory* factory =
++      content::GetGpuChannelEstablishFactory();
++  gpu_channel_host_ = factory->EstablishGpuChannelSync();
++
++  context_provider_ = viz::ContextProviderCommandBuffer::CreateForGL(
++      gpu_channel_host_, content::kGpuStreamIdDefault,
++      content::kGpuStreamPriorityUI, GURL("chrome://gpu/VrUiLinux"),
++      viz::command_buffer_metrics::ContextType::XR_COMPOSITING);
++
++  if (context_provider_->BindToCurrentSequence() ==
++      gpu::ContextResult::kSuccess) {
++    gl_ = context_provider_->ContextGL();
++    sii_ = context_provider_->SharedImageInterface();
++  }
++
++  std::move(on_initialized).Run();
++}
++
++bool GraphicsDelegateLinux::BindContext() {
++  if (!gl_) {
++    return false;
++  }
++
++  // The VR UI draws through gles2_lib, whose thread-local context key only
++  // gles2::Initialize() allocates. Without it, SetGLContext() would write to
++  // whichever pthread key 0 is.
++  [[maybe_unused]] static const bool gles2_lib_initialized = [] {
++    gles2::Initialize();
++    return true;
++  }();
++  gles2::SetGLContext(gl_);
++  return true;
++}
++
++void GraphicsDelegateLinux::ClearContext() {
++  gles2::SetGLContext(nullptr);
++}
++
++bool GraphicsDelegateLinux::PreRender() {
++  if (!gl_) {
++    return false;
++  }
++
++  BindContext();
++
++  // Create a memory buffer and a shared image referencing that memory buffer.
++  if (!EnsureMemoryBuffer()) {
++    return false;
++  }
++
++  // Create a texture id and associate it with shared image.
++  shared_image_texture_ = client_shared_image_->CreateGLTexture(gl_);
++  scoped_shared_image_access_ =
++      shared_image_texture_->BeginAccess(gpu::SyncToken(), /*readonly=*/false);
++
++  gl_->BindTexture(GL_TEXTURE_2D, scoped_shared_image_access_->texture_id());
++  gl_->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  gl_->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  gl_->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  gl_->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++  gl_->BindTexture(GL_TEXTURE_2D, 0);
++
++  // Bind our image/texture/memory buffer as the draw framebuffer.
++  gl_->GenFramebuffers(1, &draw_frame_buffer_);
++  gl_->BindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_frame_buffer_);
++  gl_->FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                            GL_TEXTURE_2D,
++                            scoped_shared_image_access_->texture_id(), 0);
++
++  if (gl_->GetError() != GL_NO_ERROR) {
++    gpu::SharedImageTexture::ScopedAccess::EndAccess(
++        std::move(scoped_shared_image_access_));
++    shared_image_texture_.reset();
++    // Clear any remaining GL errors.
++    while (gl_->GetError() != GL_NO_ERROR) {
++    }
++    return false;
++  }
++
++  // A WebXR frame without overlay elements draws nothing, and the XR process
++  // composites what the buffer holds, so start every frame transparent.
++  ClearBufferToBlack();
++
++  return true;
++}
++
++void GraphicsDelegateLinux::PostRender() {
++  // Unbind the drawing buffer.
++  gl_->BindFramebuffer(GL_FRAMEBUFFER, 0);
++  gl_->DeleteFramebuffers(1, &draw_frame_buffer_);
++
++  // Generate a SyncToken after GPU is done accessing the texture.
++  access_done_sync_token_ = gpu::SharedImageTexture::ScopedAccess::EndAccess(
++      std::move(scoped_shared_image_access_));
++  sii_->VerifySyncToken(access_done_sync_token_);
++  shared_image_texture_.reset();
++  gl_->BindTexture(GL_TEXTURE_2D, 0);
++  draw_frame_buffer_ = 0;
++
++  // Flush.
++  gl_->ShallowFlushCHROMIUM();
++  ClearContext();
++}
++
++scoped_refptr<gpu::ClientSharedImage> GraphicsDelegateLinux::GetTexture() {
++  return client_shared_image_;
++}
++
++gpu::SyncToken GraphicsDelegateLinux::GetSyncToken() {
++  return access_done_sync_token_;
++}
++
++bool GraphicsDelegateLinux::EnsureMemoryBuffer() {
++  gfx::Size buffer_size = GetTextureSize();
++  if (client_shared_image_ && last_size_ == buffer_size) {
++    return true;
++  }
++
++  // Destroy any existing SharedImage as its size is not correct.
++  ResetMemoryBuffer();
++
++  last_size_ = buffer_size;
++
++  viz::SharedImageFormat format = viz::SinglePlaneFormat::kRGBA_8888;
++
++  // These SharedImages will be written to via GLES2 to render the scene,
++  // followed by the XR process copying them over GLES2 to composite them.
++  client_shared_image_ = sii_->CreateSharedImage(
++      {format, buffer_size, gfx::ColorSpace(),
++       gpu::SHARED_IMAGE_USAGE_GLES2_WRITE | gpu::SHARED_IMAGE_USAGE_GLES2_READ,
++       "VRGraphicsDelegate"},
++      gpu::kNullSurfaceHandle);
++  if (!client_shared_image_) {
++    return false;
++  }
++
++  return true;
++}
++
++void GraphicsDelegateLinux::ResetMemoryBuffer() {
++  if (client_shared_image_) {
++    client_shared_image_->UpdateDestructionSyncToken(access_done_sync_token_);
++    client_shared_image_.reset();
++  }
++  access_done_sync_token_.Clear();
++}
++
++void GraphicsDelegateLinux::ClearBufferToBlack() {
++  gl_->ClearColor(0, 0, 0, 0);
++  gl_->Clear(GL_COLOR_BUFFER_BIT);
++}
++
++}  // namespace vr
+diff --git a/chrome/browser/vr/graphics_delegate_linux.h b/chrome/browser/vr/graphics_delegate_linux.h
+new file mode 100644
+index 0000000000000..326a9bc6cb678
+--- /dev/null
++++ b/chrome/browser/vr/graphics_delegate_linux.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_VR_GRAPHICS_DELEGATE_LINUX_H_
++#define CHROME_BROWSER_VR_GRAPHICS_DELEGATE_LINUX_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "chrome/browser/vr/graphics_delegate.h"
++#include "gpu/GLES2/gl2extchromium.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/common/sync_token.h"
++#include "gpu/ipc/client/gpu_channel_host.h"
++#include "services/viz/public/cpp/gpu/context_provider_command_buffer.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace gpu {
++class SharedImageInterface;
++namespace gles2 {
++class GLES2Interface;
++}
++}  // namespace gpu
++
++namespace vr {
++
++// Draws the in-headset browser overlay over the GPU command buffer into a
++// SharedImage that the XR process copies and composites. Like
++// GraphicsDelegateWin, plus the gles2_lib setup that only Linux needs.
++class GraphicsDelegateLinux : public GraphicsDelegate {
++ public:
++  GraphicsDelegateLinux();
++  ~GraphicsDelegateLinux() override;
++
++  // GraphicsDelegate:
++  void Initialize(base::OnceClosure on_initialized) override;
++  bool PreRender() override;
++  void PostRender() override;
++  scoped_refptr<gpu::ClientSharedImage> GetTexture() override;
++  gpu::SyncToken GetSyncToken() override;
++  void ResetMemoryBuffer() override;
++  bool BindContext() override;
++  void ClearContext() override;
++
++ private:
++  // Helpers:
++  bool EnsureMemoryBuffer();
++  void ClearBufferToBlack() override;
++
++  scoped_refptr<gpu::GpuChannelHost> gpu_channel_host_;
++  scoped_refptr<viz::ContextProviderCommandBuffer> context_provider_;
++  raw_ptr<gpu::gles2::GLES2Interface> gl_ = nullptr;
++  raw_ptr<gpu::SharedImageInterface> sii_ = nullptr;
++  gfx::Size last_size_;
++  scoped_refptr<gpu::ClientSharedImage> client_shared_image_;
++  std::unique_ptr<gpu::SharedImageTexture> shared_image_texture_;
++  std::unique_ptr<gpu::SharedImageTexture::ScopedAccess>
++      scoped_shared_image_access_;
++  GLuint draw_frame_buffer_ = 0;
++  // Sync point after access to the buffer is done.
++  gpu::SyncToken access_done_sync_token_;
++};
++
++}  // namespace vr
++
++#endif  // CHROME_BROWSER_VR_GRAPHICS_DELEGATE_LINUX_H_
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+index a3d93e95b8ae8..68394a09752bd 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
+@@ -13,18 +13,22 @@
+ #include "base/files/scoped_file.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
++#include "components/viz/common/gpu/context_provider.h"
+ #include "components/viz/common/resources/shared_image_format.h"
+ #include "device/vr/openxr/openxr_composition_layer.h"
+ #include "device/vr/openxr/openxr_extension_helper.h"
+ #include "device/vr/openxr/openxr_swapchain_info.h"
+ #include "device/vr/openxr/openxr_util.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/client/gles2_interface.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
+ #include "gpu/ipc/common/surface_handle.h"
+ #include "third_party/openxr/src/include/openxr/openxr.h"
+ #include "ui/gfx/buffer_types.h"
+ #include "ui/gfx/color_space.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/gpu_fence.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ #include "ui/gfx/native_pixmap_handle.h"
+@@ -97,6 +101,7 @@ OpenXrGraphicsBindingVulkan::OpenXrGraphicsBindingVulkan(
+ }
+ 
+ OpenXrGraphicsBindingVulkan::~OpenXrGraphicsBindingVulkan() {
++  ReleaseOverlayCopy();
+   // The layers outlive vulkan_, so free their intermediate images (which
+   // reference the VkDevice) and drop their pointer to it now.
+   auto release = [](OpenXrCompositionLayer& layer) {
+@@ -409,6 +414,15 @@ bool OpenXrGraphicsBindingVulkan::RenderLayer(
+     return false;
+   }
+ 
++  // The page's content is left out while the overlay hides it, and from the
++  // base layer that only carries the overlay above the page's layers.
++  if (!webxr_visible_) {
++    return DrawOverlay(layer, dst, /*clear_alpha=*/1.f, context_provider);
++  }
++  if (layer.GetLayerId() == kInvalidLayerId && !layers_sequence_.empty()) {
++    return DrawOverlay(layer, dst, /*clear_alpha=*/0.f, context_provider);
++  }
++
+   // The runtime flips projection layers, and the other types too if it has
+   // XR_FB_composition_layer_image_layout (GetFlipLayerLayout()). Otherwise
+   // the copy flips them.
+@@ -416,8 +430,47 @@ bool OpenXrGraphicsBindingVulkan::RenderLayer(
+       ShouldFlipSubmittedImage(layer) &&
+       layer.type() != OpenXrCompositionLayer::Type::kProjection &&
+       !GetFlipLayerLayout(layer);
+-  return vulkan_->CopyToSwapchainImage(src, dst, layer.GetSwapchainImageSize(),
+-                                       flip_y);
++  if (!vulkan_->CopyToSwapchainImage(src, dst, layer.GetSwapchainImageSize(),
++                                     flip_y)) {
++    return false;
++  }
++  if (!overlay_visible_ ||
++      layer.type() != OpenXrCompositionLayer::Type::kProjection) {
++    return true;
++  }
++  return DrawOverlay(layer, dst, std::nullopt, context_provider);
++}
++
++bool OpenXrGraphicsBindingVulkan::DrawOverlay(
++    OpenXrCompositionLayer& layer,
++    VkImage dst,
++    std::optional<float> clear_alpha,
++    const scoped_refptr<viz::ContextProvider>& context_provider) {
++  const gfx::Size size = layer.GetSwapchainImageSize();
++  std::vector<OpenXrVulkanContext::OverlayDraw> draws;
++  const bool draw_overlay =
++      overlay_visible_ && overlay_shared_image_ &&
++      layer.type() == OpenXrCompositionLayer::Type::kProjection;
++  if (draw_overlay && overlay_updated_) {
++    if (!CopyOverlay(context_provider)) {
++      return false;
++    }
++    overlay_updated_ = false;
++  }
++  if (draw_overlay && overlay_copy_) {
++    // The overlay is drawn bottom-up, like the page's WebGL content: flip it
++    // for layers the runtime does not flip.
++    const bool flip = !ShouldFlipSubmittedImage(layer);
++    for (const gfx::RectF& uv : {overlay_left_, overlay_right_}) {
++      gfx::RectF rect = gfx::ScaleRect(uv, size.width(), size.height());
++      if (flip) {
++        rect.set_y(size.height() - rect.bottom());
++      }
++      draws.push_back({gfx::ToEnclosingRect(rect), uv, flip});
++    }
++  }
++  return vulkan_->DrawOverlay(dst, swapchain_format_, size, clear_alpha,
++                              overlay_image_, overlay_format_, draws);
+ }
+ 
+ void OpenXrGraphicsBindingVulkan::CleanupWithoutSubmit() {
+@@ -438,11 +491,97 @@ bool OpenXrGraphicsBindingVulkan::SetOverlayTexture(
+     const gpu::SyncToken& sync_token,
+     const gfx::RectF& left,
+     const gfx::RectF& right) {
+-  // The in-headset browser overlay is not wired up on Linux yet (it lands in a
+-  // follow-up CL), so nothing calls this and the required override is a no-op.
++  if (!texture) {
++    return false;
++  }
++  overlay_shared_image_ = std::move(texture);
++  overlay_sync_token_ = sync_token;
++  overlay_updated_ = true;
++  overlay_left_ = left;
++  overlay_right_ = right;
+   return true;
+ }
+ 
++bool OpenXrGraphicsBindingVulkan::CopyOverlay(
++    const scoped_refptr<viz::ContextProvider>& context_provider) {
++  gpu::gles2::GLES2Interface* gl =
++      context_provider ? context_provider->ContextGL() : nullptr;
++  if (!gl || !vulkan_->has_external_memory_fd()) {
++    return false;
++  }
++  const gfx::Size size = overlay_shared_image_->size();
++  // Recreate the copy for a new size, or with the new GPU context after the
++  // old one was lost.
++  if (!overlay_copy_ || overlay_copy_->size() != size ||
++      overlay_copy_sii_.get() != context_provider->SharedImageInterface()) {
++    ReleaseOverlayCopy();
++    // Use the swapchain's format, as CreateSharedImages() does: Ozone/X11 may
++    // only import BGRA, and sampling it with the swapchain's color encoding
++    // makes blending into an sRGB swapchain happen in linear space.
++    overlay_format_ = swapchain_format_;
++    const viz::SharedImageFormat si_format =
++        (swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
++         swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM)
++            ? viz::SinglePlaneFormat::kBGRA_8888
++            : viz::SinglePlaneFormat::kRGBA_8888;
++    if (!vulkan_->CreateExportableImage(size, overlay_format_,
++                                        VK_IMAGE_USAGE_SAMPLED_BIT,
++                                        &overlay_image_)) {
++      return false;
++    }
++    overlay_copy_sii_ = context_provider->SharedImageInterface();
++    overlay_copy_ = ExportLinearImageAsSharedImage(
++        overlay_copy_sii_.get(),
++        {si_format, size, gfx::ColorSpace::CreateSRGB(),
++         gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++             gpu::SHARED_IMAGE_USAGE_GLES2_READ |
++             gpu::SHARED_IMAGE_USAGE_GLES2_WRITE,
++         "OpenXrOverlay"},
++        overlay_image_);
++    if (!overlay_copy_) {
++      ReleaseOverlayCopy();
++      return false;
++    }
++  }
++
++  std::unique_ptr<gpu::SharedImageTexture> src =
++      overlay_shared_image_->CreateGLTexture(gl);
++  std::unique_ptr<gpu::SharedImageTexture::ScopedAccess> src_access =
++      src->BeginAccess(overlay_sync_token_, /*readonly=*/true);
++  std::unique_ptr<gpu::SharedImageTexture> dst =
++      overlay_copy_->CreateGLTexture(gl);
++  std::unique_ptr<gpu::SharedImageTexture::ScopedAccess> dst_access =
++      dst->BeginAccess(overlay_copy_->creation_sync_token(),
++                       /*readonly=*/false);
++  gl->CopySubTextureCHROMIUM(src_access->texture_id(), 0,
++                             overlay_copy_->GetTextureTarget(),
++                             dst_access->texture_id(), 0, 0, 0, 0, 0,
++                             size.width(), size.height(), false, false, false);
++  gpu::SharedImageTexture::ScopedAccess::EndAccess(std::move(dst_access));
++  gpu::SharedImageTexture::ScopedAccess::EndAccess(std::move(src_access));
++  // Like the D3D11 binding, finish before compositing.
++  gl->Finish();
++  return true;
++}
++
++void OpenXrGraphicsBindingVulkan::OnSetOverlayAndWebXrVisibility() {
++  if (!overlay_visible_) {
++    overlay_shared_image_.reset();
++    overlay_updated_ = false;
++    ReleaseOverlayCopy();
++  }
++}
++
++void OpenXrGraphicsBindingVulkan::ReleaseOverlayCopy() {
++  overlay_copy_.reset();
++  overlay_copy_sii_.reset();
++  if (vulkan_ && vulkan_->valid()) {
++    vulkan_->DestroyIntermediateImage(overlay_image_);
++  }
++  // A new image starts in VK_IMAGE_LAYOUT_UNDEFINED.
++  overlay_image_ = OpenXrVulkanContext::IntermediateImage();
++}
++
+ void OpenXrGraphicsBindingVulkan::OnSwapchainImageReady(
+     OpenXrCompositionLayer& layer,
+     gpu::SharedImageInterface* sii) {
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+index 8b508071443bc..bda9793891d23 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
+@@ -7,6 +7,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ #include "base/containers/flat_set.h"
+@@ -15,11 +16,13 @@
+ #include "device/vr/openxr/openxr_graphics_binding.h"
+ #include "device/vr/openxr/openxr_platform.h"
+ #include "device/vr/vr_export.h"
++#include "gpu/command_buffer/common/sync_token.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ namespace gpu {
+ class ClientSharedImage;
++class SharedImageInterface;
+ struct SharedImageInfo;
+ }  // namespace gpu
+ 
+@@ -73,6 +76,7 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+   bool ShouldFlipSubmittedImage(OpenXrCompositionLayer& layer) const override;
+   std::unique_ptr<OpenXrCompositionLayer::GraphicsBindingData>
+   CreateLayerGraphicsBindingData() const override;
++  void OnSetOverlayAndWebXrVisibility() override;
+ 
+  private:
+   // Preferred export path: asks the GPU process for an Ozone/GBM native pixmap
+@@ -94,6 +98,21 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+       const gpu::SharedImageInfo& si_info,
+       const OpenXrVulkanContext::IntermediateImage& image);
+ 
++  // Draws the browser overlay into `dst`, the active swapchain image of
++  // `layer`, after clearing it with `clear_alpha` if given.
++  bool DrawOverlay(OpenXrCompositionLayer& layer,
++                   VkImage dst,
++                   std::optional<float> clear_alpha,
++                   const scoped_refptr<viz::ContextProvider>& context_provider);
++
++  // Copies the browser's latest overlay into `overlay_copy_`. The browser's
++  // image itself may have no DMA-BUF to sample: Ozone/X11 only allocates
++  // native buffers with --enable-native-gpu-memory-buffers.
++  bool CopyOverlay(const scoped_refptr<viz::ContextProvider>& context_provider);
++
++  // Drops `overlay_copy_` and its image.
++  void ReleaseOverlayCopy();
++
+   // Owns the Vulkan instance/device/queue plus the image create/import/copy
+   // logic; created in Initialize(). All raw Vulkan calls happen inside it.
+   std::unique_ptr<OpenXrVulkanContext> vulkan_;
+@@ -105,6 +124,21 @@ class DEVICE_VR_EXPORT OpenXrGraphicsBindingVulkan
+   // Layer types this binding cannot create, e.g. as the runtime lacks their
+   // extension.
+   base::flat_set<OpenXrCompositionLayer::Type> unsupported_layer_types_;
++
++  // The browser's overlay image, the sync token for its latest content,
++  // whether that is not copied yet, and the UV rect of each eye in it.
++  scoped_refptr<gpu::ClientSharedImage> overlay_shared_image_;
++  gpu::SyncToken overlay_sync_token_;
++  bool overlay_updated_ = false;
++  gfx::RectF overlay_left_;
++  gfx::RectF overlay_right_;
++
++  // The copy of the overlay that DrawOverlay() samples, as `overlay_format_`,
++  // and the SharedImageInterface it was created with.
++  scoped_refptr<gpu::ClientSharedImage> overlay_copy_;
++  scoped_refptr<gpu::SharedImageInterface> overlay_copy_sii_;
++  OpenXrVulkanContext::IntermediateImage overlay_image_;
++  VkFormat overlay_format_ = VK_FORMAT_UNDEFINED;
+ };
+ 
+ }  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+index 94c37ea65d959..cf1a19726887f 100644
+--- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
++++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
+@@ -210,7 +210,7 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, CleanupWithoutSubmitDoesNotCrash) {
+   binding_->CleanupWithoutSubmit();
+ }
+ 
+-TEST_F(OpenXrGraphicsBindingVulkanTest, SetOverlayTextureReturnsTrue) {
++TEST_F(OpenXrGraphicsBindingVulkanTest, SetOverlayTextureRejectsNoTexture) {
+   ASSERT_TRUE(CreateXrInstanceAndSystem());
+   ASSERT_TRUE(InitializeBinding());
+ 
+@@ -219,8 +219,8 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, SetOverlayTextureReturnsTrue) {
+   gfx::RectF left(0, 0, 0.5f, 1.0f);
+   gfx::RectF right(0.5f, 0, 0.5f, 1.0f);
+ 
+-  EXPECT_TRUE(binding_->SetOverlayTexture(std::move(shared_image), sync_token,
+-                                          left, right));
++  EXPECT_FALSE(binding_->SetOverlayTexture(std::move(shared_image), sync_token,
++                                           left, right));
+ }
+ 
+ TEST_F(OpenXrGraphicsBindingVulkanTest, CanCreateSession) {
+diff --git a/device/vr/openxr/linux/openxr_vulkan_context.cc b/device/vr/openxr/linux/openxr_vulkan_context.cc
+index bb6e4ab9a743e..a7b2d52a465df 100644
+--- a/device/vr/openxr/linux/openxr_vulkan_context.cc
++++ b/device/vr/openxr/linux/openxr_vulkan_context.cc
+@@ -8,6 +8,8 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <array>
++#include <iterator>
+ #include <string_view>
+ #include <tuple>
+ #include <vector>
+@@ -30,6 +32,102 @@ namespace device {
+ namespace {
+ // gpu::VulkanFunctionPointers requires Vulkan 1.1 or newer.
+ constexpr uint32_t kVulkanApiVersion = VK_API_VERSION_1_1;
++
++// DrawOverlay()'s shaders, compiled with `glslc -O --target-env=vulkan1.1`.
++//
++// A triangle that covers the viewport, with texture coordinates 0-1 across it:
++//   #version 450
++//   layout(location = 0) out vec2 tc;
++//   void main() {
++//     tc = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++//     gl_Position = vec4(tc * 2.0 - 1.0, 0.0, 1.0);
++//   }
++constexpr uint32_t kOverlayVertexSpirv[] = {
++    0x07230203, 0x00010300, 0x000d000b, 0x0000002c, 0x00000000, 0x00020011,
++    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
++    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
++    0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000c, 0x0000001d,
++    0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000c,
++    0x0000000b, 0x0000002a, 0x00030047, 0x0000001b, 0x00000002, 0x00050048,
++    0x0000001b, 0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000001b,
++    0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000001b, 0x00000002,
++    0x0000000b, 0x00000003, 0x00050048, 0x0000001b, 0x00000003, 0x0000000b,
++    0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
++    0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
++    0x00000002, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b,
++    0x00000008, 0x00000009, 0x00000003, 0x00040015, 0x0000000a, 0x00000020,
++    0x00000001, 0x00040020, 0x0000000b, 0x00000001, 0x0000000a, 0x0004003b,
++    0x0000000b, 0x0000000c, 0x00000001, 0x0004002b, 0x0000000a, 0x0000000e,
++    0x00000001, 0x0004002b, 0x0000000a, 0x00000010, 0x00000002, 0x00040017,
++    0x00000017, 0x00000006, 0x00000004, 0x00040015, 0x00000018, 0x00000020,
++    0x00000000, 0x0004002b, 0x00000018, 0x00000019, 0x00000001, 0x0004001c,
++    0x0000001a, 0x00000006, 0x00000019, 0x0006001e, 0x0000001b, 0x00000017,
++    0x00000006, 0x0000001a, 0x0000001a, 0x00040020, 0x0000001c, 0x00000003,
++    0x0000001b, 0x0004003b, 0x0000001c, 0x0000001d, 0x00000003, 0x0004002b,
++    0x0000000a, 0x0000001e, 0x00000000, 0x0004002b, 0x00000006, 0x00000020,
++    0x40000000, 0x0004002b, 0x00000006, 0x00000022, 0x3f800000, 0x0004002b,
++    0x00000006, 0x00000025, 0x00000000, 0x00040020, 0x00000029, 0x00000003,
++    0x00000017, 0x0005002c, 0x00000007, 0x0000002b, 0x00000022, 0x00000022,
++    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
++    0x00000005, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500c4,
++    0x0000000a, 0x0000000f, 0x0000000d, 0x0000000e, 0x000500c7, 0x0000000a,
++    0x00000011, 0x0000000f, 0x00000010, 0x0004006f, 0x00000006, 0x00000012,
++    0x00000011, 0x000500c7, 0x0000000a, 0x00000014, 0x0000000d, 0x00000010,
++    0x0004006f, 0x00000006, 0x00000015, 0x00000014, 0x00050050, 0x00000007,
++    0x00000016, 0x00000012, 0x00000015, 0x0003003e, 0x00000009, 0x00000016,
++    0x0004003d, 0x00000007, 0x0000001f, 0x00000009, 0x0005008e, 0x00000007,
++    0x00000021, 0x0000001f, 0x00000020, 0x00050083, 0x00000007, 0x00000024,
++    0x00000021, 0x0000002b, 0x00050051, 0x00000006, 0x00000026, 0x00000024,
++    0x00000000, 0x00050051, 0x00000006, 0x00000027, 0x00000024, 0x00000001,
++    0x00070050, 0x00000017, 0x00000028, 0x00000026, 0x00000027, 0x00000025,
++    0x00000022, 0x00050041, 0x00000029, 0x0000002a, 0x0000001d, 0x0000001e,
++    0x0003003e, 0x0000002a, 0x00000028, 0x000100fd, 0x00010038,
++};
++
++// Samples the overlay's `uv_rect` (offset in xy, size in zw):
++//   #version 450
++//   layout(location = 0) in vec2 tc;
++//   layout(location = 0) out vec4 color;
++//   layout(set = 0, binding = 0) uniform sampler2D overlay;
++//   layout(push_constant) uniform PushConstants {
++//     vec4 uv_rect;
++//   } pc;
++//   void main() {
++//     color = texture(overlay, pc.uv_rect.xy + tc * pc.uv_rect.zw);
++//   }
++constexpr uint32_t kOverlayFragmentSpirv[] = {
++    0x07230203, 0x00010300, 0x000d000b, 0x00000022, 0x00000000, 0x00020011,
++    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
++    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
++    0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000001a, 0x00030010,
++    0x00000004, 0x00000007, 0x00040047, 0x00000009, 0x0000001e, 0x00000000,
++    0x00040047, 0x0000000d, 0x00000021, 0x00000000, 0x00040047, 0x0000000d,
++    0x00000022, 0x00000000, 0x00030047, 0x0000000f, 0x00000002, 0x00050048,
++    0x0000000f, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000001a,
++    0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
++    0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
++    0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007,
++    0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00090019, 0x0000000a,
++    0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
++    0x00000000, 0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c,
++    0x00000000, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000,
++    0x0003001e, 0x0000000f, 0x00000007, 0x00040020, 0x00000010, 0x00000009,
++    0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000009, 0x00040015,
++    0x00000012, 0x00000020, 0x00000001, 0x0004002b, 0x00000012, 0x00000013,
++    0x00000000, 0x00040017, 0x00000014, 0x00000006, 0x00000002, 0x00040020,
++    0x00000015, 0x00000009, 0x00000007, 0x00040020, 0x00000019, 0x00000001,
++    0x00000014, 0x0004003b, 0x00000019, 0x0000001a, 0x00000001, 0x00050036,
++    0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
++    0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x00050041, 0x00000015,
++    0x00000016, 0x00000011, 0x00000013, 0x0004003d, 0x00000007, 0x00000017,
++    0x00000016, 0x0007004f, 0x00000014, 0x00000018, 0x00000017, 0x00000017,
++    0x00000000, 0x00000001, 0x0004003d, 0x00000014, 0x0000001b, 0x0000001a,
++    0x0007004f, 0x00000014, 0x0000001e, 0x00000017, 0x00000017, 0x00000002,
++    0x00000003, 0x00050085, 0x00000014, 0x0000001f, 0x0000001b, 0x0000001e,
++    0x00050081, 0x00000014, 0x00000020, 0x00000018, 0x0000001f, 0x00050057,
++    0x00000007, 0x00000021, 0x0000000e, 0x00000020, 0x0003003e, 0x00000009,
++    0x00000021, 0x000100fd, 0x00010038,
++};
+ }  // namespace
+ 
+ OpenXrVulkanContext::OpenXrVulkanContext() = default;
+@@ -54,6 +152,7 @@ void OpenXrVulkanContext::DestroyCommandPool() {
+ }
+ 
+ void OpenXrVulkanContext::DestroyVulkanState() {
++  DestroyOverlayPipeline();
+   DestroyCommandPool();
+   vk_queue_ = VK_NULL_HANDLE;  // Queue lifetime is tied to VkDevice.
+   if (vk_device_ != VK_NULL_HANDLE) {
+@@ -831,4 +930,374 @@ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
+   return true;
+ }
+ 
++bool OpenXrVulkanContext::EnsureOverlayPipeline(VkFormat format) {
++  if (overlay_pipeline_ != VK_NULL_HANDLE && overlay_target_format_ == format) {
++    return true;
++  }
++  DestroyOverlayPipeline();
++
++  // Both passes keep the target in COLOR_ATTACHMENT_OPTIMAL, the layout
++  // xrReleaseSwapchainImage expects.
++  VkAttachmentDescription attachment{};
++  attachment.format = format;
++  attachment.samples = VK_SAMPLE_COUNT_1_BIT;
++  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++  attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++  attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++  attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++  VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
++  VkSubpassDescription subpass{};
++  subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++  subpass.colorAttachmentCount = 1;
++  subpass.pColorAttachments = &color_ref;
++  VkRenderPassCreateInfo pass_ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
++  pass_ci.attachmentCount = 1;
++  pass_ci.pAttachments = &attachment;
++  pass_ci.subpassCount = 1;
++  pass_ci.pSubpasses = &subpass;
++  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++  attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++  if (vkCreateRenderPass(vk_device_, &pass_ci, nullptr, &overlay_load_pass_) !=
++      VK_SUCCESS) {
++    return false;
++  }
++  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++  attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  if (vkCreateRenderPass(vk_device_, &pass_ci, nullptr, &overlay_clear_pass_) !=
++      VK_SUCCESS) {
++    return false;
++  }
++
++  VkSamplerCreateInfo sampler_ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++  sampler_ci.magFilter = VK_FILTER_LINEAR;
++  sampler_ci.minFilter = VK_FILTER_LINEAR;
++  sampler_ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++  sampler_ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++  sampler_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++  if (vkCreateSampler(vk_device_, &sampler_ci, nullptr, &overlay_sampler_) !=
++      VK_SUCCESS) {
++    return false;
++  }
++
++  VkDescriptorSetLayoutBinding binding{};
++  binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++  binding.descriptorCount = 1;
++  binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++  VkDescriptorSetLayoutCreateInfo set_layout_ci{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++  set_layout_ci.bindingCount = 1;
++  set_layout_ci.pBindings = &binding;
++  if (vkCreateDescriptorSetLayout(vk_device_, &set_layout_ci, nullptr,
++                                  &overlay_set_layout_) != VK_SUCCESS) {
++    return false;
++  }
++  VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
++  VkDescriptorPoolCreateInfo pool_ci{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++  pool_ci.maxSets = 1;
++  pool_ci.poolSizeCount = 1;
++  pool_ci.pPoolSizes = &pool_size;
++  if (vkCreateDescriptorPool(vk_device_, &pool_ci, nullptr,
++                             &overlay_descriptor_pool_) != VK_SUCCESS) {
++    return false;
++  }
++  VkDescriptorSetAllocateInfo set_ai{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++  set_ai.descriptorPool = overlay_descriptor_pool_;
++  set_ai.descriptorSetCount = 1;
++  set_ai.pSetLayouts = &overlay_set_layout_;
++  if (vkAllocateDescriptorSets(vk_device_, &set_ai, &overlay_descriptor_set_) !=
++      VK_SUCCESS) {
++    return false;
++  }
++
++  VkPushConstantRange push_range{VK_SHADER_STAGE_FRAGMENT_BIT, 0,
++                                 4 * sizeof(float)};
++  VkPipelineLayoutCreateInfo layout_ci{
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++  layout_ci.setLayoutCount = 1;
++  layout_ci.pSetLayouts = &overlay_set_layout_;
++  layout_ci.pushConstantRangeCount = 1;
++  layout_ci.pPushConstantRanges = &push_range;
++  if (vkCreatePipelineLayout(vk_device_, &layout_ci, nullptr,
++                             &overlay_pipeline_layout_) != VK_SUCCESS) {
++    return false;
++  }
++
++  auto create_stage = [this](VkShaderStageFlagBits stage,
++                             base::span<const uint32_t> spirv) {
++    VkShaderModuleCreateInfo module_ci{
++        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++    module_ci.codeSize = spirv.size_bytes();
++    module_ci.pCode = spirv.data();
++    VkPipelineShaderStageCreateInfo stage_ci{
++        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++    stage_ci.stage = stage;
++    stage_ci.pName = "main";
++    if (vkCreateShaderModule(vk_device_, &module_ci, nullptr,
++                             &stage_ci.module) != VK_SUCCESS) {
++      stage_ci.module = VK_NULL_HANDLE;
++    }
++    return stage_ci;
++  };
++  const std::array<VkPipelineShaderStageCreateInfo, 2> stages = {
++      create_stage(VK_SHADER_STAGE_VERTEX_BIT, kOverlayVertexSpirv),
++      create_stage(VK_SHADER_STAGE_FRAGMENT_BIT, kOverlayFragmentSpirv)};
++
++  VkPipelineVertexInputStateCreateInfo vertex_input{
++      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++  VkPipelineInputAssemblyStateCreateInfo input_assembly{
++      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++  input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++  VkPipelineViewportStateCreateInfo viewport_state{
++      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++  viewport_state.viewportCount = 1;
++  viewport_state.scissorCount = 1;
++  VkPipelineRasterizationStateCreateInfo rasterization{
++      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++  rasterization.polygonMode = VK_POLYGON_MODE_FILL;
++  rasterization.cullMode = VK_CULL_MODE_NONE;
++  rasterization.lineWidth = 1.0f;
++  VkPipelineMultisampleStateCreateInfo multisample{
++      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++  // The browser draws the overlay with premultiplied alpha.
++  VkPipelineColorBlendAttachmentState blend{};
++  blend.blendEnable = VK_TRUE;
++  blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
++  blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++  blend.colorBlendOp = VK_BLEND_OP_ADD;
++  blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++  blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++  blend.alphaBlendOp = VK_BLEND_OP_ADD;
++  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++  VkPipelineColorBlendStateCreateInfo color_blend{
++      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++  color_blend.attachmentCount = 1;
++  color_blend.pAttachments = &blend;
++  const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
++                                           VK_DYNAMIC_STATE_SCISSOR};
++  VkPipelineDynamicStateCreateInfo dynamic_state{
++      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++  dynamic_state.dynamicStateCount = std::size(dynamic_states);
++  dynamic_state.pDynamicStates = dynamic_states;
++
++  VkGraphicsPipelineCreateInfo pipeline_ci{
++      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++  pipeline_ci.stageCount = stages.size();
++  pipeline_ci.pStages = stages.data();
++  pipeline_ci.pVertexInputState = &vertex_input;
++  pipeline_ci.pInputAssemblyState = &input_assembly;
++  pipeline_ci.pViewportState = &viewport_state;
++  pipeline_ci.pRasterizationState = &rasterization;
++  pipeline_ci.pMultisampleState = &multisample;
++  pipeline_ci.pColorBlendState = &color_blend;
++  pipeline_ci.pDynamicState = &dynamic_state;
++  pipeline_ci.layout = overlay_pipeline_layout_;
++  // The clear pass is compatible with this one, so it can use the pipeline.
++  pipeline_ci.renderPass = overlay_load_pass_;
++  VkResult result = VK_ERROR_INITIALIZATION_FAILED;
++  if (stages[0].module != VK_NULL_HANDLE &&
++      stages[1].module != VK_NULL_HANDLE) {
++    result =
++        vkCreateGraphicsPipelines(vk_device_, VK_NULL_HANDLE, 1, &pipeline_ci,
++                                  nullptr, &overlay_pipeline_);
++  }
++  for (const VkPipelineShaderStageCreateInfo& stage : stages) {
++    vkDestroyShaderModule(vk_device_, stage.module, nullptr);
++  }
++  if (result != VK_SUCCESS) {
++    overlay_pipeline_ = VK_NULL_HANDLE;
++    return false;
++  }
++  overlay_target_format_ = format;
++  return true;
++}
++
++void OpenXrVulkanContext::DestroyOverlayPipeline() {
++  if (vk_device_ != VK_NULL_HANDLE) {
++    // The set is freed with its pool.
++    vkDestroyPipeline(vk_device_, overlay_pipeline_, nullptr);
++    vkDestroyPipelineLayout(vk_device_, overlay_pipeline_layout_, nullptr);
++    vkDestroyDescriptorPool(vk_device_, overlay_descriptor_pool_, nullptr);
++    vkDestroyDescriptorSetLayout(vk_device_, overlay_set_layout_, nullptr);
++    vkDestroySampler(vk_device_, overlay_sampler_, nullptr);
++    vkDestroyRenderPass(vk_device_, overlay_clear_pass_, nullptr);
++    vkDestroyRenderPass(vk_device_, overlay_load_pass_, nullptr);
++  }
++  overlay_target_format_ = VK_FORMAT_UNDEFINED;
++  overlay_pipeline_ = VK_NULL_HANDLE;
++  overlay_pipeline_layout_ = VK_NULL_HANDLE;
++  overlay_descriptor_set_ = VK_NULL_HANDLE;
++  overlay_descriptor_pool_ = VK_NULL_HANDLE;
++  overlay_set_layout_ = VK_NULL_HANDLE;
++  overlay_sampler_ = VK_NULL_HANDLE;
++  overlay_clear_pass_ = VK_NULL_HANDLE;
++  overlay_load_pass_ = VK_NULL_HANDLE;
++}
++
++bool OpenXrVulkanContext::DrawOverlay(VkImage dst,
++                                      VkFormat dst_format,
++                                      const gfx::Size& dst_size,
++                                      std::optional<float> clear_alpha,
++                                      IntermediateImage& overlay,
++                                      VkFormat overlay_format,
++                                      base::span<const OverlayDraw> draws) {
++  if (!EnsureOverlayPipeline(dst_format)) {
++    DLOG(ERROR) << __func__ << ": cannot create the overlay pipeline";
++    return false;
++  }
++
++  // The views and the framebuffer only live for this call, which waits for
++  // the GPU to finish with them.
++  VkImageViewCreateInfo view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++  view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
++  view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  view_ci.image = dst;
++  view_ci.format = dst_format;
++  VkImageView dst_view = VK_NULL_HANDLE;
++  if (vkCreateImageView(vk_device_, &view_ci, nullptr, &dst_view) !=
++      VK_SUCCESS) {
++    return false;
++  }
++  VkImageView overlay_view = VK_NULL_HANDLE;
++  if (!draws.empty()) {
++    view_ci.image = overlay.image;
++    view_ci.format = overlay_format;
++    if (vkCreateImageView(vk_device_, &view_ci, nullptr, &overlay_view) !=
++        VK_SUCCESS) {
++      vkDestroyImageView(vk_device_, dst_view, nullptr);
++      return false;
++    }
++    VkDescriptorImageInfo image_info{overlay_sampler_, overlay_view,
++                                     VK_IMAGE_LAYOUT_GENERAL};
++    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++    write.dstSet = overlay_descriptor_set_;
++    write.descriptorCount = 1;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    write.pImageInfo = &image_info;
++    vkUpdateDescriptorSets(vk_device_, 1, &write, 0, nullptr);
++  }
++  VkRenderPass pass = clear_alpha ? overlay_clear_pass_ : overlay_load_pass_;
++  VkFramebufferCreateInfo framebuffer_ci{
++      VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
++  framebuffer_ci.renderPass = pass;
++  framebuffer_ci.attachmentCount = 1;
++  framebuffer_ci.pAttachments = &dst_view;
++  framebuffer_ci.width = static_cast<uint32_t>(dst_size.width());
++  framebuffer_ci.height = static_cast<uint32_t>(dst_size.height());
++  framebuffer_ci.layers = 1;
++  VkFramebuffer framebuffer = VK_NULL_HANDLE;
++  bool success = vkCreateFramebuffer(vk_device_, &framebuffer_ci, nullptr,
++                                     &framebuffer) == VK_SUCCESS;
++
++  VkCommandBufferBeginInfo begin_info{
++      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++  success = success &&
++            vkResetCommandBuffer(vk_command_buffer_, 0) == VK_SUCCESS &&
++            vkBeginCommandBuffer(vk_command_buffer_, &begin_info) == VK_SUCCESS;
++  if (success) {
++    std::vector<VkImageMemoryBarrier> barriers;
++    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    if (!draws.empty() && overlay.current_layout != VK_IMAGE_LAYOUT_GENERAL) {
++      // First use; later frames keep GENERAL, which the GPU process's writes
++      // through the DMA-BUF leave untouched.
++      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++      barrier.oldLayout = overlay.current_layout;
++      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++      barrier.image = overlay.image;
++      barriers.push_back(barrier);
++    }
++    if (!clear_alpha) {
++      // Draw over what CopyToSwapchainImage() wrote.
++      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++      barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.image = dst;
++      barriers.push_back(barrier);
++    }
++    if (!barriers.empty()) {
++      vkCmdPipelineBarrier(
++          vk_command_buffer_,
++          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++          0, 0, nullptr, 0, nullptr, barriers.size(), barriers.data());
++    }
++
++    VkClearValue clear_value{};
++    clear_value.color = {{0.f, 0.f, 0.f, clear_alpha.value_or(0.f)}};
++    VkRenderPassBeginInfo pass_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++    pass_begin.renderPass = pass;
++    pass_begin.framebuffer = framebuffer;
++    pass_begin.renderArea.extent = {framebuffer_ci.width,
++                                    framebuffer_ci.height};
++    pass_begin.clearValueCount = 1;
++    pass_begin.pClearValues = &clear_value;
++    vkCmdBeginRenderPass(vk_command_buffer_, &pass_begin,
++                         VK_SUBPASS_CONTENTS_INLINE);
++    if (!draws.empty()) {
++      vkCmdBindPipeline(vk_command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                        overlay_pipeline_);
++      vkCmdBindDescriptorSets(
++          vk_command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
++          overlay_pipeline_layout_, 0, 1, &overlay_descriptor_set_, 0, nullptr);
++    }
++    const gfx::Rect target_rect(dst_size);
++    for (const OverlayDraw& draw : draws) {
++      const gfx::Rect scissor = gfx::IntersectRects(draw.rect, target_rect);
++      if (scissor.IsEmpty()) {
++        continue;
++      }
++      VkViewport viewport{static_cast<float>(draw.rect.x()),
++                          static_cast<float>(draw.rect.y()),
++                          static_cast<float>(draw.rect.width()),
++                          static_cast<float>(draw.rect.height()),
++                          0.0f,
++                          1.0f};
++      vkCmdSetViewport(vk_command_buffer_, 0, 1, &viewport);
++      VkRect2D vk_scissor{{scissor.x(), scissor.y()},
++                          {static_cast<uint32_t>(scissor.width()),
++                           static_cast<uint32_t>(scissor.height())}};
++      vkCmdSetScissor(vk_command_buffer_, 0, 1, &vk_scissor);
++      const float uv_rect[] = {
++          draw.uv.x(), draw.flip_y ? draw.uv.bottom() : draw.uv.y(),
++          draw.uv.width(), draw.flip_y ? -draw.uv.height() : draw.uv.height()};
++      vkCmdPushConstants(vk_command_buffer_, overlay_pipeline_layout_,
++                         VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uv_rect),
++                         uv_rect);
++      vkCmdDraw(vk_command_buffer_, 3, 1, 0, 0);
++    }
++    vkCmdEndRenderPass(vk_command_buffer_);
++    success = vkEndCommandBuffer(vk_command_buffer_) == VK_SUCCESS;
++  }
++
++  if (success) {
++    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    submit.commandBufferCount = 1;
++    submit.pCommandBuffers = &vk_command_buffer_;
++    vkResetFences(vk_device_, 1, &vk_frame_fence_);
++    success =
++        vkQueueSubmit(vk_queue_, 1, &submit, vk_frame_fence_) == VK_SUCCESS;
++    if (success) {
++      vkWaitForFences(vk_device_, 1, &vk_frame_fence_, VK_TRUE, UINT64_MAX);
++      if (!draws.empty()) {
++        overlay.current_layout = VK_IMAGE_LAYOUT_GENERAL;
++      }
++    }
++  }
++
++  vkDestroyFramebuffer(vk_device_, framebuffer, nullptr);
++  vkDestroyImageView(vk_device_, overlay_view, nullptr);
++  vkDestroyImageView(vk_device_, dst_view, nullptr);
++  return success;
++}
++
+ }  // namespace device
+diff --git a/device/vr/openxr/linux/openxr_vulkan_context.h b/device/vr/openxr/linux/openxr_vulkan_context.h
+index f07e64eb200e8..aa41e1faff5e0 100644
+--- a/device/vr/openxr/linux/openxr_vulkan_context.h
++++ b/device/vr/openxr/linux/openxr_vulkan_context.h
+@@ -5,11 +5,16 @@
+ #ifndef DEVICE_VR_OPENXR_LINUX_OPENXR_VULKAN_CONTEXT_H_
+ #define DEVICE_VR_OPENXR_LINUX_OPENXR_VULKAN_CONTEXT_H_
+ 
++#include <optional>
++
++#include "base/containers/span.h"
+ #include "base/files/scoped_file.h"
+ #include "base/scoped_native_library.h"
+ #include "device/vr/openxr/openxr_platform.h"
+ #include "device/vr/vr_export.h"
+ #include "third_party/openxr/src/include/openxr/openxr.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ namespace gfx {
+@@ -39,6 +44,14 @@ class DEVICE_VR_EXPORT OpenXrVulkanContext {
+     base::ScopedFD dma_buf_fd;
+   };
+ 
++  // Draws the `uv` rect of the browser overlay into `rect` of the target,
++  // upside down with `flip_y`.
++  struct OverlayDraw {
++    gfx::Rect rect;
++    gfx::RectF uv;
++    bool flip_y = false;
++  };
++
+   OpenXrVulkanContext();
+ 
+   OpenXrVulkanContext(const OpenXrVulkanContext&) = delete;
+@@ -106,7 +119,24 @@ class DEVICE_VR_EXPORT OpenXrVulkanContext {
+                             const gfx::Size& size,
+                             bool flip_y);
+ 
++  // Blends `overlay` (premultiplied alpha, an image with SAMPLED usage in
++  // `overlay_format`) into the swapchain image `dst` once per entry of `draws`,
++  // and waits for it. With `clear_alpha`, dst is first cleared to black of that
++  // alpha; otherwise it must hold content in COLOR_ATTACHMENT_OPTIMAL, as
++  // CopyToSwapchainImage() leaves it. dst ends in COLOR_ATTACHMENT_OPTIMAL.
++  bool DrawOverlay(VkImage dst,
++                   VkFormat dst_format,
++                   const gfx::Size& dst_size,
++                   std::optional<float> clear_alpha,
++                   IntermediateImage& overlay,
++                   VkFormat overlay_format,
++                   base::span<const OverlayDraw> draws);
++
+  private:
++  // Creates the objects DrawOverlay() needs to draw into `format` images.
++  bool EnsureOverlayPipeline(VkFormat format);
++  void DestroyOverlayPipeline();
++
+   // Cleans up the command pool and command buffer.
+   void DestroyCommandPool();
+ 
+@@ -143,6 +173,18 @@ class DEVICE_VR_EXPORT OpenXrVulkanContext {
+   // vkQueueWaitIdle, scoping the CPU stall to the specific submit.
+   VkFence vk_frame_fence_ = VK_NULL_HANDLE;
+ 
++  // DrawOverlay() state, for targets of `overlay_target_format_`. The two
++  // render passes only differ in whether they keep or clear the target.
++  VkFormat overlay_target_format_ = VK_FORMAT_UNDEFINED;
++  VkRenderPass overlay_load_pass_ = VK_NULL_HANDLE;
++  VkRenderPass overlay_clear_pass_ = VK_NULL_HANDLE;
++  VkSampler overlay_sampler_ = VK_NULL_HANDLE;
++  VkDescriptorSetLayout overlay_set_layout_ = VK_NULL_HANDLE;
++  VkDescriptorPool overlay_descriptor_pool_ = VK_NULL_HANDLE;
++  VkDescriptorSet overlay_descriptor_set_ = VK_NULL_HANDLE;
++  VkPipelineLayout overlay_pipeline_layout_ = VK_NULL_HANDLE;
++  VkPipeline overlay_pipeline_ = VK_NULL_HANDLE;
++
+   // Maximum texture dimensions queried from VkPhysicalDeviceLimits.
+   // Defaults to 4096 until Initialize() queries the real value.
+   gfx::Size max_texture_size_{4096, 4096};
+diff --git a/device/vr/openxr/openxr_device.cc b/device/vr/openxr/openxr_device.cc
+index 3740459ebc8bf..16bcd06f3865a 100644
+--- a/device/vr/openxr/openxr_device.cc
++++ b/device/vr/openxr/openxr_device.cc
+@@ -232,11 +232,7 @@ void OpenXrDevice::OnRequestSessionResult(
+   session_result->session = std::move(session);
+   session_result->controller =
+       exclusive_controller_receiver_.BindNewPipeAndPassRemote();
+-#if !BUILDFLAG(IS_LINUX)
+-  // The in-headset overlay UI is not implemented on Linux; leaving the overlay
+-  // unset tells the browser to skip the VrUiHost.
+   session_result->overlay = std::move(overlay);
+-#endif
+ 
+   std::move(request_session_callback_).Run(std::move(session_result));
+ 
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index e099ae63e82d4..0d060214a658c 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -777,6 +777,13 @@ void OpenXrRenderLoop::SendFrameData(
+       empty_frame_data->render_info->frame_id =
+           frame_data->render_info->frame_id;
+     }
++    // Keep the frame's shared images too: Blink expects them in every frame
++    // with an id, which a frame started before WebXR was hidden has.
++    empty_frame_data->buffer_shared_image =
++        std::move(frame_data->buffer_shared_image);
++    empty_frame_data->buffer_sync_token = frame_data->buffer_sync_token;
++    empty_frame_data->composition_layers_data =
++        std::move(frame_data->composition_layers_data);
+     std::move(callback).Run(std::move(empty_frame_data));
+   }
+ 
