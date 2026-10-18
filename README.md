@@ -372,6 +372,67 @@ profile chrome-webxr-dev /path/to/src/out/Default/chrome flags=(unconfined) {
 Load it with `sudo apparmor_parser -r /etc/apparmor.d/chrome-webxr-dev`, then run
 without `--no-sandbox`.
 
+## Run upstream Chromium (no patches)
+
+Upstream Chromium runs WebXR over OpenXR on Linux from M157 (beta now, stable
+on 2026-11-03), with `--enable-features=OpenXR`. It has the backend, the
+sandbox and the frame synchronization, but not the features of the patches
+here: no WebXR Layers, frame rate, WebGPU or in-headset overlay.
+
+Verified with the Chromium snapshot r1721517 (158.0.8111.0) against Monado.
+Google Chrome builds were not tested.
+
+1. Get a Chromium snapshot built from main:
+
+   ```bash
+   rev=$(curl -s https://commondatastorage.googleapis.com/chromium-browser-snapshots/Linux_x64/LAST_CHANGE)
+   curl -LO "https://commondatastorage.googleapis.com/chromium-browser-snapshots/Linux_x64/$rev/chrome-linux.zip"
+   unzip chrome-linux.zip
+   ```
+
+2. Let it use Chromium's sandbox. On Ubuntu 23.10 and newer, a downloaded
+   Chromium stops with *No usable sandbox!* because AppArmor blocks
+   unprivileged user namespaces for binaries without a profile. Give it one,
+   with the path where you unpacked it:
+
+   ```bash
+   sudo tee /etc/apparmor.d/chromium-snapshot <<'EOF'
+   abi <abi/4.0>,
+   include <tunables/global>
+   profile chromium-snapshot /path/to/chrome-linux/chrome flags=(unconfined) {
+     userns,
+     include if exists <local/chromium-snapshot>
+   }
+   EOF
+   sudo apparmor_parser -r /etc/apparmor.d/chromium-snapshot
+   ```
+
+   `--no-sandbox` also gets past this, but it turns off every sandbox,
+   including the OpenXR service's own; use it only for a quick check.
+
+3. Start the OpenXR runtime (see [Build and run Monado](#1-build-and-run-monado)).
+   Then start Chromium with OpenXR enabled:
+
+   ```bash
+   XR_RUNTIME_JSON=/path/to/monado/build/openxr_monado-dev.json \
+   ./chrome-linux/chrome \
+     --enable-features=OpenXR \
+     --user-data-dir=/tmp/chromium-xr-profile \
+     https://immersive-web.github.io/webxr-samples/immersive-vr-session.html
+   ```
+
+   - Without `XR_RUNTIME_JSON`, the OpenXR loader uses the system's active
+     runtime (`~/.config/openxr/1/active_runtime.json`, then
+     `/etc/xdg/openxr/1/active_runtime.json`), which an installed Monado or
+     SteamVR sets.
+   - Add `--use-angle=vulkan` for the GPU-fence path; see
+     [Frame synchronization](#frame-synchronization).
+   - Add `--enable-logging=stderr --vmodule='*openxr*=1'` to see the OpenXR
+     log; see [Troubleshooting](#troubleshooting).
+
+The sample's **Enter VR** button is enabled once Chromium has found the runtime,
+which takes up to 5 s.
+
 ## Build and run
 
 ### Base commits
