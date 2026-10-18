@@ -1,0 +1,44 @@
+From 674281624db379fefab532b875097f2d7b57a94a Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Wed, 15 Jul 2026 22:43:41 +0800
+Subject: [PATCH 08/10] vr: fix OpenXR session-child use-after-free on teardown
+
+Per the OpenXR spec, child handles are implicitly destroyed when their
+parent XrSession is destroyed, and using a handle afterwards is
+undefined behavior. Uninitialize() destroyed the session first and only
+then ran the destructors that own session-child handles (the input
+helper's controller action spaces and hand trackers, the
+scene-understanding manager's anchor spaces, and the depth sensor, light
+estimator, and mesh manager), so their xrDestroy* calls ran on
+already-destroyed handles. Runtimes may return XR_ERROR_HANDLE_INVALID,
+but are not required to, and some fault instead: without this change one
+runtime crashes the XR utility process on every enter/exit cycle. Reset
+those owners before xrDestroySession(), while the session is still
+valid.
+---
+ device/vr/openxr/openxr_api_wrapper.cc | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index 7fdd2f6aa1312..c3fb5ba0ba2bf 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -236,6 +236,18 @@ XrResult OpenXrApiWrapper::ShutdownSession() {
+ void OpenXrApiWrapper::Uninitialize() {
+   // The instance is owned by the OpenXRDevice, so don't destroy it here.
+ 
++  // Child handles are implicitly destroyed with their parent XrSession, and
++  // destroying them afterwards is undefined behavior (runtimes may return
++  // XR_ERROR_HANDLE_INVALID or fault). Tear down everything that owns a
++  // session-parented handle here, while the session is still valid, instead
++  // of letting these destructors run after xrDestroySession(). Reset() below
++  // re-clears them as a no-op.
++  input_helper_.reset();
++  depth_sensor_.reset();
++  light_estimator_.reset();
++  scene_understanding_manager_.reset();
++  mesh_manager_.reset();
++
+   // Destroying an session in OpenXr also destroys all child objects of that
+   // instance (including the swapchain, and spaces objects),
+   // so they don't need to be manually destroyed.

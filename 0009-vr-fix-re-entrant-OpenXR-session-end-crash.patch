@@ -1,0 +1,97 @@
+From 626692b82b51dbd4a30dc38e67f768e05020f406 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Wed, 15 Jul 2026 22:44:44 +0800
+Subject: [PATCH 09/10] vr: fix re-entrant OpenXR session-end crash
+
+GetNextFrameData() can synchronously end the session: when the OpenXR
+runtime reports no locatable views for kMaxInvalidViewFrames (e.g. an
+HMD that is present but never starts tracking), the api wrapper calls
+ShutdownSession() -> ExitPresent(), which resets pending_frame_.
+StartPendingFrame() and its callers (GetFrameData,
+RequestNextOverlayPose) then dereferenced the now-disengaged optional,
+aborting the browser on the hardened libc++ optional::operator->.
+
+Make StartPendingFrame() return false when the session ends while it is
+starting the frame, and have the callers bail with
+if (!StartPendingFrame()) { return; } instead of inspecting
+pending_frame_ themselves.
+---
+ device/vr/openxr/openxr_render_loop.cc | 26 +++++++++++++++++++++-----
+ device/vr/openxr/openxr_render_loop.h  |  4 +++-
+ 2 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index 7d2aea48daaac..13b35b51163e5 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -197,7 +197,9 @@ void OpenXrRenderLoop::GetFrameData(
+     // Function should no-op if no change is needed.
+     depth->SetDepthActive(options->depth_active);
+   }
+-  StartPendingFrame();
++  if (!StartPendingFrame()) {
++    return;
++  }
+   webxr_has_pose_ = true;
+   pending_frame_->webxr_has_pose_ = true;
+   pending_frame_->sent_frame_data_time_ = base::TimeTicks::Now();
+@@ -332,17 +334,27 @@ void OpenXrRenderLoop::ClearPendingFrame() {
+   }
+ }
+ 
+-void OpenXrRenderLoop::StartPendingFrame() {
++bool OpenXrRenderLoop::StartPendingFrame() {
+   DVLOG(3) << __func__ << " pending_frame_=" << pending_frame_.has_value();
+   if (!pending_frame_) {
+     pending_frame_.emplace();
+     pending_frame_->waiting_for_webxr_ = webxr_visible_;
+     pending_frame_->waiting_for_overlay_ = overlay_visible_;
+-    pending_frame_->frame_data_ = GetNextFrameData();
++    // GetNextFrameData() can synchronously end the session (e.g. no locatable
++    // views for kMaxInvalidViewFrames), which calls ExitPresent() and resets
++    // `pending_frame_`. Compute into a local and report failure if that
++    // happened, so callers stop instead of dereferencing a disengaged optional.
++    mojom::XRFrameDataPtr next_frame_data = GetNextFrameData();
++    if (!pending_frame_) {
++      DVLOG(1) << __func__ << ": session ended during GetNextFrameData()";
++      return false;
++    }
++    pending_frame_->frame_data_ = std::move(next_frame_data);
+     // GetNextFrameData() should never return null:
+     DCHECK(pending_frame_->frame_data_);
+     pending_frame_->render_info_ = GetRenderInfo(*pending_frame_->frame_data_);
+   }
++  return true;
+ }
+ 
+ void OpenXrRenderLoop::StartRuntimeFinish(
+@@ -672,8 +684,12 @@ void OpenXrRenderLoop::RequestNextOverlayPose(
+   TRACE_EVENT_INSTANT0("xr", "OpenXrRenderLoop::RequestOverlayPose",
+                        TRACE_EVENT_SCOPE_THREAD);
+ 
+-  // Ensure we have a pending frame.
+-  StartPendingFrame();
++  // Ensure we have a pending frame; bail if the session ended while starting
++  // it. ExitPresent() has already reset the overlay receiver, so dropping this
++  // callback during teardown is safe.
++  if (!StartPendingFrame()) {
++    return;
++  }
+   pending_frame_->overlay_has_pose_ = true;
+ 
+ #if BUILDFLAG(IS_LINUX)
+diff --git a/device/vr/openxr/openxr_render_loop.h b/device/vr/openxr/openxr_render_loop.h
+index c656981c9ea7e..570bb4c56fe15 100644
+--- a/device/vr/openxr/openxr_render_loop.h
++++ b/device/vr/openxr/openxr_render_loop.h
+@@ -118,7 +118,9 @@ class OpenXrRenderLoop : public XRThread,
+   void CleanUp() override;
+ 
+   void ClearPendingFrame();
+-  void StartPendingFrame();
++  // Returns false if the session ended synchronously while starting the frame
++  // (see the .cc); callers should bail without touching `pending_frame_`.
++  bool StartPendingFrame();
+ 
+   void StartRuntimeFinish(
+       base::RepeatingCallback<void(mojom::XRVisibilityState)>

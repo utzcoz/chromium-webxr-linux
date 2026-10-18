@@ -1,4 +1,4 @@
-From 399512cef49efc5312ffd4fef4e5dea47d3423e5 Mon Sep 17 00:00:00 2001
+From ef4bfed68834af9c3d375ad19a306a86d0a7ad69 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Mon, 13 Jul 2026 00:10:32 +0800
 Subject: [PATCH 10/10] vr: allocate the WebXR shared buffer via Ozone/GBM
@@ -514,6 +514,3 @@ index 2d567f27b7a23..1606d546ffeef 100644
    // Destroys all intermediate images and frees their Vulkan memory.
    void DestroyIntermediateImages();
  
--- 
-2.53.0
-
