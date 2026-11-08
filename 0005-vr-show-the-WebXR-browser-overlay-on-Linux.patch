@@ -1,7 +1,7 @@
-From 4981c712f43d53eed3a5f386001e84f79ceae113 Mon Sep 17 00:00:00 2001
+From c0ee6aec614bccf60a3a02c1a56f95d2f32819f9 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 18 Oct 2026 20:35:14 +0800
-Subject: [PATCH 6/7] vr: show the WebXR browser overlay on Linux
+Subject: [PATCH 5/7] vr: show the WebXR browser overlay on Linux
 
 The in-headset browser overlay (permission prompts and capture
 indicators) was turned off on Linux: OpenXrDevice dropped the
@@ -37,16 +37,15 @@ Change-Id: Id815250e4c1b40132e9fb4e0fa43c42df7db571f
  .../vr/openxr/linux/openxr_vulkan_context.cc  | 469 ++++++++++++++++++
  .../vr/openxr/linux/openxr_vulkan_context.h   |  42 ++
  device/vr/openxr/openxr_device.cc             |   4 -
- device/vr/openxr/openxr_render_loop.cc        |   7 +
- 11 files changed, 956 insertions(+), 11 deletions(-)
+ 10 files changed, 949 insertions(+), 11 deletions(-)
  create mode 100644 chrome/browser/vr/graphics_delegate_linux.cc
  create mode 100644 chrome/browser/vr/graphics_delegate_linux.h
 
 diff --git a/chrome/browser/vr/BUILD.gn b/chrome/browser/vr/BUILD.gn
-index 10be38661ad0d..23672467a3d47 100644
+index 99256a7c0c2fd..e8ba491360e07 100644
 --- a/chrome/browser/vr/BUILD.gn
 +++ b/chrome/browser/vr/BUILD.gn
-@@ -282,6 +282,15 @@ if (enable_vr) {
+@@ -292,6 +292,15 @@ if (enable_vr) {
        deps += [ "//services/viz/public/cpp/gpu" ]
      }
  
@@ -63,7 +62,7 @@ index 10be38661ad0d..23672467a3d47 100644
        sources += [
          "graphics_delegate_android.cc",
 diff --git a/chrome/browser/vr/graphics_delegate.cc b/chrome/browser/vr/graphics_delegate.cc
-index 53d63485a0772..29fea1de373c4 100644
+index 9fbc8271e0eed..b326cd6550c84 100644
 --- a/chrome/browser/vr/graphics_delegate.cc
 +++ b/chrome/browser/vr/graphics_delegate.cc
 @@ -26,6 +26,8 @@
@@ -342,7 +341,7 @@ index 0000000000000..326a9bc6cb678
 +
 +#endif  // CHROME_BROWSER_VR_GRAPHICS_DELEGATE_LINUX_H_
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
-index a3d93e95b8ae8..68394a09752bd 100644
+index 8bb6d227a625c..a0565f45032a5 100644
 --- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 @@ -13,18 +13,22 @@
@@ -621,10 +620,10 @@ index 8b508071443bc..bda9793891d23 100644
  
  }  // namespace device
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
-index 94c37ea65d959..cf1a19726887f 100644
+index 8093b026591a1..d75bace7bc961 100644
 --- a/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan_unittest.cc
-@@ -210,7 +210,7 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, CleanupWithoutSubmitDoesNotCrash) {
+@@ -241,7 +241,7 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, CleanupWithoutSubmitDoesNotCrash) {
    binding_->CleanupWithoutSubmit();
  }
  
@@ -633,7 +632,7 @@ index 94c37ea65d959..cf1a19726887f 100644
    ASSERT_TRUE(CreateXrInstanceAndSystem());
    ASSERT_TRUE(InitializeBinding());
  
-@@ -219,8 +219,8 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, SetOverlayTextureReturnsTrue) {
+@@ -250,8 +250,8 @@ TEST_F(OpenXrGraphicsBindingVulkanTest, SetOverlayTextureReturnsTrue) {
    gfx::RectF left(0, 0, 0.5f, 1.0f);
    gfx::RectF right(0.5f, 0, 0.5f, 1.0f);
  
@@ -645,7 +644,7 @@ index 94c37ea65d959..cf1a19726887f 100644
  
  TEST_F(OpenXrGraphicsBindingVulkanTest, CanCreateSession) {
 diff --git a/device/vr/openxr/linux/openxr_vulkan_context.cc b/device/vr/openxr/linux/openxr_vulkan_context.cc
-index bb6e4ab9a743e..a7b2d52a465df 100644
+index e788b9ad18b60..dfe71ce966b12 100644
 --- a/device/vr/openxr/linux/openxr_vulkan_context.cc
 +++ b/device/vr/openxr/linux/openxr_vulkan_context.cc
 @@ -8,6 +8,8 @@
@@ -655,9 +654,9 @@ index bb6e4ab9a743e..a7b2d52a465df 100644
 +#include <array>
 +#include <iterator>
  #include <string_view>
- #include <tuple>
  #include <vector>
-@@ -30,6 +32,102 @@ namespace device {
+ 
+@@ -29,6 +31,102 @@ namespace device {
  namespace {
  // gpu::VulkanFunctionPointers requires Vulkan 1.1 or newer.
  constexpr uint32_t kVulkanApiVersion = VK_API_VERSION_1_1;
@@ -760,7 +759,7 @@ index bb6e4ab9a743e..a7b2d52a465df 100644
  }  // namespace
  
  OpenXrVulkanContext::OpenXrVulkanContext() = default;
-@@ -54,6 +152,7 @@ void OpenXrVulkanContext::DestroyCommandPool() {
+@@ -53,6 +151,7 @@ void OpenXrVulkanContext::DestroyCommandPool() {
  }
  
  void OpenXrVulkanContext::DestroyVulkanState() {
@@ -768,7 +767,7 @@ index bb6e4ab9a743e..a7b2d52a465df 100644
    DestroyCommandPool();
    vk_queue_ = VK_NULL_HANDLE;  // Queue lifetime is tied to VkDevice.
    if (vk_device_ != VK_NULL_HANDLE) {
-@@ -831,4 +930,374 @@ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
+@@ -834,4 +933,374 @@ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
    return true;
  }
  
@@ -1224,10 +1223,10 @@ index f07e64eb200e8..aa41e1faff5e0 100644
    // Defaults to 4096 until Initialize() queries the real value.
    gfx::Size max_texture_size_{4096, 4096};
 diff --git a/device/vr/openxr/openxr_device.cc b/device/vr/openxr/openxr_device.cc
-index 3740459ebc8bf..16bcd06f3865a 100644
+index ebc404f9d0cdc..1f80ae4dc0b0d 100644
 --- a/device/vr/openxr/openxr_device.cc
 +++ b/device/vr/openxr/openxr_device.cc
-@@ -232,11 +232,7 @@ void OpenXrDevice::OnRequestSessionResult(
+@@ -231,11 +231,7 @@ void OpenXrDevice::OnRequestSessionResult(
    session_result->session = std::move(session);
    session_result->controller =
        exclusive_controller_receiver_.BindNewPipeAndPassRemote();
@@ -1238,22 +1237,4 @@ index 3740459ebc8bf..16bcd06f3865a 100644
 -#endif
  
    std::move(request_session_callback_).Run(std::move(session_result));
- 
-diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
-index e099ae63e82d4..0d060214a658c 100644
---- a/device/vr/openxr/openxr_render_loop.cc
-+++ b/device/vr/openxr/openxr_render_loop.cc
-@@ -777,6 +777,13 @@ void OpenXrRenderLoop::SendFrameData(
-       empty_frame_data->render_info->frame_id =
-           frame_data->render_info->frame_id;
-     }
-+    // Keep the frame's shared images too: Blink expects them in every frame
-+    // with an id, which a frame started before WebXR was hidden has.
-+    empty_frame_data->buffer_shared_image =
-+        std::move(frame_data->buffer_shared_image);
-+    empty_frame_data->buffer_sync_token = frame_data->buffer_sync_token;
-+    empty_frame_data->composition_layers_data =
-+        std::move(frame_data->composition_layers_data);
-     std::move(callback).Run(std::move(empty_frame_data));
-   }
  

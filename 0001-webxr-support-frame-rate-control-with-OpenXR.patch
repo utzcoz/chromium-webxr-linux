@@ -1,0 +1,1656 @@
+From 0fb809e96380d1007a23d790bb63132d4392754e Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Tue, 27 Oct 2026 22:31:24 +0800
+Subject: [PATCH 1/7] webxr: support frame rate control with OpenXR
+
+Implement XRSession.frameRate, supportedFrameRates and
+updateTargetFrameRate with XR_FB_display_refresh_rate. Until now they
+were stubs.
+
+The device sends the supported rates and the current rate when the
+session starts, and the current rate with every frame, so the page also
+sees changes the runtime makes on its own. A new XRFrameRateController
+interface passes the page's target rate to the runtime.
+updateTargetFrameRate resolves once the runtime has the request,
+without waiting for the switch, per
+https://github.com/immersive-web/webxr/issues/1449.
+
+Runtimes without the extension behave as before.
+
+The WebXR Test API can't set up frame rates, so the web tests extend
+the Chromium mock in wpt_internal.
+
+Bug: 506004811
+Co-authored-by: Neil Kronlage <neilkr@meta.com>
+Change-Id: Ie8f902973efb65fa4bce922180a271172aaa085d
+---
+ .../vr/webxr_vr_frame_loop_browser_test.cc    |  77 ++++++++++
+ .../html/test_webxr_frame_rate.html           |  59 +++++++
+ device/BUILD.gn                               |   1 +
+ device/vr/BUILD.gn                            |   2 +
+ .../openxr/fb/openxr_frame_rate_handler_fb.cc | 109 +++++++++++++
+ .../openxr/fb/openxr_frame_rate_handler_fb.h  |  74 +++++++++
+ .../openxr_frame_rate_handler_fb_unittest.cc  | 144 ++++++++++++++++++
+ device/vr/openxr/openxr_api_wrapper.cc        |  21 ++-
+ device/vr/openxr/openxr_api_wrapper.h         |   3 +
+ device/vr/openxr/openxr_extension_helper.cc   |   5 +
+ device/vr/openxr/openxr_extension_helper.h    |   5 +
+ device/vr/openxr/openxr_platform_helper.cc    |   2 +
+ device/vr/openxr/openxr_render_loop.cc        |  37 +++++
+ device/vr/openxr/openxr_render_loop.h         |   7 +
+ device/vr/openxr/test/fake_openxr_impl_api.cc |  48 ++++++
+ device/vr/openxr/test/openxr_test_helper.cc   |  23 +++
+ device/vr/openxr/test/openxr_test_helper.h    |   7 +
+ device/vr/public/mojom/vr_service.mojom       |  21 +++
+ .../renderer/modules/xr/xr_frame_provider.cc  |  12 ++
+ .../renderer/modules/xr/xr_frame_provider.h   |  10 ++
+ .../blink/renderer/modules/xr/xr_session.cc   |  98 +++++++++++-
+ .../blink/renderer/modules/xr/xr_session.h    |  21 ++-
+ .../blink/renderer/modules/xr/xr_session.idl  |   2 +-
+ .../blink/renderer/modules/xr/xr_system.cc    |  16 ++
+ .../wpt/resources/chromium/webxr-test.js      |   2 +
+ .../resources/xr-internal-device-mocking.js   |  71 +++++++++
+ .../webxr/xrSession_frameRate.https.html      | 136 +++++++++++++++++
+ tools/cfi/ignores.txt                         |   1 +
+ 28 files changed, 1004 insertions(+), 10 deletions(-)
+ create mode 100644 chrome/test/data/xr/e2e_test_files/html/test_webxr_frame_rate.html
+ create mode 100644 device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+ create mode 100644 device/vr/openxr/fb/openxr_frame_rate_handler_fb.h
+ create mode 100644 device/vr/openxr/fb/openxr_frame_rate_handler_fb_unittest.cc
+ create mode 100644 third_party/blink/web_tests/wpt_internal/webxr/xrSession_frameRate.https.html
+
+diff --git a/chrome/browser/vr/webxr_vr_frame_loop_browser_test.cc b/chrome/browser/vr/webxr_vr_frame_loop_browser_test.cc
+index 341b9ed0f954e..5988bba517c24 100644
+--- a/chrome/browser/vr/webxr_vr_frame_loop_browser_test.cc
++++ b/chrome/browser/vr/webxr_vr_frame_loop_browser_test.cc
+@@ -4,11 +4,14 @@
+ 
+ #include <memory>
+ 
++#include "base/command_line.h"
+ #include "base/environment.h"
+ #include "chrome/browser/vr/test/mock_xr_device_hook_base.h"
+ #include "chrome/browser/vr/test/multi_class_browser_test.h"
+ #include "chrome/browser/vr/test/ui_utils.h"
+ #include "chrome/browser/vr/test/webxr_vr_browser_test.h"
++#include "content/public/common/content_switches.h"
++#include "device/vr/buildflags/buildflags.h"
+ 
+ namespace vr {
+ 
+@@ -56,4 +59,78 @@ WEBXR_VR_ALL_RUNTIMES_BROWSER_TEST_F(TestLateSetOfBaseLayer) {
+   t->AssertNoJavaScriptErrors();
+ }
+ 
++#if BUILDFLAG(ENABLE_OPENXR)
++class WebXrVrOpenXrFrameRateBrowserTest : public WebXrVrOpenXrBrowserTest {
++ public:
++  void SetUpCommandLine(base::CommandLine* command_line) override {
++    WebXrVrOpenXrBrowserTest::SetUpCommandLine(command_line);
++    command_line->AppendSwitchASCII(switches::kEnableBlinkFeatures,
++                                    "WebXRFrameRate");
++  }
++};
++
++// The fake runtime offers 72, 90 and 120 Hz, and starts at 90 Hz.
++IN_PROC_BROWSER_TEST_F(WebXrVrOpenXrFrameRateBrowserTest, TestFrameRate) {
++  MockXRDeviceHookBase my_mock;
++  LoadFileAndAwaitInitialization("test_webxr_frame_rate");
++  EnterSessionWithUserGestureOrFail();
++
++  RunJavaScriptOrFail(
++      "assert_array_equals(Array.from(immersiveSession().supportedFrameRates), "
++      "[72, 90, 120])");
++  PollJavaScriptBooleanOrFail("immersiveSession().frameRate === 90",
++                              kPollTimeoutMedium);
++
++  RunJavaScriptOrFail("updateTargetFrameRate(60)");
++  PollJavaScriptBooleanOrFail("updateResult === 'TypeError'",
++                              kPollTimeoutShort);
++
++  RunJavaScriptOrFail("updateTargetFrameRate(120)");
++  PollJavaScriptBooleanOrFail("updateResult === 'resolved'",
++                              kPollTimeoutMedium);
++  PollJavaScriptBooleanOrFail("immersiveSession().frameRate === 120",
++                              kPollTimeoutMedium);
++  RunJavaScriptOrFail("assert_equals(frameRateChanges, 1)");
++
++  RunJavaScriptOrFail("done()");
++  EndTest();
++}
++
++// updateTargetFrameRate() resolves without new frames.
++IN_PROC_BROWSER_TEST_F(WebXrVrOpenXrFrameRateBrowserTest,
++                       TestFrameRateUpdateWithoutFrames) {
++  MockXRDeviceHookBase my_mock;
++  LoadFileAndAwaitInitialization("test_webxr_frame_rate");
++  EnterSessionWithUserGestureOrFail();
++  PollJavaScriptBooleanOrFail("immersiveSession().frameRate === 90",
++                              kPollTimeoutMedium);
++
++  RunJavaScriptOrFail("stopFrameLoop()");
++  PollJavaScriptBooleanOrFail("frameLoopStopped", kPollTimeoutShort);
++  RunJavaScriptOrFail("updateTargetFrameRate(120)");
++  PollJavaScriptBooleanOrFail("updateResult === 'resolved'",
++                              kPollTimeoutMedium);
++
++  RunJavaScriptOrFail("done()");
++  EndTest();
++}
++
++// Ending the session rejects a pending updateTargetFrameRate().
++IN_PROC_BROWSER_TEST_F(WebXrVrOpenXrFrameRateBrowserTest,
++                       TestEndingSessionRejectsPendingFrameRateUpdate) {
++  MockXRDeviceHookBase my_mock;
++  LoadFileAndAwaitInitialization("test_webxr_frame_rate");
++  EnterSessionWithUserGestureOrFail();
++  PollJavaScriptBooleanOrFail("immersiveSession().frameRate === 90",
++                              kPollTimeoutMedium);
++
++  RunJavaScriptOrFail("updateTargetFrameRateAndEndSession(120)");
++  PollJavaScriptBooleanOrFail("updateResult === 'InvalidStateError'",
++                              kPollTimeoutShort);
++
++  RunJavaScriptOrFail("done()");
++  EndTest();
++}
++#endif  // BUILDFLAG(ENABLE_OPENXR)
++
+ }  // namespace vr
+diff --git a/chrome/test/data/xr/e2e_test_files/html/test_webxr_frame_rate.html b/chrome/test/data/xr/e2e_test_files/html/test_webxr_frame_rate.html
+new file mode 100644
+index 0000000000000..0286b209536cf
+--- /dev/null
++++ b/chrome/test/data/xr/e2e_test_files/html/test_webxr_frame_rate.html
+@@ -0,0 +1,59 @@
++<!doctype html>
++<!--
++Helpers for the XRSession frame rate tests.
++-->
++<html>
++  <head>
++    <link rel="stylesheet" type="text/css" href="../resources/webxr_e2e.css">
++  </head>
++  <body>
++    <canvas id="webgl-canvas"></canvas>
++    <script src="../../../../../../third_party/blink/web_tests/resources/testharness.js"></script>
++    <script src="../resources/webxr_e2e.js"></script>
++    <script src="../resources/webxr_boilerplate.js"></script>
++    <script>
++      let frameRateChanges = 0;
++
++      onSessionStartedCallback = function(session) {
++        if (session.mode !== 'immersive-vr') {
++          return;
++        }
++        session.addEventListener('frameratechange', () => frameRateChanges++);
++      }
++
++      function immersiveSession() {
++        return sessionInfos[sessionTypes.IMMERSIVE].currentSession;
++      }
++
++      // The outcome of the last updateTargetFrameRate(): 'resolved', an error
++      // name, or null while pending.
++      let updateResult = null;
++
++      function updateTargetFrameRate(rate) {
++        updateResult = null;
++        immersiveSession().updateTargetFrameRate(rate).then(
++            () => { updateResult = 'resolved'; },
++            (error) => { updateResult = error.name; });
++      }
++
++      function updateTargetFrameRateAndEndSession(rate) {
++        updateTargetFrameRate(rate);
++        immersiveSession().end();
++      }
++
++      // Stops the immersive session's frame loop after its next frame.
++      let frameLoopStopped = false;
++
++      function stopFrameLoop() {
++        const onFrame = onXRFrame;
++        onXRFrame = (time, frame) => {
++          if (frame.session !== immersiveSession()) {
++            onFrame(time, frame);
++            return;
++          }
++          frameLoopStopped = true;
++        };
++      }
++    </script>
++  </body>
++</html>
+diff --git a/device/BUILD.gn b/device/BUILD.gn
+index 741410776eb26..94bfca1967ced 100644
+--- a/device/BUILD.gn
++++ b/device/BUILD.gn
+@@ -436,6 +436,7 @@ test("device_unittests") {
+ 
+     if (enable_openxr) {
+       sources += [
++        "vr/openxr/fb/openxr_frame_rate_handler_fb_unittest.cc",
+         "vr/openxr/openxr_hand_utils_unittest.cc",
+         "vr/openxr/openxr_view_configuration_unittest.cc",
+       ]
+diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
+index 0ffabcd4ffdc0..f27400c4bc32a 100644
+--- a/device/vr/BUILD.gn
++++ b/device/vr/BUILD.gn
+@@ -147,6 +147,8 @@ if (enable_vr) {
+       sources += [
+         "openxr/context_provider_callbacks.h",
+         "openxr/exit_xr_present_reason.h",
++        "openxr/fb/openxr_frame_rate_handler_fb.cc",
++        "openxr/fb/openxr_frame_rate_handler_fb.h",
+         "openxr/fb/openxr_hand_tracker_fb.cc",
+         "openxr/fb/openxr_hand_tracker_fb.h",
+         "openxr/msft/openxr_anchor_manager_msft.cc",
+diff --git a/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc b/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+new file mode 100644
+index 0000000000000..21f01b4b26e1b
+--- /dev/null
++++ b/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+@@ -0,0 +1,109 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/check.h"
++#include "device/vr/openxr/openxr_extension_helper.h"
++
++namespace device {
++
++namespace {
++
++// Rejects bad values from a faulty runtime, like NaN or infinity.
++bool IsValidRate(float rate) {
++  return std::isfinite(rate) && rate > 0;
++}
++
++}  // namespace
++
++// static
++const char* OpenXrFrameRateHandlerFb::GetExtension() {
++  return XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
++}
++
++// static
++bool OpenXrFrameRateHandlerFb::IsSupported(
++    const OpenXrExtensionEnumeration& extension_enum) {
++  return extension_enum.ExtensionSupported(GetExtension());
++}
++
++// static
++std::unique_ptr<OpenXrFrameRateHandlerFb> OpenXrFrameRateHandlerFb::Create(
++    const OpenXrExtensionHelper& extension_helper,
++    XrSession session) {
++  if (!IsSupported(*extension_helper.ExtensionEnumeration())) {
++    return nullptr;
++  }
++  const auto& methods = extension_helper.ExtensionMethods();
++  return std::make_unique<OpenXrFrameRateHandlerFb>(
++      Methods{
++          .enumerate_display_refresh_rates =
++              methods.xrEnumerateDisplayRefreshRatesFB,
++          .get_display_refresh_rate = methods.xrGetDisplayRefreshRateFB,
++          .request_display_refresh_rate = methods.xrRequestDisplayRefreshRateFB,
++      },
++      session);
++}
++
++OpenXrFrameRateHandlerFb::OpenXrFrameRateHandlerFb(const Methods& methods,
++                                                   XrSession session)
++    : methods_(methods), session_(session) {
++  CHECK(methods_.enumerate_display_refresh_rates);
++  CHECK(methods_.get_display_refresh_rate);
++  CHECK(methods_.request_display_refresh_rate);
++
++  ReadFrameRate();
++
++  uint32_t count = 0;
++  if (XR_FAILED(methods_.enumerate_display_refresh_rates(session_, 0, &count,
++                                                         nullptr))) {
++    return;
++  }
++  std::vector<float> rates(count);
++  if (XR_FAILED(methods_.enumerate_display_refresh_rates(
++          session_, rates.size(), &count, rates.data()))) {
++    return;
++  }
++  std::erase_if(rates, [](float rate) { return !IsValidRate(rate); });
++  // Runtimes may list a rate more than once.
++  std::ranges::sort(rates);
++  auto duplicates = std::ranges::unique(rates);
++  rates.erase(duplicates.begin(), duplicates.end());
++  supported_frame_rates_ = std::move(rates);
++}
++
++OpenXrFrameRateHandlerFb::~OpenXrFrameRateHandlerFb() = default;
++
++void OpenXrFrameRateHandlerFb::RequestFrameRate(float rate) {
++  CHECK(std::ranges::contains(supported_frame_rates_, rate));
++  // Errors are ignored: the runtime may ignore requests anyway.
++  methods_.request_display_refresh_rate(session_, rate);
++}
++
++void OpenXrFrameRateHandlerFb::OnSessionBegin() {
++  ReadFrameRate();
++}
++
++void OpenXrFrameRateHandlerFb::ReadFrameRate() {
++  float frame_rate = 0;
++  if (XR_SUCCEEDED(methods_.get_display_refresh_rate(session_, &frame_rate)) &&
++      IsValidRate(frame_rate)) {
++    frame_rate_ = frame_rate;
++  }
++}
++
++void OpenXrFrameRateHandlerFb::OnDisplayRefreshRateChanged(
++    const XrEventDataDisplayRefreshRateChangedFB& event) {
++  if (!IsValidRate(event.toDisplayRefreshRate)) {
++    return;
++  }
++  frame_rate_ = event.toDisplayRefreshRate;
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/fb/openxr_frame_rate_handler_fb.h b/device/vr/openxr/fb/openxr_frame_rate_handler_fb.h
+new file mode 100644
+index 0000000000000..765cddb88ed41
+--- /dev/null
++++ b/device/vr/openxr/fb/openxr_frame_rate_handler_fb.h
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DEVICE_VR_OPENXR_FB_OPENXR_FRAME_RATE_HANDLER_FB_H_
++#define DEVICE_VR_OPENXR_FB_OPENXR_FRAME_RATE_HANDLER_FB_H_
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "device/vr/vr_export.h"
++#include "third_party/openxr/src/include/openxr/openxr.h"
++
++namespace device {
++
++class OpenXrExtensionEnumeration;
++class OpenXrExtensionHelper;
++
++// Reports and changes the display refresh rate with XR_FB_display_refresh_rate.
++class DEVICE_VR_EXPORT OpenXrFrameRateHandlerFb {
++ public:
++  // The extension functions the handler calls. All must be set.
++  struct Methods {
++    PFN_xrEnumerateDisplayRefreshRatesFB enumerate_display_refresh_rates =
++        nullptr;
++    PFN_xrGetDisplayRefreshRateFB get_display_refresh_rate = nullptr;
++    PFN_xrRequestDisplayRefreshRateFB request_display_refresh_rate = nullptr;
++  };
++
++  static const char* GetExtension();
++  static bool IsSupported(const OpenXrExtensionEnumeration& extension_enum);
++
++  // Returns null if the runtime does not support the extension.
++  static std::unique_ptr<OpenXrFrameRateHandlerFb> Create(
++      const OpenXrExtensionHelper& extension_helper,
++      XrSession session);
++
++  OpenXrFrameRateHandlerFb(const Methods& methods, XrSession session);
++
++  OpenXrFrameRateHandlerFb(const OpenXrFrameRateHandlerFb&) = delete;
++  OpenXrFrameRateHandlerFb& operator=(const OpenXrFrameRateHandlerFb&) = delete;
++
++  ~OpenXrFrameRateHandlerFb();
++
++  // Sorted and unique. Empty if the runtime lists none.
++  const std::vector<float>& supported_frame_rates() const {
++    return supported_frame_rates_;
++  }
++  std::optional<float> frame_rate() const { return frame_rate_; }
++
++  // |rate| must be a supported rate. The runtime may switch to it later, or
++  // not at all.
++  void RequestFrameRate(float rate);
++
++  // Reads the rate again. Some runtimes report a different one before the
++  // session begins.
++  void OnSessionBegin();
++
++  void OnDisplayRefreshRateChanged(
++      const XrEventDataDisplayRefreshRateChangedFB& event);
++
++ private:
++  void ReadFrameRate();
++
++  const Methods methods_;
++  const XrSession session_;
++  std::vector<float> supported_frame_rates_;
++  std::optional<float> frame_rate_;
++};
++
++}  // namespace device
++
++#endif  // DEVICE_VR_OPENXR_FB_OPENXR_FRAME_RATE_HANDLER_FB_H_
+diff --git a/device/vr/openxr/fb/openxr_frame_rate_handler_fb_unittest.cc b/device/vr/openxr/fb/openxr_frame_rate_handler_fb_unittest.cc
+new file mode 100644
+index 0000000000000..128cfe1fef5a4
+--- /dev/null
++++ b/device/vr/openxr/fb/openxr_frame_rate_handler_fb_unittest.cc
+@@ -0,0 +1,144 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
++
++#include <algorithm>
++#include <limits>
++#include <memory>
++#include <vector>
++
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/openxr/src/include/openxr/openxr.h"
++
++namespace device {
++
++namespace {
++
++// What the fake runtime reports, and the rates it was asked for.
++struct FakeRuntime {
++  std::vector<float> rates;
++  XrResult enumerate_result = XR_SUCCESS;
++  float rate = 0;
++  std::vector<float> requested_rates;
++};
++
++FakeRuntime* g_runtime = nullptr;
++
++XrResult XRAPI_PTR EnumerateDisplayRefreshRates(XrSession session,
++                                                uint32_t capacity,
++                                                uint32_t* count,
++                                                float* rates) {
++  if (XR_FAILED(g_runtime->enumerate_result)) {
++    return g_runtime->enumerate_result;
++  }
++  *count = g_runtime->rates.size();
++  if (capacity == 0) {
++    return XR_SUCCESS;
++  }
++  if (capacity < g_runtime->rates.size()) {
++    return XR_ERROR_SIZE_INSUFFICIENT;
++  }
++  std::ranges::copy(g_runtime->rates, rates);
++  return XR_SUCCESS;
++}
++
++XrResult XRAPI_PTR GetDisplayRefreshRate(XrSession session, float* rate) {
++  *rate = g_runtime->rate;
++  return XR_SUCCESS;
++}
++
++XrResult XRAPI_PTR RequestDisplayRefreshRate(XrSession session, float rate) {
++  g_runtime->requested_rates.push_back(rate);
++  return XR_SUCCESS;
++}
++
++XrEventDataDisplayRefreshRateChangedFB RateChangeEvent(float from, float to) {
++  XrEventDataDisplayRefreshRateChangedFB event{
++      XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB};
++  event.fromDisplayRefreshRate = from;
++  event.toDisplayRefreshRate = to;
++  return event;
++}
++
++class OpenXrFrameRateHandlerFbTest : public testing::Test {
++ protected:
++  void SetUp() override { g_runtime = &runtime_; }
++  void TearDown() override { g_runtime = nullptr; }
++
++  std::unique_ptr<OpenXrFrameRateHandlerFb> CreateHandler() {
++    return std::make_unique<OpenXrFrameRateHandlerFb>(
++        OpenXrFrameRateHandlerFb::Methods{
++            .enumerate_display_refresh_rates = &EnumerateDisplayRefreshRates,
++            .get_display_refresh_rate = &GetDisplayRefreshRate,
++            .request_display_refresh_rate = &RequestDisplayRefreshRate,
++        },
++        XR_NULL_HANDLE);
++  }
++
++  FakeRuntime runtime_{.rates = {72.0f, 90.0f, 120.0f}, .rate = 90.0f};
++};
++
++}  // namespace
++
++TEST_F(OpenXrFrameRateHandlerFbTest, ReportsRuntimeRates) {
++  auto handler = CreateHandler();
++  EXPECT_THAT(handler->supported_frame_rates(),
++              testing::ElementsAre(72.0f, 90.0f, 120.0f));
++  EXPECT_EQ(handler->frame_rate(), 90.0f);
++}
++
++TEST_F(OpenXrFrameRateHandlerFbTest, DropsInvalidRates) {
++  runtime_.rates = {0.0f, -90.0f, std::numeric_limits<float>::quiet_NaN(),
++                    std::numeric_limits<float>::infinity(), 90.0f};
++  runtime_.rate = std::numeric_limits<float>::infinity();
++  auto handler = CreateHandler();
++  EXPECT_THAT(handler->supported_frame_rates(), testing::ElementsAre(90.0f));
++  EXPECT_FALSE(handler->frame_rate());
++}
++
++TEST_F(OpenXrFrameRateHandlerFbTest, SortsRatesWithoutDuplicates) {
++  runtime_.rates = {120.0f, 72.0f, 90.0f, 72.0f};
++  auto handler = CreateHandler();
++  EXPECT_THAT(handler->supported_frame_rates(),
++              testing::ElementsAre(72.0f, 90.0f, 120.0f));
++}
++
++TEST_F(OpenXrFrameRateHandlerFbTest, NoRatesIfEnumerationFails) {
++  runtime_.enumerate_result = XR_ERROR_RUNTIME_FAILURE;
++  auto handler = CreateHandler();
++  EXPECT_TRUE(handler->supported_frame_rates().empty());
++  EXPECT_EQ(handler->frame_rate(), 90.0f);
++}
++
++TEST_F(OpenXrFrameRateHandlerFbTest, RateChangesOnRuntimeEvent) {
++  auto handler = CreateHandler();
++  handler->RequestFrameRate(120.0f);
++  EXPECT_THAT(runtime_.requested_rates, testing::ElementsAre(120.0f));
++  // The rate only changes when the runtime's event arrives.
++  EXPECT_EQ(handler->frame_rate(), 90.0f);
++
++  handler->OnDisplayRefreshRateChanged(RateChangeEvent(90.0f, 120.0f));
++  EXPECT_EQ(handler->frame_rate(), 120.0f);
++}
++
++TEST_F(OpenXrFrameRateHandlerFbTest, ReadsRateAgainWhenSessionBegins) {
++  auto handler = CreateHandler();
++  // Some runtimes report another rate once the session runs.
++  runtime_.rate = 72.0f;
++  handler->OnSessionBegin();
++  EXPECT_EQ(handler->frame_rate(), 72.0f);
++}
++
++TEST_F(OpenXrFrameRateHandlerFbTest, IgnoresInvalidRateEvents) {
++  auto handler = CreateHandler();
++  for (float rate : {0.0f, -90.0f, std::numeric_limits<float>::quiet_NaN(),
++                     std::numeric_limits<float>::infinity()}) {
++    handler->OnDisplayRefreshRateChanged(RateChangeEvent(90.0f, rate));
++    EXPECT_EQ(handler->frame_rate(), 90.0f);
++  }
++}
++
++}  // namespace device
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index b7a6bd87e62c6..ff9185612cc73 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -147,6 +147,7 @@ void OpenXrApiWrapper::Reset() {
+   scene_understanding_manager_.reset();
+   unbounded_space_provider_.reset();
+   visibility_mask_handler_.reset();
++  frame_rate_handler_.reset();
+   unbounded_space_ = XR_NULL_HANDLE;
+   local_space_ = XR_NULL_HANDLE;
+   stage_space_ = XR_NULL_HANDLE;
+@@ -450,6 +451,10 @@ OpenXrDepthSensor* OpenXrApiWrapper::GetDepthSensor() {
+   return depth_sensor_.get();
+ }
+ 
++OpenXrFrameRateHandlerFb* OpenXrApiWrapper::GetFrameRateHandler() {
++  return frame_rate_handler_.get();
++}
++
+ XrResult OpenXrApiWrapper::EnableSupportedFeatures(
+     const OpenXrExtensionHelper& extension_helper) {
+   CHECK(session_options_);
+@@ -731,6 +736,9 @@ XrResult OpenXrApiWrapper::InitSession(
+         extension_helper, session_);
+   }
+ 
++  frame_rate_handler_ =
++      OpenXrFrameRateHandlerFb::Create(extension_helper, session_);
++
+   EnsureEventPolling();
+ 
+   return XR_SUCCESS;
+@@ -1039,8 +1047,12 @@ XrResult OpenXrApiWrapper::BeginSession() {
+   }
+ 
+   XrResult xr_result = xrBeginSession(session_, &session_begin_info);
+-  if (XR_SUCCEEDED(xr_result))
++  if (XR_SUCCEEDED(xr_result)) {
+     session_running_ = true;
++    if (frame_rate_handler_) {
++      frame_rate_handler_->OnSessionBegin();
++    }
++  }
+ 
+   // Only the first xrBeginSession() starts the WebXR session. Later ones
+   // resume it after the runtime stopped it.
+@@ -1668,6 +1680,13 @@ XrResult OpenXrApiWrapper::ProcessEvents() {
+       if (visibility_mask_handler_) {
+         visibility_mask_handler_->OnVisibilityMaskChanged(*mask_changed_event);
+       }
++    } else if (event_data.type ==
++               XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
++      if (frame_rate_handler_) {
++        frame_rate_handler_->OnDisplayRefreshRateChanged(
++            *reinterpret_cast<XrEventDataDisplayRefreshRateChangedFB*>(
++                &event_data));
++      }
+     } else {
+       DVLOG(1) << __func__ << " Unhandled event type: " << event_data.type;
+       TRACE_EVENT_INSTANT("xr", "UnandledXrEvent", "type", event_data.type);
+diff --git a/device/vr/openxr/openxr_api_wrapper.h b/device/vr/openxr/openxr_api_wrapper.h
+index 8f80c884b2619..d2a6c7cbcef9d 100644
+--- a/device/vr/openxr/openxr_api_wrapper.h
++++ b/device/vr/openxr/openxr_api_wrapper.h
+@@ -14,6 +14,7 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "device/vr/openxr/exit_xr_present_reason.h"
++#include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
+ #include "device/vr/openxr/openxr_anchor_manager.h"
+ #include "device/vr/openxr/openxr_depth_sensor.h"
+ #include "device/vr/openxr/openxr_graphics_binding.h"
+@@ -138,6 +139,7 @@ class OpenXrApiWrapper {
+   OpenXrHitTestManager* GetHitTestManager();
+   OpenXrLightEstimator* GetLightEstimator();
+   OpenXrDepthSensor* GetDepthSensor();
++  OpenXrFrameRateHandlerFb* GetFrameRateHandler();
+ 
+   void OnContextProviderCreated(
+       scoped_refptr<viz::ContextProvider> context_provider);
+@@ -283,6 +285,7 @@ class OpenXrApiWrapper {
+   std::unique_ptr<OpenXrMeshManager> mesh_manager_;
+   std::unique_ptr<OpenXrUnboundedSpaceProvider> unbounded_space_provider_;
+   std::unique_ptr<OpenXrVisibilityMaskHandler> visibility_mask_handler_;
++  std::unique_ptr<OpenXrFrameRateHandlerFb> frame_rate_handler_;
+ 
+   // The context provider is owned by the OpenXrRenderLoop, and may change when
+   // there is a context lost.
+diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
+index d495fc8d07d64..43f3250dd6994 100644
+--- a/device/vr/openxr/openxr_extension_helper.cc
++++ b/device/vr/openxr/openxr_extension_helper.cc
+@@ -173,6 +173,11 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
+   // Visibility Mask
+   OPENXR_LOAD_FN(xrGetVisibilityMaskKHR);
+ 
++  // Display refresh rate
++  OPENXR_LOAD_FN(xrEnumerateDisplayRefreshRatesFB);
++  OPENXR_LOAD_FN(xrGetDisplayRefreshRateFB);
++  OPENXR_LOAD_FN(xrRequestDisplayRefreshRateFB);
++
+ #if BUILDFLAG(IS_WIN)
+   OPENXR_LOAD_FN(xrConvertWin32PerformanceCounterToTimeKHR);
+ #endif
+diff --git a/device/vr/openxr/openxr_extension_helper.h b/device/vr/openxr/openxr_extension_helper.h
+index 38ec9ae2c6f09..d512f9d6bee3b 100644
+--- a/device/vr/openxr/openxr_extension_helper.h
++++ b/device/vr/openxr/openxr_extension_helper.h
+@@ -84,6 +84,11 @@ struct OpenXrExtensionMethods {
+   // Visibility Mask
+   OPENXR_DECLARE_FN(xrGetVisibilityMaskKHR);
+ 
++  // Display refresh rate
++  OPENXR_DECLARE_FN(xrEnumerateDisplayRefreshRatesFB);
++  OPENXR_DECLARE_FN(xrGetDisplayRefreshRateFB);
++  OPENXR_DECLARE_FN(xrRequestDisplayRefreshRateFB);
++
+ #if BUILDFLAG(IS_WIN)
+   // Time
+   OPENXR_DECLARE_FN(xrConvertWin32PerformanceCounterToTimeKHR);
+diff --git a/device/vr/openxr/openxr_platform_helper.cc b/device/vr/openxr/openxr_platform_helper.cc
+index 11fe768ff1950..ca11c0deff27c 100644
+--- a/device/vr/openxr/openxr_platform_helper.cc
++++ b/device/vr/openxr/openxr_platform_helper.cc
+@@ -16,6 +16,7 @@
+ #include "base/version.h"
+ #include "build/build_config.h"
+ #include "components/version_info/version_info.h"
++#include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
+ #include "device/vr/openxr/openxr_api_wrapper.h"
+ #include "device/vr/openxr/openxr_extension_handler_factories.h"
+ #include "device/vr/openxr/openxr_extension_handler_factory.h"
+@@ -197,6 +198,7 @@ XrResult OpenXrPlatformHelper::CreateInstance(XrInstance* instance,
+ 
+   EnableExtensionIfSupported(XR_EXT_FUTURE_EXTENSION_NAME);
+   EnableExtensionIfSupported(OpenXrVisibilityMaskHandler::GetExtension());
++  EnableExtensionIfSupported(OpenXrFrameRateHandlerFb::GetExtension());
+ 
+   for (const auto& extension : handled_extensions) {
+     EnableExtensionIfSupported(extension.c_str());
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index 420456104e280..6ac1548c03d8a 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -19,6 +19,7 @@
+ #include "build/build_config.h"
+ #include "components/viz/common/gpu/context_provider.h"
+ #include "device/vr/openxr/exit_xr_present_reason.h"
++#include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
+ #include "device/vr/openxr/openxr_api_wrapper.h"
+ #include "device/vr/openxr/openxr_input_helper.h"
+ #include "device/vr/openxr/openxr_util.h"
+@@ -97,6 +98,7 @@ void OpenXrRenderLoop::ExitPresent(ExitXrPresentReason reason) {
+   presentation_receiver_.reset();
+   frame_data_receiver_.reset();
+   layer_manager_receiver_.reset();
++  frame_rate_controller_receiver_.reset();
+   submit_client_.reset();
+ 
+   pending_frame_.reset();
+@@ -294,6 +296,7 @@ void OpenXrRenderLoop::CleanUp() {
+   presentation_receiver_.reset();
+   frame_data_receiver_.reset();
+   layer_manager_receiver_.reset();
++  frame_rate_controller_receiver_.reset();
+   overlay_receiver_.reset();
+   overlay_submit_callback_.Reset();
+   pending_overlay_pose_callback_.Reset();
+@@ -434,6 +437,15 @@ void OpenXrRenderLoop::StartRuntimeFinish(
+   if (auto* depth = openxr_->GetDepthSensor(); depth) {
+     session->device_config->depth_configuration = depth->GetDepthConfig();
+   }
++  if (auto* frame_rate_handler = openxr_->GetFrameRateHandler()) {
++    session->device_config->frame_rate = frame_rate_handler->frame_rate();
++    if (!frame_rate_handler->supported_frame_rates().empty()) {
++      session->device_config->supported_frame_rates =
++          frame_rate_handler->supported_frame_rates();
++      session->frame_rate_controller =
++          frame_rate_controller_receiver_.BindNewPipeAndPassRemote();
++    }
++  }
+   if (graphics_binding_->SupportsLayers()) {
+     session->device_config->max_render_layers =
+         openxr_->IsFeatureEnabled(mojom::XRSessionFeature::LAYERS)
+@@ -810,6 +822,10 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
+ 
+   frame_data->render_info->mojo_from_viewer = openxr_->GetViewerPose();
+ 
++  if (auto* frame_rate_handler = openxr_->GetFrameRateHandler()) {
++    frame_data->frame_rate = frame_rate_handler->frame_rate();
++  }
++
+   UpdateStageParameters();
+ 
+   std::optional<gfx::Transform> local_from_floor = openxr_->GetLocalFromFloor();
+@@ -1311,6 +1327,27 @@ void OpenXrRenderLoop::SetEnabledCompositionLayers(
+       context_provider_->SharedImageInterface());
+ }
+ 
++void OpenXrRenderLoop::UpdateTargetFrameRate(
++    float rate,
++    UpdateTargetFrameRateCallback callback) {
++  // The handler is gone if the runtime has already ended the session.
++  OpenXrFrameRateHandlerFb* frame_rate_handler = openxr_->GetFrameRateHandler();
++  if (!frame_rate_handler) {
++    std::move(callback).Run();
++    return;
++  }
++  if (!std::ranges::contains(frame_rate_handler->supported_frame_rates(),
++                             rate)) {
++    frame_rate_controller_receiver_.ReportBadMessage(
++        "Frame rate is not supported.");
++    return;
++  }
++  // Don't wait for a switch, which may never come. GetNextFrameData()
++  // reports it if it does.
++  frame_rate_handler->RequestFrameRate(rate);
++  std::move(callback).Run();
++}
++
+ void OpenXrRenderLoop::CreateAnchor(
+     mojom::XRNativeOriginInformationPtr native_origin_information,
+     const device::Pose& native_origin_from_anchor,
+diff --git a/device/vr/openxr/openxr_render_loop.h b/device/vr/openxr/openxr_render_loop.h
+index db498c5223416..6849a97f15b3d 100644
+--- a/device/vr/openxr/openxr_render_loop.h
++++ b/device/vr/openxr/openxr_render_loop.h
+@@ -81,6 +81,7 @@ class OpenXrRenderLoop : public XRThread,
+                          public mojom::ImmersiveOverlay,
+                          public mojom::XREnvironmentIntegrationProvider,
+                          public mojom::XRLayerManager,
++                         public mojom::XRFrameRateController,
+                          public viz::ContextLostObserver {
+  public:
+   using RequestSessionCallback =
+@@ -262,6 +263,10 @@ class OpenXrRenderLoop : public XRThread,
+   void SetEnabledCompositionLayers(
+       const std::vector<LayerId>& layer_ids) override;
+ 
++  // XRFrameRateController
++  void UpdateTargetFrameRate(float rate,
++                             UpdateTargetFrameRateCallback callback) override;
++
+   void CreateAnchor(
+       mojom::XRNativeOriginInformationPtr native_origin_information,
+       const device::Pose& native_origin_from_anchor,
+@@ -348,6 +353,8 @@ class OpenXrRenderLoop : public XRThread,
+   mojo::Receiver<mojom::XRPresentationProvider> presentation_receiver_{this};
+   mojo::Receiver<mojom::XRFrameDataProvider> frame_data_receiver_{this};
+   mojo::Receiver<mojom::XRLayerManager> layer_manager_receiver_{this};
++  mojo::Receiver<mojom::XRFrameRateController> frame_rate_controller_receiver_{
++      this};
+   mojo::Receiver<mojom::ImmersiveOverlay> overlay_receiver_{this};
+   mojom::XRVisibilityState visibility_state_ =
+       mojom::XRVisibilityState::VISIBLE;
+diff --git a/device/vr/openxr/test/fake_openxr_impl_api.cc b/device/vr/openxr/test/fake_openxr_impl_api.cc
+index 985d094fa3c76..4f82644103f21 100644
+--- a/device/vr/openxr/test/fake_openxr_impl_api.cc
++++ b/device/vr/openxr/test/fake_openxr_impl_api.cc
+@@ -552,6 +552,34 @@ XrResult XRAPI_PTR xrEndSession(XrSession session) {
+   return XR_SUCCESS;
+ }
+ 
++XrResult XRAPI_PTR
++xrEnumerateDisplayRefreshRatesFB(XrSession session,
++                                 uint32_t display_refresh_rate_capacity_input,
++                                 uint32_t* display_refresh_rate_count_output,
++                                 float* display_refresh_rates) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(GetTestHelper().ValidateSession(session));
++  RETURN_IF(display_refresh_rate_count_output == nullptr,
++            XR_ERROR_VALIDATION_FAILURE,
++            "display_refresh_rate_count_output is nullptr");
++
++  const auto& rates = OpenXrTestHelper::kDisplayRefreshRates;
++  *display_refresh_rate_count_output = rates.size();
++  if (display_refresh_rate_capacity_input == 0) {
++    return XR_SUCCESS;
++  }
++
++  RETURN_IF(display_refresh_rates == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "display_refresh_rates is nullptr");
++  RETURN_IF(display_refresh_rate_capacity_input < rates.size(),
++            XR_ERROR_SIZE_INSUFFICIENT,
++            "display_refresh_rate_capacity_input size is insufficient");
++
++  std::ranges::copy(rates, display_refresh_rates);
++
++  return XR_SUCCESS;
++}
++
+ XrResult XRAPI_PTR xrEnumerateEnvironmentBlendModes(
+     XrInstance instance,
+     XrSystemId system_id,
+@@ -996,6 +1024,16 @@ xrGetCurrentInteractionProfile(XrSession session,
+   return XR_SUCCESS;
+ }
+ 
++XrResult XRAPI_PTR xrGetDisplayRefreshRateFB(XrSession session,
++                                             float* display_refresh_rate) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(GetTestHelper().ValidateSession(session));
++  RETURN_IF(display_refresh_rate == nullptr, XR_ERROR_VALIDATION_FAILURE,
++            "display_refresh_rate is nullptr");
++  *display_refresh_rate = GetTestHelper().display_refresh_rate();
++  return XR_SUCCESS;
++}
++
+ #if BUILDFLAG(IS_ANDROID)
+ XrResult XRAPI_PTR xrGetOpenGLESGraphicsRequirementsKHR(
+     XrInstance instance,
+@@ -1203,6 +1241,13 @@ XrResult XRAPI_PTR xrPollEvent(XrInstance instance,
+   return GetTestHelper().PollEvent(event_data);
+ }
+ 
++XrResult XRAPI_PTR xrRequestDisplayRefreshRateFB(XrSession session,
++                                                 float display_refresh_rate) {
++  DVLOG(2) << __FUNCTION__;
++  RETURN_IF_XR_FAILED(GetTestHelper().ValidateSession(session));
++  return GetTestHelper().RequestDisplayRefreshRate(display_refresh_rate);
++}
++
+ XrResult XRAPI_PTR
+ xrReleaseSwapchainImage(XrSwapchain swapchain,
+                         const XrSwapchainImageReleaseInfo* release_info) {
+@@ -1552,6 +1597,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+   TRY_LOAD_METHOD(xrDestroySwapchain);
+   TRY_LOAD_METHOD(xrEndFrame);
+   TRY_LOAD_METHOD(xrEndSession);
++  TRY_LOAD_METHOD(xrEnumerateDisplayRefreshRatesFB);
+   TRY_LOAD_METHOD(xrEnumerateEnvironmentBlendModes);
+   TRY_LOAD_METHOD(xrEnumerateInstanceExtensionProperties);
+   TRY_LOAD_METHOD(xrEnumerateSwapchainFormats);
+@@ -1566,6 +1612,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+   TRY_LOAD_METHOD(xrGetActionStateVector2f);
+   TRY_LOAD_METHOD(xrGetActionStatePose);
+   TRY_LOAD_METHOD(xrGetCurrentInteractionProfile);
++  TRY_LOAD_METHOD(xrGetDisplayRefreshRateFB);
+ #if BUILDFLAG(IS_ANDROID)
+   TRY_LOAD_METHOD(xrGetOpenGLESGraphicsRequirementsKHR);
+ #endif
+@@ -1583,6 +1630,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+   TRY_LOAD_METHOD(xrLocateViews);
+   TRY_LOAD_METHOD(xrPollEvent);
+   TRY_LOAD_METHOD(xrReleaseSwapchainImage);
++  TRY_LOAD_METHOD(xrRequestDisplayRefreshRateFB);
+   TRY_LOAD_METHOD(xrSuggestInteractionProfileBindings);
+   TRY_LOAD_METHOD(xrStringToPath);
+   TRY_LOAD_METHOD(xrPathToString);
+diff --git a/device/vr/openxr/test/openxr_test_helper.cc b/device/vr/openxr/test/openxr_test_helper.cc
+index 610bd51ddf36f..025d4616f928b 100644
+--- a/device/vr/openxr/test/openxr_test_helper.cc
++++ b/device/vr/openxr/test/openxr_test_helper.cc
+@@ -108,6 +108,7 @@ const std::vector<const char*>& OpenXrTestHelper::GetSupportedExtensions() {
+       XR_MSFT_SECONDARY_VIEW_CONFIGURATION_EXTENSION_NAME,
+       XR_EXT_HAND_TRACKING_EXTENSION_NAME,
+       XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
++      XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
+ #if BUILDFLAG(IS_WIN)
+       XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
+       XR_EXT_WIN32_APPCONTAINER_COMPATIBLE_EXTENSION_NAME,
+@@ -195,6 +196,7 @@ void OpenXrTestHelper::Reset() {
+ #endif
+   next_handle_ = 0;
+   next_predicted_display_time_ = 0;
++  display_refresh_rate_ = kDisplayRefreshRates[1];
+ 
+   // vectors
+   paths_.clear();
+@@ -1597,6 +1599,27 @@ XrResult OpenXrTestHelper::PollEvent(XrEventDataBuffer* event_data) {
+   return XR_EVENT_UNAVAILABLE;
+ }
+ 
++XrResult OpenXrTestHelper::RequestDisplayRefreshRate(float rate) {
++  RETURN_IF_FALSE(std::ranges::contains(kDisplayRefreshRates, rate),
++                  XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB,
++                  "xrRequestDisplayRefreshRateFB rate is not supported");
++  if (rate == display_refresh_rate_) {
++    return XR_SUCCESS;
++  }
++
++  XrEventDataBuffer event_data;
++  XrEventDataDisplayRefreshRateChangedFB* event_data_ptr =
++      reinterpret_cast<XrEventDataDisplayRefreshRateChangedFB*>(&event_data);
++  event_data_ptr->type = XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB;
++  event_data_ptr->next = nullptr;
++  event_data_ptr->fromDisplayRefreshRate = display_refresh_rate_;
++  event_data_ptr->toDisplayRefreshRate = rate;
++  event_queue_.push(event_data);
++
++  display_refresh_rate_ = rate;
++  return XR_SUCCESS;
++}
++
+ #if BUILDFLAG(IS_WIN)
+ const std::vector<Microsoft::WRL::ComPtr<ID3D11Texture2D>>&
+ OpenXrTestHelper::GetSwapchainTextures() const {
+diff --git a/device/vr/openxr/test/openxr_test_helper.h b/device/vr/openxr/test/openxr_test_helper.h
+index 985543400e9b9..ff968b21869e4 100644
+--- a/device/vr/openxr/test/openxr_test_helper.h
++++ b/device/vr/openxr/test/openxr_test_helper.h
+@@ -161,6 +161,9 @@ class OpenXrTestHelper {
+   void UpdateEventQueue();
+   XrResult PollEvent(XrEventDataBuffer* event_data);
+ 
++  float display_refresh_rate() const { return display_refresh_rate_; }
++  XrResult RequestDisplayRefreshRate(float rate);
++
+   void LocateJoints(XrHandTrackerEXT hand_tracker,
+                     const XrHandJointsLocateInfoEXT* locate_info,
+                     XrHandJointLocationsEXT* locations);
+@@ -209,6 +212,8 @@ class OpenXrTestHelper {
+ 
+   static constexpr XrEnvironmentBlendMode kEnvironmentBlendMode =
+       XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++  static constexpr std::array<float, 3> kDisplayRefreshRates = {72.0f, 90.0f,
++                                                                120.0f};
+   static constexpr const char* kLocalReferenceSpacePath =
+       "/reference_space/local";
+   static constexpr const char* kStageReferenceSpacePath =
+@@ -372,6 +377,8 @@ class OpenXrTestHelper {
+ 
+   std::queue<XrEventDataBuffer> event_queue_;
+ 
++  float display_refresh_rate_ = kDisplayRefreshRates[1];
++
+   void OnTestHookDisconnected();
+   mojo::SharedRemote<device_test::mojom::XRTestHook> GetTestHook();
+ 
+diff --git a/device/vr/public/mojom/vr_service.mojom b/device/vr/public/mojom/vr_service.mojom
+index e7266260f64e7..4be38fe02fc23 100644
+--- a/device/vr/public/mojom/vr_service.mojom
++++ b/device/vr/public/mojom/vr_service.mojom
+@@ -107,6 +107,14 @@ struct XRSessionDeviceConfig {
+   // The max number of layers that can be enabled at same time. See
+   // SetEnabledCompositionLayers.
+   uint16 max_render_layers = 1;
++
++  // The rates the page may ask for with XRFrameRateController. Empty if the
++  // page can't control the frame rate.
++  array<float> supported_frame_rates;
++
++  // The device's current frame rate, if known. XRFrameData.frame_rate reports
++  // changes.
++  float? frame_rate;
+ };
+ 
+ // This structure contains all the mojo interfaces for different kinds of
+@@ -124,6 +132,8 @@ struct XRSessionDeviceConfig {
+ struct XRSession {
+   pending_remote<XRFrameDataProvider> data_provider;
+   pending_remote<XRLayerManager>? layer_manager;
++  // Only present if XRSessionDeviceConfig.supported_frame_rates is non-empty.
++  pending_remote<XRFrameRateController>? frame_rate_controller;
+   // TODO(crbug.com/529477851): Move where the client_receiver gets set to the
+   // device process then mark this as non-optional.
+   pending_receiver<XRSessionClient>? client_receiver;
+@@ -1001,6 +1011,9 @@ struct XRFrameData {
+   float rendering_time_ratio;
+ 
+   XRTrackedImagesData? tracked_images;
++
++  // The device's current frame rate, if known.
++  float? frame_rate;
+ };
+ 
+ struct RequestSessionSuccess {
+@@ -1338,6 +1351,14 @@ interface XRLayerManager {
+   SetEnabledCompositionLayers(array<LayerId> layer_ids);
+ };
+ 
++// Lets a session pick the device's frame rate. Hosted in the device process.
++interface XRFrameRateController {
++  // Asks the device to target |rate|, one of
++  // XRSessionDeviceConfig.supported_frame_rates. Replies without waiting for
++  // the device to switch, which XRFrameData.frame_rate reports.
++  UpdateTargetFrameRate(float rate) => ();
++};
++
+ // Functions for pushing frame data to the sessions.
+ // This interface is hosted in the Browser process, and called by the
+ // renderer for use by debug WebUI.
+diff --git a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
+index f0d56477f1228..fbbc7877c4f55 100644
+--- a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
++++ b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
+@@ -79,6 +79,7 @@ XRFrameProvider::XRFrameProvider(XRSystem* xr)
+       immersive_data_provider_(xr->GetExecutionContext()),
+       immersive_presentation_provider_(xr->GetExecutionContext()),
+       layer_manager_(xr->GetExecutionContext()),
++      frame_rate_controller_(xr->GetExecutionContext()),
+       last_has_focus_(xr->IsFrameFocused()) {}
+ 
+ void XRFrameProvider::AddImmersiveSessionObserver(
+@@ -131,6 +132,15 @@ void XRFrameProvider::OnSessionStarted(
+                    WrapWeakPersistent(this), WrapWeakPersistent(session)));
+     }
+ 
++    if (session_ptr->frame_rate_controller) {
++      frame_rate_controller_.Bind(std::move(session_ptr->frame_rate_controller),
++                                  xr_->GetExecutionContext()->GetTaskRunner(
++                                      TaskType::kMiscPlatformAPI));
++      frame_rate_controller_.set_disconnect_handler(
++          BindOnce(&XRFrameProvider::OnProviderConnectionError,
++                   WrapWeakPersistent(this), WrapWeakPersistent(session)));
++    }
++
+     frame_transport_->BindSubmitFrameClient(
+         std::move(session_ptr->submit_frame_sink->client_receiver));
+     frame_transport_->SetTransportOptions(
+@@ -197,6 +207,7 @@ void XRFrameProvider::OnSessionEnded(XRSession* session) {
+     immersive_presentation_provider_.reset();
+     immersive_data_provider_.reset();
+     layer_manager_.reset();
++    frame_rate_controller_.reset();
+     shared_images_.clear();
+ 
+     first_immersive_frame_time_ = std::nullopt;
+@@ -957,6 +968,7 @@ void XRFrameProvider::Trace(Visitor* visitor) const {
+   visitor->Trace(requesting_sessions_);
+   visitor->Trace(immersive_observers_);
+   visitor->Trace(layer_manager_);
++  visitor->Trace(frame_rate_controller_);
+ }
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/modules/xr/xr_frame_provider.h b/third_party/blink/renderer/modules/xr/xr_frame_provider.h
+index bc339c619a24f..c784b04ec5990 100644
+--- a/third_party/blink/renderer/modules/xr/xr_frame_provider.h
++++ b/third_party/blink/renderer/modules/xr/xr_frame_provider.h
+@@ -95,6 +95,14 @@ class XRFrameProvider final : public GarbageCollected<XRFrameProvider> {
+     return layer_manager_.get();
+   }
+ 
++  // Only bound if the device lets the page control its frame rate.
++  device::mojom::blink::XRFrameRateController* frame_rate_controller() {
++    if (!frame_rate_controller_.is_bound()) {
++      return nullptr;
++    }
++    return frame_rate_controller_.get();
++  }
++
+   // Adds an ImmersiveSessionObserver. Observers will be automatically removed
+   // by Oilpan when they are destroyed, and their WeakMember becomes null.
+   void AddImmersiveSessionObserver(ImmersiveSessionObserver*);
+@@ -195,6 +203,8 @@ class XRFrameProvider final : public GarbageCollected<XRFrameProvider> {
+   Vector<XRSharedImageData> shared_images_;
+ 
+   HeapMojoRemote<device::mojom::blink::XRLayerManager> layer_manager_;
++  HeapMojoRemote<device::mojom::blink::XRFrameRateController>
++      frame_rate_controller_;
+ 
+   bool last_has_focus_ = false;
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index ea33e05586131..4cb85796a1d55 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -70,6 +70,7 @@
+ #include "third_party/blink/renderer/platform/bindings/enumeration_base.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_throw_exception.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "ui/gfx/geometry/point3_f.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
+@@ -137,6 +138,8 @@ const char kEntityTypesNotSpecified[] =
+ const char kSessionNotHaveSetFrameRate[] =
+     "Session does not have a set frame rate.";
+ 
++const char kFrameRateNotSupported[] = "Frame rate is not supported.";
++
+ const float kMinDefaultFramebufferScale = 0.1f;
+ const float kMaxDefaultFramebufferScale = 1.0f;
+ 
+@@ -424,6 +427,8 @@ XRSession::XRSession(
+   // device_config_ may be referenced throughout the lifetime of the session.
+   UpdateViews(std::move(device_config_->views));
+ 
++  frame_rate_ = device_config_->frame_rate;
++
+   DVLOG(2) << __func__
+            << ": supports_viewport_scaling_=" << supports_viewport_scaling_;
+ 
+@@ -826,12 +831,84 @@ void XRSession::UpdateStageParameters(
+   }
+ }
+ 
++NotShared<DOMFloat32Array> XRSession::supportedFrameRates() {
++  if (!FrameRateController()) {
++    return NotShared<DOMFloat32Array>();
++  }
++  return NotShared<DOMFloat32Array>(
++      DOMFloat32Array::Create(device_config_->supported_frame_rates));
++}
++
+ ScriptPromise<IDLUndefined> XRSession::updateTargetFrameRate(
++    ScriptState* script_state,
+     float rate,
+     ExceptionState& exception_state) {
+-  exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
+-                                    kSessionNotHaveSetFrameRate);
+-  return EmptyPromise();
++  if (!frame_rate_) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      kSessionNotHaveSetFrameRate);
++    return EmptyPromise();
++  }
++
++  if (ended_) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      kSessionEnded);
++    return EmptyPromise();
++  }
++
++  auto* frame_rate_controller = FrameRateController();
++  if (!frame_rate_controller ||
++      !std::ranges::contains(device_config_->supported_frame_rates, rate)) {
++    exception_state.ThrowTypeError(kFrameRateNotSupported);
++    return EmptyPromise();
++  }
++
++  auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<IDLUndefined>>(
++      script_state, exception_state.GetContext());
++  auto promise = resolver->Promise();
++
++  // The device replies once it has the request. Frames report any switch.
++  update_target_frame_rate_promises_.insert(resolver);
++  frame_rate_controller->UpdateTargetFrameRate(
++      rate, resolver->WrapCallbackInScriptScope(blink::BindOnce(
++                &XRSession::OnUpdateTargetFrameRate, WrapPersistent(this))));
++
++  return promise;
++}
++
++void XRSession::OnUpdateTargetFrameRate(
++    ScriptPromiseResolver<IDLUndefined>* resolver) {
++  CHECK(update_target_frame_rate_promises_.Take(resolver));
++  if (ended_) {
++    resolver->RejectWithDOMException(DOMExceptionCode::kInvalidStateError,
++                                     kSessionEnded);
++    return;
++  }
++  resolver->Resolve();
++}
++
++void XRSession::SetFrameRate(float frame_rate) {
++  if (frame_rate_ == frame_rate) {
++    return;
++  }
++  // The first known rate is not a change.
++  const bool changed = frame_rate_.has_value();
++  frame_rate_ = frame_rate;
++  if (changed &&
++      RuntimeEnabledFeatures::WebXRFrameRateEnabled(GetExecutionContext())) {
++    // Queued, as this can run in the middle of a frame update.
++    EnqueueEvent(
++        *XRSessionEvent::Create(event_type_names::kFrameratechange, this),
++        TaskType::kMiscPlatformAPI);
++  }
++}
++
++device::mojom::blink::XRFrameRateController* XRSession::FrameRateController() {
++  // The controller belongs to the immersive session, like LayerManager().
++  // XRSystem checked that it comes with a list of rates.
++  if (ended_ || !immersive()) {
++    return nullptr;
++  }
++  return xr_->frameProvider()->frame_rate_controller();
+ }
+ 
+ ScriptPromise<XRReferenceSpace> XRSession::requestReferenceSpace(
+@@ -1648,6 +1725,7 @@ void XRSession::HandleShutdown() {
+       end_session_resolver_->Detach();
+       end_session_resolver_ = nullptr;
+     }
++    update_target_frame_rate_promises_.clear();
+     return;
+   }
+ 
+@@ -1658,6 +1736,15 @@ void XRSession::HandleShutdown() {
+   xr_->frameProvider()->OnSessionEnded(this);
+   xr_->OnSessionEnded(this);
+ 
++  // The device's pending replies were dropped with the session.
++  HeapHashSet<Member<ScriptPromiseResolver<IDLUndefined>>>
++      update_target_frame_rate_promises;
++  update_target_frame_rate_promises_.swap(update_target_frame_rate_promises);
++  for (auto& resolver : update_target_frame_rate_promises) {
++    resolver->RejectWithDOMException(DOMExceptionCode::kInvalidStateError,
++                                     kSessionEnded);
++  }
++
+   if (end_session_resolver_) {
+     DVLOG(3) << __func__ << ": Resolving end_session_resolver_";
+     end_session_resolver_->Resolve();
+@@ -2045,6 +2132,10 @@ void XRSession::UpdatePresentationFrameState(
+     if (ended_) {
+       return;
+     }
++
++    if (frame_data->frame_rate) {
++      SetFrameRate(*frame_data->frame_rate);
++    }
+   } else {
+     UpdateWorldUnderstandingStateForFrame(timestamp, frame_data);
+   }
+@@ -2797,6 +2888,7 @@ void XRSession::Trace(Visitor* visitor) const {
+   visitor->Trace(client_receiver_);
+   visitor->Trace(callback_collection_);
+   visitor->Trace(create_anchor_promises_);
++  visitor->Trace(update_target_frame_rate_promises_);
+   visitor->Trace(request_hit_test_source_promises_);
+   visitor->Trace(graphics_bindings_);
+   visitor->Trace(reference_spaces_);
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 05ab92ac0ca5a..64eef50578e43 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -158,10 +158,8 @@ class XRSession final : public EventTarget,
+     return dom_overlay_state_.Get();
+   }
+   V8XRVisibilityState visibilityState() const;
+-  std::optional<float> frameRate() const { return std::nullopt; }
+-  NotShared<DOMFloat32Array> supportedFrameRates() const {
+-    return NotShared<DOMFloat32Array>();
+-  }
++  std::optional<float> frameRate() const { return frame_rate_; }
++  NotShared<DOMFloat32Array> supportedFrameRates();
+   XRRenderState* renderState() const { return render_state_.Get(); }
+ 
+   // ARCore by default returns textures in RGBA half-float HDR format and no
+@@ -214,7 +212,8 @@ class XRSession final : public EventTarget,
+   // Returns true iff depth is enabled on the system and depth_active_ is true.
+   bool IsDepthActive();
+ 
+-  ScriptPromise<IDLUndefined> updateTargetFrameRate(float rate,
++  ScriptPromise<IDLUndefined> updateTargetFrameRate(ScriptState* script_state,
++                                                    float rate,
+                                                     ExceptionState&);
+ 
+   ScriptPromise<XRReferenceSpace> requestReferenceSpace(
+@@ -509,6 +508,12 @@ class XRSession final : public EventTarget,
+   void OnCreateAnchorResult(ScriptPromiseResolver<XRAnchor>* resolver,
+                             const std::optional<device::AnchorId>& id);
+ 
++  // Null unless this session can change the device's frame rate.
++  device::mojom::blink::XRFrameRateController* FrameRateController();
++  void OnUpdateTargetFrameRate(ScriptPromiseResolver<IDLUndefined>* resolver);
++  // Sets frameRate, and queues frameratechange if it changed.
++  void SetFrameRate(float frame_rate);
++
+   void EnsureEnvironmentErrorHandler();
+   void OnEnvironmentProviderError();
+ 
+@@ -658,6 +663,12 @@ class XRSession final : public EventTarget,
+   uint32_t stage_parameters_id_ = 0;
+   device::mojom::blink::VRStageParametersPtr stage_parameters_;
+ 
++  // The nominal frame rate, if the device reports one.
++  std::optional<float> frame_rate_;
++  // Promises from updateTargetFrameRate that wait for the device.
++  HeapHashSet<Member<ScriptPromiseResolver<IDLUndefined>>>
++      update_target_frame_rate_promises_;
++
+   HeapMojoReceiver<device::mojom::blink::XRSessionClient, XRSession>
+       client_receiver_;
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.idl b/third_party/blink/renderer/modules/xr/xr_session.idl
+index c465648fa9a90..e74946b7747b4 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.idl
++++ b/third_party/blink/renderer/modules/xr/xr_session.idl
+@@ -69,7 +69,7 @@ enum XRReflectionFormat {
+   [RuntimeEnabled=WebXRFrameRate] attribute EventHandler onframeratechange;
+ 
+   [RaisesException] void updateRenderState(optional XRRenderStateInit init = {});
+-  [RuntimeEnabled=WebXRFrameRate, RaisesException] Promise<undefined> updateTargetFrameRate(float rate);
++  [RuntimeEnabled=WebXRFrameRate, CallWith=ScriptState, RaisesException] Promise<undefined> updateTargetFrameRate(float rate);
+   [CallWith=ScriptState, RaisesException] Promise<XRReferenceSpace> requestReferenceSpace(XRReferenceSpaceType type);
+ 
+   unsigned long requestAnimationFrame(XRFrameRequestCallback callback);
+diff --git a/third_party/blink/renderer/modules/xr/xr_system.cc b/third_party/blink/renderer/modules/xr/xr_system.cc
+index 7a807db661924..801c4261a262e 100644
+--- a/third_party/blink/renderer/modules/xr/xr_system.cc
++++ b/third_party/blink/renderer/modules/xr/xr_system.cc
+@@ -13,6 +13,7 @@
+ #include "base/trace_event/typed_macros.h"
+ #include "build/build_config.h"
+ #include "device/vr/public/mojom/vr_service.mojom-blink.h"
++#include "mojo/public/cpp/bindings/message.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -1490,6 +1491,21 @@ void XRSystem::OnRequestSessionReturned(
+     return;
+   }
+ 
++  // The device offers frame rate control with both a list of rates and a
++  // controller, or neither.
++  const auto& session = result->get_success()->session;
++  const bool has_frame_rates =
++      !session->device_config->supported_frame_rates.empty();
++  const bool has_frame_rate_controller =
++      session->frame_rate_controller.is_valid();
++  if (has_frame_rates != has_frame_rate_controller) {
++    mojo::ReportBadMessage("Frame rates and controller do not match.");
++    FinishSessionCreation(
++        query, device::mojom::blink::RequestSessionResult::NewFailureReason(
++                   device::mojom::RequestSessionError::INVALID_CLIENT));
++    return;
++  }
++
+   Element* fullscreen_element = nullptr;
+   const auto& enabled_features =
+       result->get_success()->session->enabled_features;
+diff --git a/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js b/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js
+index 707919a81e3b2..2bba6fb53e346 100644
+--- a/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js
++++ b/third_party/blink/web_tests/external/wpt/resources/chromium/webxr-test.js
+@@ -1307,6 +1307,8 @@ class MockRuntime {
+                                    xrSessionMojom.XRSessionFeature.LAYERS) ?
+                   (16 - 1) / 2 :
+                   1,
++              // The mock does not let the page change the frame rate.
++              supportedFrameRates: [],
+             },
+             enviromentBlendMode: this.enviromentBlendMode_,
+             interactionMode: this.interactionMode_
+diff --git a/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js b/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
+index 3e6a52853bd46..6b7f737cfd1c7 100644
+--- a/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
++++ b/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
+@@ -102,3 +102,74 @@ MockVRService.prototype.getFramesThrottled = function() {
+ 
+   return this.frames_throttled_;
+ };
++
++// XRFrameRateController. Sessions requested after setFrameRates() can pick
++// one of |supportedFrameRates|.
++MockRuntime.prototype.setFrameRates = function(supportedFrameRates, frameRate) {
++  this.supported_frame_rates_ = supportedFrameRates;
++  this.frame_rate_ = frameRate;
++  this.requested_frame_rates_ = [];
++  this.hold_frame_rate_replies_ = false;
++  this.keep_frame_rate_ = false;
++};
++
++// Switches the device to |frameRate|. The page sees it in the next frame.
++MockRuntime.prototype.setFrameRate = function(frameRate) {
++  this.frame_rate_ = frameRate;
++};
++
++MockRuntime.prototype.getRequestedFrameRates = function() {
++  return this.requested_frame_rates_;
++};
++
++// Stops replying to updateTargetFrameRate, like a slow device.
++MockRuntime.prototype.holdFrameRateReplies = function() {
++  this.hold_frame_rate_replies_ = true;
++};
++
++// Ignores later requests, like a device capped by power saving.
++MockRuntime.prototype.keepFrameRate = function() {
++  this.keep_frame_rate_ = true;
++};
++
++// Switches at once unless keepFrameRate() was called. The page sees the new
++// rate in the next frame.
++MockRuntime.prototype.updateTargetFrameRate = function(rate) {
++  this.requested_frame_rates_.push(rate);
++  if (this.hold_frame_rate_replies_) {
++    return new Promise(() => {});
++  }
++  if (!this.keep_frame_rate_) {
++    this.frame_rate_ = rate;
++  }
++  return Promise.resolve();
++};
++
++MockRuntime.prototype._requestRuntimeSession_preFrameRate =
++    MockRuntime.prototype._requestRuntimeSession;
++MockRuntime.prototype._requestRuntimeSession = async function(sessionOptions) {
++  const result = await this._requestRuntimeSession_preFrameRate(sessionOptions);
++  if (!result.session || !this.supported_frame_rates_) {
++    return result;
++  }
++
++  const vrMojom =
++      await import('/gen/device/vr/public/mojom/vr_service.mojom.m.js');
++  this.frameRateControllerReceiver_ =
++      new vrMojom.XRFrameRateControllerReceiver(this);
++  result.session.frameRateController =
++      this.frameRateControllerReceiver_.$.bindNewPipeAndPassRemote();
++  result.session.deviceConfig.supportedFrameRates = this.supported_frame_rates_;
++  result.session.deviceConfig.frameRate = this.frame_rate_;
++  return result;
++};
++
++MockRuntime.prototype._injectAdditionalFrameData_preFrameRate =
++    MockRuntime.prototype._injectAdditionalFrameData;
++MockRuntime.prototype._injectAdditionalFrameData = function(options,
++                                                            frameData) {
++  this._injectAdditionalFrameData_preFrameRate(options, frameData);
++  if (this.frame_rate_ !== undefined) {
++    frameData.frameRate = this.frame_rate_;
++  }
++};
+diff --git a/third_party/blink/web_tests/wpt_internal/webxr/xrSession_frameRate.https.html b/third_party/blink/web_tests/wpt_internal/webxr/xrSession_frameRate.https.html
+new file mode 100644
+index 0000000000000..e492934de23e2
+--- /dev/null
++++ b/third_party/blink/web_tests/wpt_internal/webxr/xrSession_frameRate.https.html
+@@ -0,0 +1,136 @@
++<!DOCTYPE html>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>let additionalChromiumResources = ["resources/xr-internal-device-mocking.js"];</script>
++<script src="/webxr/resources/webxr_util.js"></script>
++<script src="/webxr/resources/webxr_test_constants.js"></script>
++
++<script>
++// The WebXR Test API cannot set up frame rates yet, so this test drives the
++// chromium mock directly.
++
++// Starts an immersive session and its frame loop on a device that runs at
++// |frameRate| and supports |supportedFrameRates|.
++async function requestSessionWithFrameRates(
++    t, gl, supportedFrameRates, frameRate) {
++  const controller = await navigator.xr.test.simulateDeviceConnection(
++      TRACKED_IMMERSIVE_DEVICE);
++  controller.setFrameRates(supportedFrameRates, frameRate);
++  await gl.makeXRCompatible();
++  const session = await new Promise((resolve, reject) => {
++    navigator.xr.test.simulateUserActivation(() => {
++      navigator.xr.requestSession('immersive-vr').then(resolve, reject);
++    });
++  });
++  t.add_cleanup(() => session.end().catch(() => {}));
++
++  session.updateRenderState({baseLayer: new XRWebGLLayer(session, gl)});
++  const onFrame = () => session.requestAnimationFrame(onFrame);
++  session.requestAnimationFrame(onFrame);
++  return {controller, session};
++}
++
++xr_session_promise_test(
++    'Frame rate is null when the device does not report it',
++    async (session, fakeDeviceController, t) => {
++      assert_equals(session.frameRate, null);
++      assert_equals(session.supportedFrameRates, null);
++      await promise_rejects_dom(
++          t, 'InvalidStateError', session.updateTargetFrameRate(90));
++    }, TRACKED_IMMERSIVE_DEVICE, 'immersive-vr');
++
++xr_promise_test('Session reports the device frame rates',
++    async (t, gl) => {
++  const {session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  assert_equals(session.frameRate, 90);
++  assert_array_equals(session.supportedFrameRates, [72, 90, 120]);
++  assert_true(session.supportedFrameRates instanceof Float32Array);
++}, {}, 'webgl');
++
++xr_promise_test('updateTargetFrameRate rejects unsupported rates',
++    async (t, gl) => {
++  const {controller, session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  await promise_rejects_js(t, TypeError, session.updateTargetFrameRate(60));
++  assert_array_equals(controller.getRequestedFrameRates(), []);
++}, {}, 'webgl');
++
++xr_promise_test('frameratechange follows updateTargetFrameRate',
++    async (t, gl) => {
++  const {controller, session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  const changed = new Promise(resolve => {
++    session.addEventListener('frameratechange', resolve, {once: true});
++  });
++  await session.updateTargetFrameRate(120);
++  assert_array_equals(controller.getRequestedFrameRates(), [120]);
++  const event = await changed;
++  assert_true(event instanceof XRSessionEvent);
++  assert_equals(event.session, session);
++  assert_equals(session.frameRate, 120);
++}, {}, 'webgl');
++
++xr_promise_test('updateTargetFrameRate resolves if the device keeps its rate',
++    async (t, gl) => {
++  const {controller, session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  controller.keepFrameRate();
++  let fired = false;
++  session.addEventListener('frameratechange', () => { fired = true; });
++  await session.updateTargetFrameRate(120);
++  // Let a few frames through.
++  for (let i = 0; i < 3; i++) {
++    await new Promise(resolve => session.requestAnimationFrame(resolve));
++  }
++  assert_false(fired);
++  assert_equals(session.frameRate, 90);
++}, {}, 'webgl');
++
++xr_promise_test('frameratechange fires when the device changes its rate',
++    async (t, gl) => {
++  const {controller, session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  const changed = new Promise(resolve => {
++    session.addEventListener('frameratechange', resolve, {once: true});
++  });
++  // The page learns of it from a frame.
++  controller.setFrameRate(72);
++  await changed;
++  assert_equals(session.frameRate, 72);
++}, {}, 'webgl');
++
++xr_promise_test('frameratechange does not fire when the rate is unchanged',
++    async (t, gl) => {
++  const {session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  let fired = false;
++  session.addEventListener('frameratechange', () => { fired = true; });
++  // Let a few frames through.
++  for (let i = 0; i < 3; i++) {
++    await new Promise(resolve => session.requestAnimationFrame(resolve));
++  }
++  assert_false(fired);
++  assert_equals(session.frameRate, 90);
++}, {}, 'webgl');
++
++xr_promise_test('updateTargetFrameRate rejects after the session ends',
++    async (t, gl) => {
++  const {session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  await session.end();
++  await promise_rejects_dom(
++      t, 'InvalidStateError', session.updateTargetFrameRate(90));
++}, {}, 'webgl');
++
++xr_promise_test('updateTargetFrameRate rejects if the session ends first',
++    async (t, gl) => {
++  const {controller, session} =
++      await requestSessionWithFrameRates(t, gl, [72, 90, 120], 90);
++  controller.holdFrameRateReplies();
++  const rejected = promise_rejects_dom(
++      t, 'InvalidStateError', session.updateTargetFrameRate(120));
++  await session.end();
++  await rejected;
++}, {}, 'webgl');
++</script>
+diff --git a/tools/cfi/ignores.txt b/tools/cfi/ignores.txt
+index 353c814e9f111..15da222a5f0f8 100644
+--- a/tools/cfi/ignores.txt
++++ b/tools/cfi/ignores.txt
+@@ -236,6 +236,7 @@ src:*third_party/angle/src/common/vulkan/vulkan_icd.cpp
+ # its trampoline dispatch through the same kind of pointers, and the mock's
+ # Vulkan calls go through vkGetInstanceProcAddr.
+ src:*third_party/openxr/src/src/*
++src:*device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+ src:*device/vr/openxr/linux/openxr_vulkan_context.cc
+ src:*device/vr/openxr/msft/openxr_anchor_manager_msft.cc
+ src:*device/vr/openxr/msft/openxr_scene_msft.cc
