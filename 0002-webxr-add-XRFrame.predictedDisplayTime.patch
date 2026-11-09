@@ -1,7 +1,7 @@
-From 0b4bac51a91e395d0c6c626ba6210f546ee99529 Mon Sep 17 00:00:00 2001
+From c3bf3cc1ad10ee6edbc078fb2617d7c11c158435 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 27 Sep 2026 17:43:58 +0800
-Subject: [PATCH 3/7] webxr: add XRFrame.predictedDisplayTime
+Subject: [PATCH 2/7] webxr: add XRFrame.predictedDisplayTime
 
 Expose when the device expects a frame to be displayed, behind
 WebXRSpecParity. Inline sessions report the animation frame time, as
@@ -16,45 +16,31 @@ it with the frame data. Blink converts it to the page's clock.
 Bug: 506004811
 Change-Id: I62e6a34d2e5084da6a414306cf809d60a3606494
 ---
- device/vr/BUILD.gn                            |  1 +
  .../openxr_platform_helper_android_statics.cc |  2 +-
  .../linux/openxr_platform_helper_linux.cc     |  3 +-
- device/vr/openxr/openxr_api_wrapper.cc        | 28 +++++++
- device/vr/openxr/openxr_api_wrapper.h         |  8 ++
- .../vr/openxr/openxr_api_wrapper_unittest.cc  | 73 +++++++++++++++++++
+ device/vr/openxr/openxr_api_wrapper.cc        | 30 ++++++++++
+ device/vr/openxr/openxr_api_wrapper.h         |  8 +++
+ .../vr/openxr/openxr_api_wrapper_unittest.cc  | 10 ++++
  device/vr/openxr/openxr_extension_helper.cc   |  3 +
  device/vr/openxr/openxr_extension_helper.h    |  3 +
  device/vr/openxr/openxr_platform.h            |  2 +
  device/vr/openxr/openxr_render_loop.cc        |  2 +
- device/vr/openxr/test/fake_openxr_impl_api.cc | 19 +++++
+ device/vr/openxr/test/fake_openxr_impl_api.cc | 19 ++++++
  device/vr/openxr/test/openxr_test_helper.cc   |  2 +
  device/vr/public/mojom/vr_service.mojom       |  2 +
  .../blink/renderer/modules/xr/xr_frame.cc     |  4 +-
  .../blink/renderer/modules/xr/xr_frame.h      |  6 ++
  .../blink/renderer/modules/xr/xr_frame.idl    |  1 +
  .../blink/renderer/modules/xr/xr_session.cc   | 13 ++++
- .../blink/renderer/modules/xr/xr_session.h    |  8 ++
+ .../blink/renderer/modules/xr/xr_session.h    |  8 +++
  .../idlharness.https.window-expected.txt      |  4 +-
  .../global-interface-listing-expected.txt     |  1 +
- .../resources/xr-internal-device-mocking.js   | 22 ++++++
- .../xrFrame_predictedDisplayTime.https.html   | 59 +++++++++++++++
+ .../resources/xr-internal-device-mocking.js   | 22 +++++++
+ .../xrFrame_predictedDisplayTime.https.html   | 60 +++++++++++++++++++
  third_party/openxr/BUILD.gn                   |  2 +
- 23 files changed, 262 insertions(+), 6 deletions(-)
- create mode 100644 device/vr/openxr/openxr_api_wrapper_unittest.cc
+ 22 files changed, 201 insertions(+), 6 deletions(-)
  create mode 100644 third_party/blink/web_tests/wpt_internal/webxr/xrFrame_predictedDisplayTime.https.html
 
-diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
-index 418a38b8c44ac..bf740aa62cc9a 100644
---- a/device/vr/BUILD.gn
-+++ b/device/vr/BUILD.gn
-@@ -439,6 +439,7 @@ if (enable_openxr) {
-       sources = [
-         "openxr/linux/openxr_graphics_binding_vulkan_unittest.cc",
-         "openxr/linux/openxr_platform_helper_linux_unittest.cc",
-+        "openxr/openxr_api_wrapper_unittest.cc",
-         "openxr/openxr_frame_rate_handler_unittest.cc",
-       ]
- 
 diff --git a/device/vr/openxr/android/openxr_platform_helper_android_statics.cc b/device/vr/openxr/android/openxr_platform_helper_android_statics.cc
 index 926c851250d2d..f803c09ecd084 100644
 --- a/device/vr/openxr/android/openxr_platform_helper_android_statics.cc
@@ -90,7 +76,7 @@ index 7cb471a838120..3b77dcd2254ee 100644
  
  OpenXrPlatformHelperLinux::OpenXrPlatformHelperLinux() = default;
 diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
-index 6f49886d38b1f..a92cbc4cb245c 100644
+index ff9185612cc73..2c66b2598dce0 100644
 --- a/device/vr/openxr/openxr_api_wrapper.cc
 +++ b/device/vr/openxr/openxr_api_wrapper.cc
 @@ -19,6 +19,7 @@
@@ -101,7 +87,7 @@ index 6f49886d38b1f..a92cbc4cb245c 100644
  #include "components/viz/common/gpu/context_provider.h"
  #include "device/vr/openxr/openxr_extension_helper.h"
  #include "device/vr/openxr/openxr_graphics_binding.h"
-@@ -134,6 +135,33 @@ std::vector<XrEnvironmentBlendMode> OpenXrApiWrapper::GetSupportedBlendModes(
+@@ -134,6 +135,35 @@ std::vector<XrEnvironmentBlendMode> OpenXrApiWrapper::GetSupportedBlendModes(
    return environment_blend_modes;
  }
  
@@ -112,8 +98,10 @@ index 6f49886d38b1f..a92cbc4cb245c 100644
 +    XrTime time) {
 +  const OpenXrExtensionMethods& methods = extension_helper.ExtensionMethods();
 +#if BUILDFLAG(IS_WIN)
++  // FromQPCValue() needs TimeTicks to count the performance counter.
 +  LARGE_INTEGER counter;
-+  if (!methods.xrConvertTimeToWin32PerformanceCounterKHR ||
++  if (!base::TimeTicks::IsHighResolution() ||
++      !methods.xrConvertTimeToWin32PerformanceCounterKHR ||
 +      XR_FAILED(methods.xrConvertTimeToWin32PerformanceCounterKHR(
 +          instance, time, &counter))) {
 +    return std::nullopt;
@@ -136,7 +124,7 @@ index 6f49886d38b1f..a92cbc4cb245c 100644
  
  OpenXrApiWrapper::~OpenXrApiWrapper() {
 diff --git a/device/vr/openxr/openxr_api_wrapper.h b/device/vr/openxr/openxr_api_wrapper.h
-index 44d5d2f7b06a2..332779ed3327b 100644
+index d2a6c7cbcef9d..c9903bf22ca5e 100644
 --- a/device/vr/openxr/openxr_api_wrapper.h
 +++ b/device/vr/openxr/openxr_api_wrapper.h
 @@ -13,6 +13,7 @@
@@ -145,8 +133,8 @@ index 44d5d2f7b06a2..332779ed3327b 100644
  #include "base/memory/raw_ptr.h"
 +#include "base/time/time.h"
  #include "device/vr/openxr/exit_xr_present_reason.h"
+ #include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
  #include "device/vr/openxr/openxr_anchor_manager.h"
- #include "device/vr/openxr/openxr_depth_sensor.h"
 @@ -84,6 +85,13 @@ class OpenXrApiWrapper {
        XrInstance instance,
        XrSystemId system);
@@ -162,74 +150,21 @@ index 44d5d2f7b06a2..332779ed3327b 100644
  
    // The supplied graphics_binding is guaranteed by the caller to exist until
 diff --git a/device/vr/openxr/openxr_api_wrapper_unittest.cc b/device/vr/openxr/openxr_api_wrapper_unittest.cc
-new file mode 100644
-index 0000000000000..d6b6862900855
---- /dev/null
+index 351c9bc19cbde..e239393fdb68f 100644
+--- a/device/vr/openxr/openxr_api_wrapper_unittest.cc
 +++ b/device/vr/openxr/openxr_api_wrapper_unittest.cc
-@@ -0,0 +1,73 @@
-+// Copyright 2026 The Chromium Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "device/vr/openxr/openxr_api_wrapper.h"
-+
-+#include <memory>
-+
-+#include "base/base_paths.h"
-+#include "base/check.h"
-+#include "base/files/file_path.h"
-+#include "base/path_service.h"
-+#include "base/scoped_environment_variable_override.h"
+@@ -17,6 +17,7 @@
+ #include "base/path_service.h"
+ #include "base/scoped_environment_variable_override.h"
+ #include "base/test/task_environment.h"
 +#include "base/time/time.h"
-+#include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
-+#include "device/vr/openxr/openxr_extension_helper.h"
-+#include "device/vr/openxr/test/openxr_mock_helper.h"
-+#include "testing/gtest/include/gtest/gtest.h"
-+#include "third_party/openxr/src/include/openxr/openxr.h"
-+
-+namespace device {
-+
-+namespace {
-+
-+// Points XR_RUNTIME_JSON at the mock runtime copied next to the test binary.
-+std::unique_ptr<base::ScopedEnvironmentVariableOverride>
-+UseMockOpenXrRuntime() {
-+  base::FilePath dir;
-+  CHECK(base::PathService::Get(base::DIR_EXE, &dir));
-+  return std::make_unique<base::ScopedEnvironmentVariableOverride>(
-+      "XR_RUNTIME_JSON",
-+      dir.Append(FILE_PATH_LITERAL("mock_vr_clients/bin/openxr/openxr.json"))
-+          .value());
-+}
-+
-+}  // namespace
-+
-+class OpenXrApiWrapperTest : public ::testing::Test {
-+ protected:
-+  void SetUp() override {
-+    mock_runtime_ = UseMockOpenXrRuntime();
-+    ASSERT_TRUE(InitializeOpenXrMockTrampoline());
-+    helper_ = std::make_unique<OpenXrPlatformHelperLinux>();
-+    ASSERT_TRUE(helper_->EnsureInitialized());
-+    ASSERT_TRUE(XR_SUCCEEDED(helper_->CreateInstance(&instance_)));
-+    extension_helper_ = std::make_unique<OpenXrExtensionHelper>(
-+        instance_, helper_->GetExtensionEnumeration());
-+  }
-+
-+  void TearDown() override {
-+    extension_helper_.reset();
-+    if (instance_ != XR_NULL_HANDLE) {
-+      helper_->DestroyInstance(instance_);
-+    }
-+    helper_.reset();
-+  }
-+
-+  std::unique_ptr<base::ScopedEnvironmentVariableOverride> mock_runtime_;
-+  std::unique_ptr<OpenXrPlatformHelperLinux> helper_;
-+  std::unique_ptr<OpenXrExtensionHelper> extension_helper_;
-+  XrInstance instance_ = XR_NULL_HANDLE;
-+};
-+
+ #include "device/vr/openxr/exit_xr_present_reason.h"
+ #include "device/vr/openxr/linux/openxr_platform_helper_linux.h"
+ #include "device/vr/openxr/openxr_extension_helper.h"
+@@ -166,4 +167,13 @@ TEST_F(OpenXrApiWrapperTest, SessionEndsWhenExited) {
+   EXPECT_EQ(resumed_count_, 0);
+ }
+ 
 +TEST_F(OpenXrApiWrapperTest, XrTimeToTimeTicks) {
 +  // The mock runtime's XrTime is CLOCK_MONOTONIC in nanoseconds, which is what
 +  // base::TimeTicks counts on Linux.
@@ -239,7 +174,7 @@ index 0000000000000..d6b6862900855
 +      base::TimeTicks() + base::Nanoseconds(time));
 +}
 +
-+}  // namespace device
+ }  // namespace device
 diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
 index 43f3250dd6994..4e51cc6d897ec 100644
 --- a/device/vr/openxr/openxr_extension_helper.cc
@@ -283,10 +218,10 @@ index 260b69d81026c..84f094046f031 100644
  #endif
  
 diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
-index 6d579910b3566..e099ae63e82d4 100644
+index 6ac1548c03d8a..5e7a1ee233bf3 100644
 --- a/device/vr/openxr/openxr_render_loop.cc
 +++ b/device/vr/openxr/openxr_render_loop.cc
-@@ -805,6 +805,8 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
+@@ -813,6 +813,8 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
    const XrTime frame_time = openxr_->GetPredictedDisplayTime();
  
    frame_data->time_delta = base::Nanoseconds(frame_time);
@@ -296,7 +231,7 @@ index 6d579910b3566..e099ae63e82d4 100644
  
    // Unless we are fully synchronized/visible we shouldn't report input state.
 diff --git a/device/vr/openxr/test/fake_openxr_impl_api.cc b/device/vr/openxr/test/fake_openxr_impl_api.cc
-index bb6d0fa114369..918fd079328af 100644
+index 4f82644103f21..13c79212cdee4 100644
 --- a/device/vr/openxr/test/fake_openxr_impl_api.cc
 +++ b/device/vr/openxr/test/fake_openxr_impl_api.cc
 @@ -8,6 +8,7 @@
@@ -329,7 +264,7 @@ index bb6d0fa114369..918fd079328af 100644
  XrResult XRAPI_PTR xrCreateAction(XrActionSet action_set,
                                    const XrActionCreateInfo* create_info,
                                    XrAction* action) {
-@@ -1574,6 +1590,9 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+@@ -1577,6 +1593,9 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
    TRY_LOAD_METHOD(xrAttachSessionActionSets);
    TRY_LOAD_METHOD(xrBeginFrame);
    TRY_LOAD_METHOD(xrBeginSession);
@@ -340,10 +275,10 @@ index bb6d0fa114369..918fd079328af 100644
    TRY_LOAD_METHOD(xrCreateActionSet);
    TRY_LOAD_METHOD(xrCreateActionSpace);
 diff --git a/device/vr/openxr/test/openxr_test_helper.cc b/device/vr/openxr/test/openxr_test_helper.cc
-index fa169d57135cd..aa6e6e1fa0bf9 100644
+index 025d4616f928b..b21c3ead6ec80 100644
 --- a/device/vr/openxr/test/openxr_test_helper.cc
 +++ b/device/vr/openxr/test/openxr_test_helper.cc
-@@ -75,12 +75,14 @@ const std::vector<const char*>& OpenXrTestHelper::GetSupportedExtensions() {
+@@ -114,12 +114,14 @@ const std::vector<const char*>& OpenXrTestHelper::GetSupportedExtensions() {
        XR_EXT_WIN32_APPCONTAINER_COMPATIBLE_EXTENSION_NAME,
  #elif BUILDFLAG(IS_ANDROID)
        XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
@@ -359,10 +294,10 @@ index fa169d57135cd..aa6e6e1fa0bf9 100644
        XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
  #endif
 diff --git a/device/vr/public/mojom/vr_service.mojom b/device/vr/public/mojom/vr_service.mojom
-index 7341d6d3dc0b7..0563b1f0f660a 100644
+index 4be38fe02fc23..6a961eeb311f9 100644
 --- a/device/vr/public/mojom/vr_service.mojom
 +++ b/device/vr/public/mojom/vr_service.mojom
-@@ -929,6 +929,8 @@ struct XRFrameData {
+@@ -941,6 +941,8 @@ struct XRFrameData {
    XRRenderInfo render_info;
    // Time delta from an unspecified origin.
    mojo_base.mojom.TimeDelta time_delta;
@@ -430,7 +365,7 @@ index b0af93c9bc7ba..5414820daaf54 100644
    [RuntimeEnabled=WebXR]
    readonly attribute XRAnchorSet trackedAnchors;
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 8d68fe82c1b45..3f15ab13ef15d 100644
+index 4cb85796a1d55..678b712cee7b2 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -37,6 +37,8 @@
@@ -442,7 +377,7 @@ index 8d68fe82c1b45..3f15ab13ef15d 100644
  #include "third_party/blink/renderer/modules/event_target_modules.h"
  #include "third_party/blink/renderer/modules/xr/vr_service_type_converters.h"
  #include "third_party/blink/renderer/modules/xr/xr_anchor_set.h"
-@@ -1979,6 +1981,17 @@ void XRSession::UpdatePresentationFrameState(
+@@ -2023,6 +2025,17 @@ void XRSession::UpdatePresentationFrameState(
    if (ended_)
      return;
  
@@ -461,7 +396,7 @@ index 8d68fe82c1b45..3f15ab13ef15d 100644
    // update the depthNear/Far used by the views.
    // TODO(crbug.com/452595360): Apply pending frame data on frame submit.
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index b09b094d86caf..6c9e4fc7a85cd 100644
+index 64eef50578e43..1be9b426d0b56 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -25,6 +25,7 @@
@@ -484,9 +419,9 @@ index b09b094d86caf..6c9e4fc7a85cd 100644
    XRSpace* viewerSpace() const;
  
    XRAnchorSet* TrackedAnchors() const;
-@@ -660,6 +666,8 @@ class XRSession final : public EventTarget,
-   // The nominal frame rate, if the device reports one.
-   std::optional<float> frame_rate_;
+@@ -669,6 +675,8 @@ class XRSession final : public EventTarget,
+   HeapHashSet<Member<ScriptPromiseResolver<IDLUndefined>>>
+       update_target_frame_rate_promises_;
  
 +  DOMHighResTimeStamp predicted_display_time_ = 0;
 +
@@ -514,10 +449,10 @@ index f2c4f1f3c2730..d602350641cbb 100644
    assert_true: The prototype object must have a property "skipRendering" expected true got false
  [FAIL] XRWebGLLayer interface: attribute fixedFoveation
 diff --git a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
-index 126acc8d47ad2..1492d29c9bff2 100644
+index 1e5bf431a4d51..17bc896ff5ca7 100644
 --- a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
 +++ b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
-@@ -13134,6 +13134,7 @@ interface XRFrame
+@@ -13166,6 +13166,7 @@ interface XRFrame
      attribute @@toStringTag
      getter detectedMeshes
      getter detectedPlanes
@@ -526,10 +461,10 @@ index 126acc8d47ad2..1492d29c9bff2 100644
      getter trackedAnchors
      method constructor
 diff --git a/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js b/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
-index 819680a079b1a..fc91e4b13b6cd 100644
+index 6b7f737cfd1c7..7a9c5b886254a 100644
 --- a/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
 +++ b/third_party/blink/web_tests/wpt_internal/webxr/resources/xr-internal-device-mocking.js
-@@ -154,3 +154,25 @@ MockRuntime.prototype._injectAdditionalFrameData = function(options,
+@@ -173,3 +173,25 @@ MockRuntime.prototype._injectAdditionalFrameData = function(options,
      frameData.frameRate = this.frame_rate_;
    }
  };
@@ -557,10 +492,10 @@ index 819680a079b1a..fc91e4b13b6cd 100644
 +};
 diff --git a/third_party/blink/web_tests/wpt_internal/webxr/xrFrame_predictedDisplayTime.https.html b/third_party/blink/web_tests/wpt_internal/webxr/xrFrame_predictedDisplayTime.https.html
 new file mode 100644
-index 0000000000000..46d26e4a624a7
+index 0000000000000..5565829f06ff1
 --- /dev/null
 +++ b/third_party/blink/web_tests/wpt_internal/webxr/xrFrame_predictedDisplayTime.https.html
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,60 @@
 +<!DOCTYPE html>
 +<script src="/resources/testharness.js"></script>
 +<script src="/resources/testharnessreport.js"></script>
@@ -596,9 +531,10 @@ index 0000000000000..46d26e4a624a7
 +xr_promise_test('predictedDisplayTime follows the device', async (t, gl) => {
 +  const controller = await navigator.xr.test.simulateDeviceConnection(
 +      TRACKED_IMMERSIVE_DEVICE);
-+  // Well after the time origin, 50ms apart.
++  // TimeTicks count from boot, so start far beyond any uptime, which is after
++  // the time origin. 50ms apart.
 +  const stepMs = 50;
-+  controller.setPredictedDisplayTimes(1e12, stepMs * 1000);
++  controller.setPredictedDisplayTimes(1e15, stepMs * 1000);
 +  await gl.makeXRCompatible();
 +  const session = await new Promise((resolve, reject) => {
 +    navigator.xr.test.simulateUserActivation(() => {
