@@ -1,7 +1,7 @@
-From 5d194290ae1b97603f355e0ea5ca5e3d17c4cd40 Mon Sep 17 00:00:00 2001
+From ace45bb5421857287739274d8ccd6aac2c6ee001 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 27 Sep 2026 21:05:28 +0800
-Subject: [PATCH 3/7] webxr: add XRSession.trackedSources and
+Subject: [PATCH 3/6] webxr: add XRSession.trackedSources and
  XRInputSource.skipRendering
 
 Implement both behind WebXRSpecParity.
@@ -46,10 +46,10 @@ Change-Id: I095380b06df462f85d468ec397fdb8b8861e426a
  create mode 100644 third_party/blink/web_tests/wpt_internal/webxr/xrSession_trackedSources.https.html
 
 diff --git a/content/browser/xr/metrics/webxr_session_tracker.cc b/content/browser/xr/metrics/webxr_session_tracker.cc
-index 24ab23c48c5b8..c9d88cb034ec7 100644
+index 46eaeb0a39a0e..b2c3cb01f70ea 100644
 --- a/content/browser/xr/metrics/webxr_session_tracker.cc
 +++ b/content/browser/xr/metrics/webxr_session_tracker.cc
-@@ -88,6 +88,7 @@ void WebXRSessionTracker::ReportFeatureUsed(
+@@ -87,6 +87,7 @@ void WebXRSessionTracker::ReportFeatureUsed(
      case XRSessionFeature::LAYERS:
      case XRSessionFeature::FRONT_FACING:
      case XRSessionFeature::WEBGPU:
@@ -57,7 +57,7 @@ index 24ab23c48c5b8..c9d88cb034ec7 100644
        // Not recording metrics for these features currently.
        break;
    }
-@@ -133,6 +134,7 @@ void WebXRSessionTracker::SetFeatureRequest(
+@@ -132,6 +133,7 @@ void WebXRSessionTracker::SetFeatureRequest(
      case XRSessionFeature::LAYERS:
      case XRSessionFeature::FRONT_FACING:
      case XRSessionFeature::WEBGPU:
@@ -66,10 +66,10 @@ index 24ab23c48c5b8..c9d88cb034ec7 100644
        break;
    }
 diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
-index 2c66b2598dce0..3bfcc67401cbf 100644
+index 845908970f45a..c55c30dfa6483 100644
 --- a/device/vr/openxr/openxr_api_wrapper.cc
 +++ b/device/vr/openxr/openxr_api_wrapper.cc
-@@ -648,6 +648,7 @@ XrResult OpenXrApiWrapper::EnableSupportedFeatures(
+@@ -651,6 +651,7 @@ XrResult OpenXrApiWrapper::EnableSupportedFeatures(
        case mojom::XRSessionFeature::IMAGE_TRACKING:
        case mojom::XRSessionFeature::CAMERA_ACCESS:
        case mojom::XRSessionFeature::DOM_OVERLAY:
@@ -102,10 +102,10 @@ index 2b9377469b8dc..5d2e29f2db193 100644
  
  // These values are persisted to logs. Entries should not be renumbered and
 diff --git a/third_party/blink/renderer/core/events/event_type_names.json5 b/third_party/blink/renderer/core/events/event_type_names.json5
-index 63e6bbfebbf9a..68118e63ebe8d 100644
+index 47c27748b4363..fa271db7395ef 100644
 --- a/third_party/blink/renderer/core/events/event_type_names.json5
 +++ b/third_party/blink/renderer/core/events/event_type_names.json5
-@@ -323,6 +323,7 @@
+@@ -324,6 +324,7 @@
      "touchmove",
      "touchstart",
      "track",
@@ -162,10 +162,10 @@ index 9cc5d6882bf37..cb3901440a798 100644
 +  [RuntimeEnabled=WebXRSpecParity] readonly attribute boolean skipRendering;
  };
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 678b712cee7b2..81fae1eda29a4 100644
+index 7b9fb5d6460db..f973dc9fb4c95 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -360,6 +360,7 @@ void XRSession::MetricsReporter::ReportFeatureUsed(
+@@ -361,6 +361,7 @@ void XRSession::MetricsReporter::ReportFeatureUsed(
      case XRSessionFeature::LAYERS:
      case XRSessionFeature::FRONT_FACING:
      case XRSessionFeature::WEBGPU:
@@ -173,7 +173,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
        // Not recording metrics for these features currently.
        break;
    }
-@@ -392,6 +393,7 @@ XRSession::XRSession(
+@@ -393,6 +394,7 @@ XRSession::XRSession(
            MakeGarbageCollected<XRPlaneManager>(base::PassKey<XRSession>{},
                                                 this)),
        input_sources_(MakeGarbageCollected<XRInputSourceArray>()),
@@ -181,7 +181,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
        empty_input_sources_(MakeGarbageCollected<XRInputSourceArray>()),
        client_receiver_(this, xr->GetExecutionContext()),
        callback_collection_(
-@@ -1124,6 +1126,13 @@ XRInputSourceArray* XRSession::inputSources(ScriptState* script_state) const {
+@@ -1125,6 +1127,13 @@ XRInputSourceArray* XRSession::inputSources(ScriptState* script_state) const {
    return input_sources_.Get();
  }
  
@@ -195,7 +195,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
  ScriptPromise<XRHitTestSource> XRSession::requestHitTestSource(
      ScriptState* script_state,
      XRHitTestOptionsInit* options_init,
-@@ -1693,8 +1702,13 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
+@@ -1694,8 +1703,13 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
      auto* input_source = (*input_sources_)[i];
      input_source->OnRemoved();
    }
@@ -209,7 +209,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
  
    if (canvas_input_provider_) {
      canvas_input_provider_->Stop();
-@@ -2621,8 +2635,18 @@ void XRSession::OnInputStateChangeInternal(
+@@ -2622,8 +2636,18 @@ void XRSession::OnInputStateChangeInternal(
          input_states) {
    HeapVector<Member<XRInputSource>> added;
    HeapVector<Member<XRInputSource>> removed;
@@ -228,7 +228,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
    DVLOG(2) << __func__ << ": frame_id=" << frame_id
             << " input_states.size()=" << input_states.size();
    // Build up our added array, and update the frame id of any active input
-@@ -2634,11 +2658,46 @@ void XRSession::OnInputStateChangeInternal(
+@@ -2635,11 +2659,46 @@ void XRSession::OnInputStateChangeInternal(
               << input_state->primary_input_pressed
               << " clicked=" << input_state->primary_input_clicked;
  
@@ -277,7 +277,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
  
      // Input sources should use DOM overlay hit test to check if they intersect
      // cross-origin content. If that's the case, the input source is set as
-@@ -2657,8 +2716,8 @@ void XRSession::OnInputStateChangeInternal(
+@@ -2658,8 +2717,8 @@ void XRSession::OnInputStateChangeInternal(
      if (stored_input_source != input_source) {
        DVLOG(2) << __func__ << ": stored_input_source != input_source";
        if (!hide_input_source) {
@@ -288,7 +288,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
          DVLOG(2) << __func__ << ": ADDED input_source "
                   << input_state->source_id;
        }
-@@ -2668,13 +2727,32 @@ void XRSession::OnInputStateChangeInternal(
+@@ -2669,13 +2728,32 @@ void XRSession::OnInputStateChangeInternal(
        if (stored_input_source) {
          stored_input_source->SetGamepadConnected(false);
          DVLOG(2) << __func__ << ": REMOVED stored_input_source";
@@ -322,7 +322,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
    // Remove any input sources that are inactive, and disconnect their gamepad.
    // Note that this is done in two passes because HeapHashMap makes no
    // guarantees about iterators on removal.
-@@ -2682,8 +2760,8 @@ void XRSession::OnInputStateChangeInternal(
+@@ -2683,8 +2761,8 @@ void XRSession::OnInputStateChangeInternal(
    // processing removed, because if we replaced any input sources, they would
    // also be in removed, and we'd remove our newly added source.
    Vector<uint32_t> inactive_sources;
@@ -333,7 +333,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
      if (input_source->activeFrameId() != frame_id) {
        inactive_sources.push_back(input_source->source_id());
        input_source->OnRemoved();
-@@ -2692,13 +2770,7 @@ void XRSession::OnInputStateChangeInternal(
+@@ -2693,13 +2771,7 @@ void XRSession::OnInputStateChangeInternal(
    }
  
    for (uint32_t source_id : inactive_sources) {
@@ -348,7 +348,7 @@ index 678b712cee7b2..81fae1eda29a4 100644
    }
  }
  
-@@ -2894,6 +2966,7 @@ void XRSession::Trace(Visitor* visitor) const {
+@@ -2895,6 +2967,7 @@ void XRSession::Trace(Visitor* visitor) const {
    visitor->Trace(animation_frame_);
    visitor->Trace(empty_input_sources_);
    visitor->Trace(input_sources_);
@@ -357,10 +357,10 @@ index 678b712cee7b2..81fae1eda29a4 100644
    visitor->Trace(canvas_input_provider_);
    visitor->Trace(overlay_element_);
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 1be9b426d0b56..7f538efbfe3ae 100644
+index 64b43a6171085..8b5c4bad5ecf3 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
-@@ -262,6 +262,7 @@ class XRSession final : public EventTarget,
+@@ -263,6 +263,7 @@ class XRSession final : public EventTarget,
    void cancelAnimationFrame(uint32_t id);
  
    XRInputSourceArray* inputSources(ScriptState*) const;
@@ -368,7 +368,7 @@ index 1be9b426d0b56..7f538efbfe3ae 100644
  
    ScriptPromise<XRHitTestSource> requestHitTestSource(
        ScriptState* script_state,
-@@ -474,6 +475,11 @@ class XRSession final : public EventTarget,
+@@ -475,6 +476,11 @@ class XRSession final : public EventTarget,
        int16_t frame_id,
        base::span<const device::mojom::blink::XRInputSourceStatePtr>
            input_states);
@@ -380,7 +380,7 @@ index 1be9b426d0b56..7f538efbfe3ae 100644
    void ProcessInputSourceEvents(
        base::span<const device::mojom::blink::XRInputSourceStatePtr>
            input_states);
-@@ -652,6 +658,7 @@ class XRSession final : public EventTarget,
+@@ -653,6 +659,7 @@ class XRSession final : public EventTarget,
  
    Member<XRFrame> animation_frame_ = nullptr;
    Member<XRInputSourceArray> input_sources_;
@@ -401,7 +401,7 @@ index e74946b7747b4..2533b182d8606 100644
    readonly attribute XRReflectionFormat preferredReflectionFormat;
    [RuntimeEnabled=WebXREnabledFeatures] readonly attribute FrozenArray<DOMString> enabledFeatures;
 diff --git a/third_party/blink/renderer/modules/xr/xr_system.cc b/third_party/blink/renderer/modules/xr/xr_system.cc
-index 801c4261a262e..d0cd5bf6323bd 100644
+index 000d3885c0248..aae3fa3eef59d 100644
 --- a/third_party/blink/renderer/modules/xr/xr_system.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_system.cc
 @@ -172,6 +172,7 @@ bool IsFeatureValidForMode(device::mojom::XRSessionFeature feature,
@@ -487,10 +487,10 @@ index d602350641cbb..a423b6b92087d 100644
    assert_true: The prototype object must have a property "fixedFoveation" expected true got false
  [FAIL] XRWebGLLayer interface: xrWebGLLayer must inherit property "fixedFoveation" with the proper type
 diff --git a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
-index 17bc896ff5ca7..52a3dbd6920d9 100644
+index 98d36382ed536..f25a266f845df 100644
 --- a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
 +++ b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
-@@ -13228,6 +13228,7 @@ interface XRInputSource
+@@ -13226,6 +13226,7 @@ interface XRInputSource
      getter hand
      getter handedness
      getter profiles
@@ -498,7 +498,7 @@ index 17bc896ff5ca7..52a3dbd6920d9 100644
      getter targetRayMode
      getter targetRaySpace
      method constructor
-@@ -13411,6 +13412,7 @@ interface XRSession : EventTarget
+@@ -13409,6 +13410,7 @@ interface XRSession : EventTarget
      getter preferredReflectionFormat
      getter renderState
      getter supportedFrameRates

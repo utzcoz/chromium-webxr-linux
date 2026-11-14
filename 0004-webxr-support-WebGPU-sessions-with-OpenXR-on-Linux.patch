@@ -1,7 +1,7 @@
-From db9d69a64bd98dfd217d9957d36de1d22fff13b5 Mon Sep 17 00:00:00 2001
+From 6048ec85cfdfdd75cc948cde6093c6271b9523d2 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 4 Oct 2026 14:27:38 +0800
-Subject: [PATCH 4/7] webxr: support WebGPU sessions with OpenXR on Linux
+Subject: [PATCH 4/6] webxr: support WebGPU sessions with OpenXR on Linux
 
 WebGPU cannot write to the DMA-BUF shared images that the OpenXR
 backend uses on Linux (crbug.com/330385376), so the backend did not
@@ -331,13 +331,13 @@ index 0000000000000..849013fb6a29e
 +
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_GPU_COPY_SWAP_CHAIN_H_
 diff --git a/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py b/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py
-index f500b3f1e0d7a..be2322b286dcb 100755
+index 1dbed125f108a..0015a34462cd1 100755
 --- a/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py
 +++ b/third_party/blink/tools/blinkpy/presubmit/audit_non_blink_usage.py
-@@ -1865,6 +1865,7 @@ _CONFIG = [
-             'gpu::ClientSharedImage',
+@@ -1878,6 +1878,7 @@ _CONFIG = [
              'gpu::ContextSupport',
              'gpu::gles2::GLES2Interface',
+             'gpu::ImageInfo',
 +            'gpu::kNullSurfaceHandle',
              'gpu::Mailbox',
              'gpu::raster::RasterInterface',

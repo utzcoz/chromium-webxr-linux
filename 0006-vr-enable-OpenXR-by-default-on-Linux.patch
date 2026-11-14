@@ -1,7 +1,7 @@
-From 58928b657ccc833c719a7aab268b74755deac6e1 Mon Sep 17 00:00:00 2001
+From a5e16439a6d3b5a899fa718f26a5e282ba89a9b5 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 18 Oct 2026 20:35:15 +0800
-Subject: [PATCH 6/7] vr: enable OpenXR by default on Linux
+Subject: [PATCH 6/6] vr: enable OpenXR by default on Linux
 
 Enable the OpenXR feature by default on Linux, as on Windows, so that
 immersive-vr sessions work with an installed OpenXR runtime without

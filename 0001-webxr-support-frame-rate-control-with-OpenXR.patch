@@ -1,7 +1,7 @@
-From 0fb809e96380d1007a23d790bb63132d4392754e Mon Sep 17 00:00:00 2001
+From 93df53b6d9b6b9a56342f4e07d2a5576754e99b3 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Tue, 27 Oct 2026 22:31:24 +0800
-Subject: [PATCH 1/7] webxr: support frame rate control with OpenXR
+Subject: [PATCH 1/6] webxr: support frame rate control with OpenXR
 
 Implement XRSession.frameRate, supportedFrameRates and
 updateTargetFrameRate with XR_FB_display_refresh_rate. Until now they
@@ -593,10 +593,10 @@ index 0000000000000..128cfe1fef5a4
 +
 +}  // namespace device
 diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
-index b7a6bd87e62c6..ff9185612cc73 100644
+index f85a83e53a43a..123d3177bddec 100644
 --- a/device/vr/openxr/openxr_api_wrapper.cc
 +++ b/device/vr/openxr/openxr_api_wrapper.cc
-@@ -147,6 +147,7 @@ void OpenXrApiWrapper::Reset() {
+@@ -148,6 +148,7 @@ void OpenXrApiWrapper::Reset() {
    scene_understanding_manager_.reset();
    unbounded_space_provider_.reset();
    visibility_mask_handler_.reset();
@@ -604,7 +604,7 @@ index b7a6bd87e62c6..ff9185612cc73 100644
    unbounded_space_ = XR_NULL_HANDLE;
    local_space_ = XR_NULL_HANDLE;
    stage_space_ = XR_NULL_HANDLE;
-@@ -450,6 +451,10 @@ OpenXrDepthSensor* OpenXrApiWrapper::GetDepthSensor() {
+@@ -451,6 +452,10 @@ OpenXrDepthSensor* OpenXrApiWrapper::GetDepthSensor() {
    return depth_sensor_.get();
  }
  
@@ -615,7 +615,7 @@ index b7a6bd87e62c6..ff9185612cc73 100644
  XrResult OpenXrApiWrapper::EnableSupportedFeatures(
      const OpenXrExtensionHelper& extension_helper) {
    CHECK(session_options_);
-@@ -731,6 +736,9 @@ XrResult OpenXrApiWrapper::InitSession(
+@@ -734,6 +739,9 @@ XrResult OpenXrApiWrapper::InitSession(
          extension_helper, session_);
    }
  
@@ -625,7 +625,7 @@ index b7a6bd87e62c6..ff9185612cc73 100644
    EnsureEventPolling();
  
    return XR_SUCCESS;
-@@ -1039,8 +1047,12 @@ XrResult OpenXrApiWrapper::BeginSession() {
+@@ -1042,8 +1050,12 @@ XrResult OpenXrApiWrapper::BeginSession() {
    }
  
    XrResult xr_result = xrBeginSession(session_, &session_begin_info);
@@ -639,7 +639,7 @@ index b7a6bd87e62c6..ff9185612cc73 100644
  
    // Only the first xrBeginSession() starts the WebXR session. Later ones
    // resume it after the runtime stopped it.
-@@ -1668,6 +1680,13 @@ XrResult OpenXrApiWrapper::ProcessEvents() {
+@@ -1670,6 +1682,13 @@ XrResult OpenXrApiWrapper::ProcessEvents() {
        if (visibility_mask_handler_) {
          visibility_mask_handler_->OnVisibilityMaskChanged(*mask_changed_event);
        }
@@ -654,7 +654,7 @@ index b7a6bd87e62c6..ff9185612cc73 100644
        DVLOG(1) << __func__ << " Unhandled event type: " << event_data.type;
        TRACE_EVENT_INSTANT("xr", "UnandledXrEvent", "type", event_data.type);
 diff --git a/device/vr/openxr/openxr_api_wrapper.h b/device/vr/openxr/openxr_api_wrapper.h
-index 8f80c884b2619..d2a6c7cbcef9d 100644
+index 5abc5434be573..54f67a4443040 100644
 --- a/device/vr/openxr/openxr_api_wrapper.h
 +++ b/device/vr/openxr/openxr_api_wrapper.h
 @@ -14,6 +14,7 @@
@@ -665,7 +665,7 @@ index 8f80c884b2619..d2a6c7cbcef9d 100644
  #include "device/vr/openxr/openxr_anchor_manager.h"
  #include "device/vr/openxr/openxr_depth_sensor.h"
  #include "device/vr/openxr/openxr_graphics_binding.h"
-@@ -138,6 +139,7 @@ class OpenXrApiWrapper {
+@@ -139,6 +140,7 @@ class OpenXrApiWrapper {
    OpenXrHitTestManager* GetHitTestManager();
    OpenXrLightEstimator* GetLightEstimator();
    OpenXrDepthSensor* GetDepthSensor();
@@ -673,7 +673,7 @@ index 8f80c884b2619..d2a6c7cbcef9d 100644
  
    void OnContextProviderCreated(
        scoped_refptr<viz::ContextProvider> context_provider);
-@@ -283,6 +285,7 @@ class OpenXrApiWrapper {
+@@ -284,6 +286,7 @@ class OpenXrApiWrapper {
    std::unique_ptr<OpenXrMeshManager> mesh_manager_;
    std::unique_ptr<OpenXrUnboundedSpaceProvider> unbounded_space_provider_;
    std::unique_ptr<OpenXrVisibilityMaskHandler> visibility_mask_handler_;
@@ -682,10 +682,10 @@ index 8f80c884b2619..d2a6c7cbcef9d 100644
    // The context provider is owned by the OpenXrRenderLoop, and may change when
    // there is a context lost.
 diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
-index d495fc8d07d64..43f3250dd6994 100644
+index 6c993ad208a06..a79f6ce2da1e7 100644
 --- a/device/vr/openxr/openxr_extension_helper.cc
 +++ b/device/vr/openxr/openxr_extension_helper.cc
-@@ -173,6 +173,11 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
+@@ -174,6 +174,11 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
    // Visibility Mask
    OPENXR_LOAD_FN(xrGetVisibilityMaskKHR);
  
@@ -734,10 +734,10 @@ index 11fe768ff1950..ca11c0deff27c 100644
    for (const auto& extension : handled_extensions) {
      EnableExtensionIfSupported(extension.c_str());
 diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
-index 420456104e280..6ac1548c03d8a 100644
+index 8d9d586928bca..c8d9ff5d2b61d 100644
 --- a/device/vr/openxr/openxr_render_loop.cc
 +++ b/device/vr/openxr/openxr_render_loop.cc
-@@ -19,6 +19,7 @@
+@@ -20,6 +20,7 @@
  #include "build/build_config.h"
  #include "components/viz/common/gpu/context_provider.h"
  #include "device/vr/openxr/exit_xr_present_reason.h"
@@ -745,7 +745,7 @@ index 420456104e280..6ac1548c03d8a 100644
  #include "device/vr/openxr/openxr_api_wrapper.h"
  #include "device/vr/openxr/openxr_input_helper.h"
  #include "device/vr/openxr/openxr_util.h"
-@@ -97,6 +98,7 @@ void OpenXrRenderLoop::ExitPresent(ExitXrPresentReason reason) {
+@@ -98,6 +99,7 @@ void OpenXrRenderLoop::ExitPresent(ExitXrPresentReason reason) {
    presentation_receiver_.reset();
    frame_data_receiver_.reset();
    layer_manager_receiver_.reset();
@@ -753,7 +753,7 @@ index 420456104e280..6ac1548c03d8a 100644
    submit_client_.reset();
  
    pending_frame_.reset();
-@@ -294,6 +296,7 @@ void OpenXrRenderLoop::CleanUp() {
+@@ -295,6 +297,7 @@ void OpenXrRenderLoop::CleanUp() {
    presentation_receiver_.reset();
    frame_data_receiver_.reset();
    layer_manager_receiver_.reset();
@@ -761,7 +761,7 @@ index 420456104e280..6ac1548c03d8a 100644
    overlay_receiver_.reset();
    overlay_submit_callback_.Reset();
    pending_overlay_pose_callback_.Reset();
-@@ -434,6 +437,15 @@ void OpenXrRenderLoop::StartRuntimeFinish(
+@@ -432,6 +435,15 @@ void OpenXrRenderLoop::StartRuntimeFinish(
    if (auto* depth = openxr_->GetDepthSensor(); depth) {
      session->device_config->depth_configuration = depth->GetDepthConfig();
    }
@@ -777,7 +777,7 @@ index 420456104e280..6ac1548c03d8a 100644
    if (graphics_binding_->SupportsLayers()) {
      session->device_config->max_render_layers =
          openxr_->IsFeatureEnabled(mojom::XRSessionFeature::LAYERS)
-@@ -810,6 +822,10 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
+@@ -808,6 +820,10 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
  
    frame_data->render_info->mojo_from_viewer = openxr_->GetViewerPose();
  
@@ -788,7 +788,7 @@ index 420456104e280..6ac1548c03d8a 100644
    UpdateStageParameters();
  
    std::optional<gfx::Transform> local_from_floor = openxr_->GetLocalFromFloor();
-@@ -1311,6 +1327,27 @@ void OpenXrRenderLoop::SetEnabledCompositionLayers(
+@@ -1309,6 +1325,27 @@ void OpenXrRenderLoop::SetEnabledCompositionLayers(
        context_provider_->SharedImageInterface());
  }
  
@@ -849,7 +849,7 @@ index db498c5223416..6849a97f15b3d 100644
    mojom::XRVisibilityState visibility_state_ =
        mojom::XRVisibilityState::VISIBLE;
 diff --git a/device/vr/openxr/test/fake_openxr_impl_api.cc b/device/vr/openxr/test/fake_openxr_impl_api.cc
-index 985d094fa3c76..4f82644103f21 100644
+index 71839b9fdd033..cd39454a245e6 100644
 --- a/device/vr/openxr/test/fake_openxr_impl_api.cc
 +++ b/device/vr/openxr/test/fake_openxr_impl_api.cc
 @@ -552,6 +552,34 @@ XrResult XRAPI_PTR xrEndSession(XrSession session) {
@@ -918,7 +918,7 @@ index 985d094fa3c76..4f82644103f21 100644
  XrResult XRAPI_PTR
  xrReleaseSwapchainImage(XrSwapchain swapchain,
                          const XrSwapchainImageReleaseInfo* release_info) {
-@@ -1552,6 +1597,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+@@ -1550,6 +1595,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
    TRY_LOAD_METHOD(xrDestroySwapchain);
    TRY_LOAD_METHOD(xrEndFrame);
    TRY_LOAD_METHOD(xrEndSession);
@@ -926,7 +926,7 @@ index 985d094fa3c76..4f82644103f21 100644
    TRY_LOAD_METHOD(xrEnumerateEnvironmentBlendModes);
    TRY_LOAD_METHOD(xrEnumerateInstanceExtensionProperties);
    TRY_LOAD_METHOD(xrEnumerateSwapchainFormats);
-@@ -1566,6 +1612,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+@@ -1564,6 +1610,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
    TRY_LOAD_METHOD(xrGetActionStateVector2f);
    TRY_LOAD_METHOD(xrGetActionStatePose);
    TRY_LOAD_METHOD(xrGetCurrentInteractionProfile);
@@ -934,7 +934,7 @@ index 985d094fa3c76..4f82644103f21 100644
  #if BUILDFLAG(IS_ANDROID)
    TRY_LOAD_METHOD(xrGetOpenGLESGraphicsRequirementsKHR);
  #endif
-@@ -1583,6 +1630,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+@@ -1581,6 +1628,7 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
    TRY_LOAD_METHOD(xrLocateViews);
    TRY_LOAD_METHOD(xrPollEvent);
    TRY_LOAD_METHOD(xrReleaseSwapchainImage);
@@ -1148,7 +1148,7 @@ index bc339c619a24f..c784b04ec5990 100644
    bool last_has_focus_ = false;
  
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index ea33e05586131..4cb85796a1d55 100644
+index 7aa38c5c364d1..d272ad046b0d2 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -70,6 +70,7 @@
@@ -1168,7 +1168,7 @@ index ea33e05586131..4cb85796a1d55 100644
  const float kMinDefaultFramebufferScale = 0.1f;
  const float kMaxDefaultFramebufferScale = 1.0f;
  
-@@ -424,6 +427,8 @@ XRSession::XRSession(
+@@ -425,6 +428,8 @@ XRSession::XRSession(
    // device_config_ may be referenced throughout the lifetime of the session.
    UpdateViews(std::move(device_config_->views));
  
@@ -1177,7 +1177,7 @@ index ea33e05586131..4cb85796a1d55 100644
    DVLOG(2) << __func__
             << ": supports_viewport_scaling_=" << supports_viewport_scaling_;
  
-@@ -826,12 +831,84 @@ void XRSession::UpdateStageParameters(
+@@ -827,12 +832,84 @@ void XRSession::UpdateStageParameters(
    }
  }
  
@@ -1265,7 +1265,7 @@ index ea33e05586131..4cb85796a1d55 100644
  }
  
  ScriptPromise<XRReferenceSpace> XRSession::requestReferenceSpace(
-@@ -1648,6 +1725,7 @@ void XRSession::HandleShutdown() {
+@@ -1649,6 +1726,7 @@ void XRSession::HandleShutdown() {
        end_session_resolver_->Detach();
        end_session_resolver_ = nullptr;
      }
@@ -1273,7 +1273,7 @@ index ea33e05586131..4cb85796a1d55 100644
      return;
    }
  
-@@ -1658,6 +1736,15 @@ void XRSession::HandleShutdown() {
+@@ -1659,6 +1737,15 @@ void XRSession::HandleShutdown() {
    xr_->frameProvider()->OnSessionEnded(this);
    xr_->OnSessionEnded(this);
  
@@ -1289,7 +1289,7 @@ index ea33e05586131..4cb85796a1d55 100644
    if (end_session_resolver_) {
      DVLOG(3) << __func__ << ": Resolving end_session_resolver_";
      end_session_resolver_->Resolve();
-@@ -2045,6 +2132,10 @@ void XRSession::UpdatePresentationFrameState(
+@@ -2046,6 +2133,10 @@ void XRSession::UpdatePresentationFrameState(
      if (ended_) {
        return;
      }
@@ -1300,7 +1300,7 @@ index ea33e05586131..4cb85796a1d55 100644
    } else {
      UpdateWorldUnderstandingStateForFrame(timestamp, frame_data);
    }
-@@ -2797,6 +2888,7 @@ void XRSession::Trace(Visitor* visitor) const {
+@@ -2798,6 +2889,7 @@ void XRSession::Trace(Visitor* visitor) const {
    visitor->Trace(client_receiver_);
    visitor->Trace(callback_collection_);
    visitor->Trace(create_anchor_promises_);
@@ -1309,10 +1309,10 @@ index ea33e05586131..4cb85796a1d55 100644
    visitor->Trace(graphics_bindings_);
    visitor->Trace(reference_spaces_);
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 05ab92ac0ca5a..64eef50578e43 100644
+index b5311d9b5868b..2174213a274be 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
-@@ -158,10 +158,8 @@ class XRSession final : public EventTarget,
+@@ -159,10 +159,8 @@ class XRSession final : public EventTarget,
      return dom_overlay_state_.Get();
    }
    V8XRVisibilityState visibilityState() const;
@@ -1325,7 +1325,7 @@ index 05ab92ac0ca5a..64eef50578e43 100644
    XRRenderState* renderState() const { return render_state_.Get(); }
  
    // ARCore by default returns textures in RGBA half-float HDR format and no
-@@ -214,7 +212,8 @@ class XRSession final : public EventTarget,
+@@ -215,7 +213,8 @@ class XRSession final : public EventTarget,
    // Returns true iff depth is enabled on the system and depth_active_ is true.
    bool IsDepthActive();
  
@@ -1335,7 +1335,7 @@ index 05ab92ac0ca5a..64eef50578e43 100644
                                                      ExceptionState&);
  
    ScriptPromise<XRReferenceSpace> requestReferenceSpace(
-@@ -509,6 +508,12 @@ class XRSession final : public EventTarget,
+@@ -510,6 +509,12 @@ class XRSession final : public EventTarget,
    void OnCreateAnchorResult(ScriptPromiseResolver<XRAnchor>* resolver,
                              const std::optional<device::AnchorId>& id);
  
@@ -1348,7 +1348,7 @@ index 05ab92ac0ca5a..64eef50578e43 100644
    void EnsureEnvironmentErrorHandler();
    void OnEnvironmentProviderError();
  
-@@ -658,6 +663,12 @@ class XRSession final : public EventTarget,
+@@ -659,6 +664,12 @@ class XRSession final : public EventTarget,
    uint32_t stage_parameters_id_ = 0;
    device::mojom::blink::VRStageParametersPtr stage_parameters_;
  
@@ -1375,7 +1375,7 @@ index c465648fa9a90..e74946b7747b4 100644
  
    unsigned long requestAnimationFrame(XRFrameRequestCallback callback);
 diff --git a/third_party/blink/renderer/modules/xr/xr_system.cc b/third_party/blink/renderer/modules/xr/xr_system.cc
-index 7a807db661924..801c4261a262e 100644
+index 003184602022f..000d3885c0248 100644
 --- a/third_party/blink/renderer/modules/xr/xr_system.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_system.cc
 @@ -13,6 +13,7 @@
@@ -1386,7 +1386,7 @@ index 7a807db661924..801c4261a262e 100644
  #include "services/metrics/public/cpp/ukm_builders.h"
  #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
  #include "third_party/blink/public/common/features.h"
-@@ -1490,6 +1491,21 @@ void XRSystem::OnRequestSessionReturned(
+@@ -1489,6 +1490,21 @@ void XRSystem::OnRequestSessionReturned(
      return;
    }
  
@@ -1643,10 +1643,10 @@ index 0000000000000..e492934de23e2
 +}, {}, 'webgl');
 +</script>
 diff --git a/tools/cfi/ignores.txt b/tools/cfi/ignores.txt
-index 353c814e9f111..15da222a5f0f8 100644
+index 8ca096c16589b..361c8ba696a9d 100644
 --- a/tools/cfi/ignores.txt
 +++ b/tools/cfi/ignores.txt
-@@ -236,6 +236,7 @@ src:*third_party/angle/src/common/vulkan/vulkan_icd.cpp
+@@ -239,6 +239,7 @@ src:*third_party/angle/src/common/vulkan/vulkan_icd.cpp
  # its trampoline dispatch through the same kind of pointers, and the mock's
  # Vulkan calls go through vkGetInstanceProcAddr.
  src:*third_party/openxr/src/src/*

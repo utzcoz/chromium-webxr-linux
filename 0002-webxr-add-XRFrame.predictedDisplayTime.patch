@@ -1,7 +1,7 @@
-From c3bf3cc1ad10ee6edbc078fb2617d7c11c158435 Mon Sep 17 00:00:00 2001
+From bc894fd9eba3046f51865a62e0dd3e735024d9fd Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 27 Sep 2026 17:43:58 +0800
-Subject: [PATCH 2/7] webxr: add XRFrame.predictedDisplayTime
+Subject: [PATCH 2/6] webxr: add XRFrame.predictedDisplayTime
 
 Expose when the device expects a frame to be displayed, behind
 WebXRSpecParity. Inline sessions report the animation frame time, as
@@ -76,7 +76,7 @@ index 7cb471a838120..3b77dcd2254ee 100644
  
  OpenXrPlatformHelperLinux::OpenXrPlatformHelperLinux() = default;
 diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
-index ff9185612cc73..2c66b2598dce0 100644
+index 123d3177bddec..845908970f45a 100644
 --- a/device/vr/openxr/openxr_api_wrapper.cc
 +++ b/device/vr/openxr/openxr_api_wrapper.cc
 @@ -19,6 +19,7 @@
@@ -87,7 +87,7 @@ index ff9185612cc73..2c66b2598dce0 100644
  #include "components/viz/common/gpu/context_provider.h"
  #include "device/vr/openxr/openxr_extension_helper.h"
  #include "device/vr/openxr/openxr_graphics_binding.h"
-@@ -134,6 +135,35 @@ std::vector<XrEnvironmentBlendMode> OpenXrApiWrapper::GetSupportedBlendModes(
+@@ -135,6 +136,35 @@ std::vector<XrEnvironmentBlendMode> OpenXrApiWrapper::GetSupportedBlendModes(
    return environment_blend_modes;
  }
  
@@ -124,7 +124,7 @@ index ff9185612cc73..2c66b2598dce0 100644
  
  OpenXrApiWrapper::~OpenXrApiWrapper() {
 diff --git a/device/vr/openxr/openxr_api_wrapper.h b/device/vr/openxr/openxr_api_wrapper.h
-index d2a6c7cbcef9d..c9903bf22ca5e 100644
+index 54f67a4443040..a678eb4c8d07c 100644
 --- a/device/vr/openxr/openxr_api_wrapper.h
 +++ b/device/vr/openxr/openxr_api_wrapper.h
 @@ -13,6 +13,7 @@
@@ -135,7 +135,7 @@ index d2a6c7cbcef9d..c9903bf22ca5e 100644
  #include "device/vr/openxr/exit_xr_present_reason.h"
  #include "device/vr/openxr/fb/openxr_frame_rate_handler_fb.h"
  #include "device/vr/openxr/openxr_anchor_manager.h"
-@@ -84,6 +85,13 @@ class OpenXrApiWrapper {
+@@ -85,6 +86,13 @@ class OpenXrApiWrapper {
        XrInstance instance,
        XrSystemId system);
  
@@ -176,10 +176,10 @@ index 351c9bc19cbde..e239393fdb68f 100644
 +
  }  // namespace device
 diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
-index 43f3250dd6994..4e51cc6d897ec 100644
+index a79f6ce2da1e7..76d0c25e0741f 100644
 --- a/device/vr/openxr/openxr_extension_helper.cc
 +++ b/device/vr/openxr/openxr_extension_helper.cc
-@@ -180,6 +180,9 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
+@@ -181,6 +181,9 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
  
  #if BUILDFLAG(IS_WIN)
    OPENXR_LOAD_FN(xrConvertWin32PerformanceCounterToTimeKHR);
@@ -218,10 +218,10 @@ index 260b69d81026c..84f094046f031 100644
  #endif
  
 diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
-index 6ac1548c03d8a..5e7a1ee233bf3 100644
+index c8d9ff5d2b61d..dd8e6521472a0 100644
 --- a/device/vr/openxr/openxr_render_loop.cc
 +++ b/device/vr/openxr/openxr_render_loop.cc
-@@ -813,6 +813,8 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
+@@ -811,6 +811,8 @@ mojom::XRFrameDataPtr OpenXrRenderLoop::GetNextFrameData() {
    const XrTime frame_time = openxr_->GetPredictedDisplayTime();
  
    frame_data->time_delta = base::Nanoseconds(frame_time);
@@ -231,7 +231,7 @@ index 6ac1548c03d8a..5e7a1ee233bf3 100644
  
    // Unless we are fully synchronized/visible we shouldn't report input state.
 diff --git a/device/vr/openxr/test/fake_openxr_impl_api.cc b/device/vr/openxr/test/fake_openxr_impl_api.cc
-index 4f82644103f21..13c79212cdee4 100644
+index cd39454a245e6..8464e3ac812df 100644
 --- a/device/vr/openxr/test/fake_openxr_impl_api.cc
 +++ b/device/vr/openxr/test/fake_openxr_impl_api.cc
 @@ -8,6 +8,7 @@
@@ -264,7 +264,7 @@ index 4f82644103f21..13c79212cdee4 100644
  XrResult XRAPI_PTR xrCreateAction(XrActionSet action_set,
                                    const XrActionCreateInfo* create_info,
                                    XrAction* action) {
-@@ -1577,6 +1593,9 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
+@@ -1575,6 +1591,9 @@ XrResult XRAPI_PTR xrGetInstanceProcAddr(XrInstance instance,
    TRY_LOAD_METHOD(xrAttachSessionActionSets);
    TRY_LOAD_METHOD(xrBeginFrame);
    TRY_LOAD_METHOD(xrBeginSession);
@@ -365,7 +365,7 @@ index b0af93c9bc7ba..5414820daaf54 100644
    [RuntimeEnabled=WebXR]
    readonly attribute XRAnchorSet trackedAnchors;
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 4cb85796a1d55..678b712cee7b2 100644
+index d272ad046b0d2..7b9fb5d6460db 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -37,6 +37,8 @@
@@ -377,7 +377,7 @@ index 4cb85796a1d55..678b712cee7b2 100644
  #include "third_party/blink/renderer/modules/event_target_modules.h"
  #include "third_party/blink/renderer/modules/xr/vr_service_type_converters.h"
  #include "third_party/blink/renderer/modules/xr/xr_anchor_set.h"
-@@ -2023,6 +2025,17 @@ void XRSession::UpdatePresentationFrameState(
+@@ -2024,6 +2026,17 @@ void XRSession::UpdatePresentationFrameState(
    if (ended_)
      return;
  
@@ -396,10 +396,10 @@ index 4cb85796a1d55..678b712cee7b2 100644
    // update the depthNear/Far used by the views.
    // TODO(crbug.com/452595360): Apply pending frame data on frame submit.
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 64eef50578e43..1be9b426d0b56 100644
+index 2174213a274be..64b43a6171085 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
-@@ -25,6 +25,7 @@
+@@ -26,6 +26,7 @@
  #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_interaction_mode.h"
  #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_light_probe_init.h"
  #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_reflection_format.h"
@@ -407,7 +407,7 @@ index 64eef50578e43..1be9b426d0b56 100644
  #include "third_party/blink/renderer/core/dom/events/event_target.h"
  #include "third_party/blink/renderer/core/typed_arrays/dom_typed_array.h"
  #include "third_party/blink/renderer/modules/xr/average_timer.h"
-@@ -175,6 +176,11 @@ class XRSession final : public EventTarget,
+@@ -176,6 +177,11 @@ class XRSession final : public EventTarget,
  
    uint16_t maxRenderLayers() const { return device_config_->max_render_layers; }
  
@@ -419,7 +419,7 @@ index 64eef50578e43..1be9b426d0b56 100644
    XRSpace* viewerSpace() const;
  
    XRAnchorSet* TrackedAnchors() const;
-@@ -669,6 +675,8 @@ class XRSession final : public EventTarget,
+@@ -670,6 +676,8 @@ class XRSession final : public EventTarget,
    HeapHashSet<Member<ScriptPromiseResolver<IDLUndefined>>>
        update_target_frame_rate_promises_;
  
@@ -449,10 +449,10 @@ index f2c4f1f3c2730..d602350641cbb 100644
    assert_true: The prototype object must have a property "skipRendering" expected true got false
  [FAIL] XRWebGLLayer interface: attribute fixedFoveation
 diff --git a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
-index 1e5bf431a4d51..17bc896ff5ca7 100644
+index de35851737a83..98d36382ed536 100644
 --- a/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
 +++ b/third_party/blink/web_tests/webexposed/global-interface-listing-expected.txt
-@@ -13166,6 +13166,7 @@ interface XRFrame
+@@ -13164,6 +13164,7 @@ interface XRFrame
      attribute @@toStringTag
      getter detectedMeshes
      getter detectedPlanes

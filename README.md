@@ -8,15 +8,15 @@ WebXR for Linux builds of Chromium, through the OpenXR API, verified against
 [Monado], the open-source reference OpenXR runtime.
 
 The Linux OpenXR backend, its sandbox, frame synchronization and WebXR Layers
-are part of upstream Chromium. This repository carries seven pending patches:
-more WebXR APIs, WebGPU, the in-headset browser overlay, OpenXR on by default,
-NixOS and NVIDIA graphics-driver access in the XR sandbox.
+are part of upstream Chromium. This repository carries six pending patches:
+more WebXR APIs, WebGPU, the in-headset browser overlay and OpenXR on by
+default. NixOS and NVIDIA graphics-driver access is upstream.
 
 [Monado]: https://monado.dev/
 
 ## Status
 
-As of 2026-11-09. Review states are from Gerrit; milestones use Chromium's
+As of 2026-11-14. Review states are from Gerrit; milestones use Chromium's
 version at landing. Release versions and dates are from
 [chromiumdash](https://chromiumdash.appspot.com/schedule). A change ships in the
 listed milestone unless it misses that milestone's release branch.
@@ -38,12 +38,14 @@ listed milestone unless it misses that milestone's release branch.
 | vr: initialize the OpenXR graphics binding before sizing views | [8639597](https://crrev.com/c/8639597) | `310fdf9`, 2026-10-27, r1728339 | M159 | Scheduled for 2026-12-08 |
 | vr: make it possible to run the OpenXR browser tests on Linux | [8668230](https://crrev.com/c/8668230) | `8832499`, 2026-10-30, r1731867 | M159 | Scheduled for 2026-12-08 |
 | vr: support WiVRn in the Linux XR sandbox | [8696747](https://crrev.com/c/8696747) | `ab0b506`, 2026-11-04, r1735440 | M159 | Scheduled for 2026-12-08 |
+| vr: support NixOS and NVIDIA in the Linux XR sandbox | [8768720](https://crrev.com/c/8768720) | `1133d50`, 2026-11-12, r1742936 | M160 | Scheduled for 2027-01-05 |
 
 - M154 and M155 contain the backend, but nothing reaches it yet.
 - From M157, WebXR over OpenXR works end to end with
   `--enable-features=OpenXR`. The feature is off by default on Linux.
 - M158 adds WebXR Layers. Main now also has the M159 view-size fix,
-  browser-test rendering fixes and WiVRn sandbox support.
+  browser-test rendering fixes and WiVRn sandbox support, and the M160
+  NixOS/NVIDIA sandbox support.
 - Two changes landed twice:
   - The core change was reverted the day it first landed (`de6885c`): its unit
     tests failed the Linux CFI bot's `cfi-icall` check.
@@ -61,18 +63,16 @@ listed milestone unless it misses that milestone's release branch.
 | `0004` | webxr: support WebGPU sessions with OpenXR on Linux | [8510031](https://crrev.com/c/8510031) | In review (patch set 18) | M160, as above |
 | `0005` | vr: show the WebXR browser overlay on Linux | [8641284](https://crrev.com/c/8641284) | In review (patch set 3) | M160, as above |
 | `0006` | vr: enable OpenXR by default on Linux | [8641285](https://crrev.com/c/8641285) | In review (patch set 3); needs a launch decision | After the launch review |
-| `0007` | vr: support NixOS and NVIDIA in the Linux XR sandbox | [8768720](https://crrev.com/c/8768720) | Local update addressing review comments | M160 (2027-01-05) if landed before the 2026-11-30 branch point |
 
 M159 branched on 2026-11-09. Pending changes can ship in M160 if they land
 before its 2026-11-30 branch point; M160 stable is scheduled for 2027-01-05.
 These are not release commitments.
 
-The first six Gerrit changes form one relation chain in this order. Patch
-`0007` is independent and can also be applied alone.
+The six Gerrit changes form one relation chain in this order.
 
 ## The patches
 
-Apply `0001` through `0007` in order, on the base in [Base commits](#base-commits).
+Apply `0001` through `0006` in order, on the base in [Base commits](#base-commits).
 
 | Patch | What it adds | How to turn it on |
 | --- | --- | --- |
@@ -82,7 +82,6 @@ Apply `0001` through `0007` in order, on the base in [Base commits](#base-commit
 | `0004` | WebGPU sessions (`XRGPUBinding`) on Linux | `--enable-features=OpenXR,WebXRWebGPUBinding` |
 | `0005` | The in-headset browser overlay: permission prompts and capture indicators | On with the session |
 | `0006` | The `OpenXR` feature on by default on Linux, as on Windows | — |
-| `0007` | NixOS driver-profile access and NVIDIA device nodes, parameters, and scheduler queries | Automatic |
 
 How upstream WebXR Layers, `0004` and `0005` work is described under
 [Architecture](#architecture).
@@ -361,7 +360,7 @@ pre-sandbox hook prepares it before seccomp engages:
   - Since M157 Flatpak's GPU driver paths are readable too.
   - M159 adds WiVRn's socket and aliases relative runtime library paths so
     the loader can reuse libraries loaded before sandboxing.
-  - Patch `0007` reads `/run/opengl-driver` and the store directories its
+  - M160 reads `/run/opengl-driver` and the store directories its
     files resolve to, and preloads NixOS drivers separately from the FHS
     paths. It also grants NVIDIA's required device nodes and driver
     parameters, and permits scheduler priority queries. Unrelated
@@ -398,8 +397,9 @@ without `--no-sandbox`.
 Upstream Chromium runs WebXR over OpenXR on Linux from M157 (stable since
 2026-11-03), with `--enable-features=OpenXR`. M158 adds WebXR Layers.
 Current main also includes the M159 view-size fix, browser-test rendering
-fixes and WiVRn sandbox support. Frame rate, WebGPU, the in-headset overlay
-and NixOS driver access still need the patches here.
+fixes and WiVRn sandbox support; main also has NixOS and NVIDIA sandbox
+support. Frame rate, WebGPU and the in-headset overlay still need the patches
+here.
 
 Verified with the Chromium snapshot r1721517 (158.0.8111.0) against Monado,
 with Chromium's sandbox on: the OpenXR service ran in its own `xr_compositing`
@@ -472,7 +472,7 @@ which takes up to 5 s.
 
 | Component | Remote | Base |
 | --- | --- | --- |
-| Chromium | `https://chromium.googlesource.com/chromium/src.git` | `61f7ea5b4b802abe4ffc47c7a8b8ef88c5ffd1f6` (main, 2026-11-08 UTC, r1738597, 159.0.8151.0) |
+| Chromium | `https://chromium.googlesource.com/chromium/src.git` | `66d7a16eaca1989c919f2f9a68e3ba2bd2741c82` (main, 2026-11-14 UTC, r1744878, 160.0.8162.0) |
 | Monado | `https://gitlab.freedesktop.org/monado/monado.git` | `v25.1.0` or newer (verified at `v25.1.0-849-gded98428a`) |
 
 The series targets this base, which already includes the merged changes
@@ -533,7 +533,7 @@ must come from the same build, or clients get `XR_ERROR_RUNTIME_UNAVAILABLE`.
 mkdir chromium && cd chromium
 fetch --nohooks chromium
 cd src
-git checkout 61f7ea5b4b802abe4ffc47c7a8b8ef88c5ffd1f6
+git checkout 66d7a16eaca1989c919f2f9a68e3ba2bd2741c82
 gclient sync
 ./build/install-build-deps.sh
 ```
@@ -650,7 +650,7 @@ the bottom of `chrome://chrome-urls` to open it.
   `LINEAR` DMA-BUF imports, which is what X11 uses. With
   `--vmodule='openxr_graphics_binding_vulkan=1'`, `via GBM native pixmap` in
   the log means the usable path is in effect.
-- **NixOS verification.** Patch `0007` was tested with NixOS-style driver
+- **NixOS verification.** The upstream sandbox change was tested with NixOS-style driver
   paths on Ubuntu/AMD RADV against Monado, with Chromium's sandbox enabled.
   A NixOS user reports SteamVR/Index works with the NVIDIA changes. This
   hardware result has not been reproduced locally.
