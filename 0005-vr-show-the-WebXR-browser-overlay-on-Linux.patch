@@ -1,4 +1,4 @@
-From 03e2e2a1d7f026044e93b1e12ad1ed5a80983f07 Mon Sep 17 00:00:00 2001
+From d66c0ccf356d6d51894018e47a234dd6e07cfb39 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 18 Oct 2026 20:35:14 +0800
 Subject: [PATCH 5/6] vr: show the WebXR browser overlay on Linux
@@ -644,7 +644,7 @@ index 8093b026591a1..d75bace7bc961 100644
  
  TEST_F(OpenXrGraphicsBindingVulkanTest, CanCreateSession) {
 diff --git a/device/vr/openxr/linux/openxr_vulkan_context.cc b/device/vr/openxr/linux/openxr_vulkan_context.cc
-index e788b9ad18b60..dfe71ce966b12 100644
+index 5b3c6aed344e1..25cdeb70854c6 100644
 --- a/device/vr/openxr/linux/openxr_vulkan_context.cc
 +++ b/device/vr/openxr/linux/openxr_vulkan_context.cc
 @@ -8,6 +8,8 @@
@@ -656,7 +656,7 @@ index e788b9ad18b60..dfe71ce966b12 100644
  #include <string_view>
  #include <vector>
  
-@@ -29,6 +31,102 @@ namespace device {
+@@ -30,6 +32,102 @@ namespace device {
  namespace {
  // gpu::VulkanFunctionPointers requires Vulkan 1.1 or newer.
  constexpr uint32_t kVulkanApiVersion = VK_API_VERSION_1_1;
@@ -759,7 +759,7 @@ index e788b9ad18b60..dfe71ce966b12 100644
  }  // namespace
  
  OpenXrVulkanContext::OpenXrVulkanContext() = default;
-@@ -53,6 +151,7 @@ void OpenXrVulkanContext::DestroyCommandPool() {
+@@ -54,6 +152,7 @@ void OpenXrVulkanContext::DestroyCommandPool() {
  }
  
  void OpenXrVulkanContext::DestroyVulkanState() {
@@ -767,7 +767,7 @@ index e788b9ad18b60..dfe71ce966b12 100644
    DestroyCommandPool();
    vk_queue_ = VK_NULL_HANDLE;  // Queue lifetime is tied to VkDevice.
    if (vk_device_ != VK_NULL_HANDLE) {
-@@ -834,4 +933,374 @@ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
+@@ -831,4 +930,374 @@ bool OpenXrVulkanContext::CopyToSwapchainImage(IntermediateImage& src_image,
    return true;
  }
  
@@ -1143,7 +1143,7 @@ index e788b9ad18b60..dfe71ce966b12 100644
 +
  }  // namespace device
 diff --git a/device/vr/openxr/linux/openxr_vulkan_context.h b/device/vr/openxr/linux/openxr_vulkan_context.h
-index f07e64eb200e8..aa41e1faff5e0 100644
+index 25e43b56c2487..fc4ebb7850d47 100644
 --- a/device/vr/openxr/linux/openxr_vulkan_context.h
 +++ b/device/vr/openxr/linux/openxr_vulkan_context.h
 @@ -5,11 +5,16 @@

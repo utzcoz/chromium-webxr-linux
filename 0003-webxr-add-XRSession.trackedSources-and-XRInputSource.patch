@@ -1,4 +1,4 @@
-From ace45bb5421857287739274d8ccd6aac2c6ee001 Mon Sep 17 00:00:00 2001
+From 74bcb1118cdd7c4b8db2132b9261b32315a28a04 Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 27 Sep 2026 21:05:28 +0800
 Subject: [PATCH 3/6] webxr: add XRSession.trackedSources and

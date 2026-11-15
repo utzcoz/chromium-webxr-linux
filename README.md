@@ -9,14 +9,15 @@ WebXR for Linux builds of Chromium, through the OpenXR API, verified against
 
 The Linux OpenXR backend, its sandbox, frame synchronization and WebXR Layers
 are part of upstream Chromium. This repository carries six pending patches:
-more WebXR APIs, WebGPU, the in-headset browser overlay and OpenXR on by
-default. NixOS and NVIDIA graphics-driver access is upstream.
+scoped OpenXR CFI exemptions, more WebXR APIs, WebGPU, the in-headset browser
+overlay and OpenXR on by default. NixOS and NVIDIA graphics-driver access is
+upstream.
 
 [Monado]: https://monado.dev/
 
 ## Status
 
-As of 2026-11-14. Review states are from Gerrit; milestones use Chromium's
+As of 2026-11-15. Review states are from Gerrit; milestones use Chromium's
 version at landing. Release versions and dates are from
 [chromiumdash](https://chromiumdash.appspot.com/schedule). A change ships in the
 listed milestone unless it misses that milestone's release branch.
@@ -39,13 +40,14 @@ listed milestone unless it misses that milestone's release branch.
 | vr: make it possible to run the OpenXR browser tests on Linux | [8668230](https://crrev.com/c/8668230) | `8832499`, 2026-10-30, r1731867 | M159 | Scheduled for 2026-12-08 |
 | vr: support WiVRn in the Linux XR sandbox | [8696747](https://crrev.com/c/8696747) | `ab0b506`, 2026-11-04, r1735440 | M159 | Scheduled for 2026-12-08 |
 | vr: support NixOS and NVIDIA in the Linux XR sandbox | [8768720](https://crrev.com/c/8768720) | `1133d50`, 2026-11-12, r1742936 | M160 | Scheduled for 2027-01-05 |
+| webxr: support frame rate control with OpenXR | [8473130](https://crrev.com/c/8473130) | `172b31e`, 2026-11-14, r1744932 | M160 | Scheduled for 2027-01-05 |
 
 - M154 and M155 contain the backend, but nothing reaches it yet.
 - From M157, WebXR over OpenXR works end to end with
   `--enable-features=OpenXR`. The feature is off by default on Linux.
 - M158 adds WebXR Layers. Main now also has the M159 view-size fix,
   browser-test rendering fixes and WiVRn sandbox support, and the M160
-  NixOS/NVIDIA sandbox support.
+  NixOS/NVIDIA sandbox support and OpenXR frame rate control.
 - Two changes landed twice:
   - The core change was reverted the day it first landed (`de6885c`): its unit
     tests failed the Linux CFI bot's `cfi-icall` check.
@@ -57,12 +59,12 @@ listed milestone unless it misses that milestone's release branch.
 
 | Patch | Change | Gerrit | Review state | Earliest stable |
 | --- | --- | --- | --- | --- |
-| `0001` | webxr: support frame rate control with OpenXR | [8473130](https://crrev.com/c/8473130) | In review (patch set 26), Code-Review +1 | M160 (2027-01-05) if landed before the 2026-11-30 branch point |
-| `0002` | webxr: add XRFrame.predictedDisplayTime | [8510029](https://crrev.com/c/8510029) | In review (patch set 18) | M160, as above |
-| `0003` | webxr: add XRSession.trackedSources and XRInputSource.skipRendering | [8510030](https://crrev.com/c/8510030) | In review (patch set 18) | M160, as above |
-| `0004` | webxr: support WebGPU sessions with OpenXR on Linux | [8510031](https://crrev.com/c/8510031) | In review (patch set 18) | M160, as above |
-| `0005` | vr: show the WebXR browser overlay on Linux | [8641284](https://crrev.com/c/8641284) | In review (patch set 3) | M160, as above |
-| `0006` | vr: enable OpenXR by default on Linux | [8641285](https://crrev.com/c/8641285) | In review (patch set 3); needs a launch decision | After the launch review |
+| `0001` | vr: scope OpenXR CFI exemptions to runtime dispatch | [8815820](https://crrev.com/c/8815820) | In review (patch set 3) | M160 (2027-01-05) if landed before the 2026-11-30 branch point |
+| `0002` | webxr: add XRFrame.predictedDisplayTime | [8510029](https://crrev.com/c/8510029) | In review (patch set 19) | M160, as above |
+| `0003` | webxr: add XRSession.trackedSources and XRInputSource.skipRendering | [8510030](https://crrev.com/c/8510030) | In review (patch set 19) | M160, as above |
+| `0004` | webxr: support WebGPU sessions with OpenXR on Linux | [8510031](https://crrev.com/c/8510031) | In review (patch set 19) | M160, as above |
+| `0005` | vr: show the WebXR browser overlay on Linux | [8641284](https://crrev.com/c/8641284) | In review (patch set 4) | M160, as above |
+| `0006` | vr: enable OpenXR by default on Linux | [8641285](https://crrev.com/c/8641285) | In review (patch set 4); needs a launch decision | After the launch review |
 
 M159 branched on 2026-11-09. Pending changes can ship in M160 if they land
 before its 2026-11-30 branch point; M160 stable is scheduled for 2027-01-05.
@@ -76,7 +78,7 @@ Apply `0001` through `0006` in order, on the base in [Base commits](#base-commit
 
 | Patch | What it adds | How to turn it on |
 | --- | --- | --- |
-| `0001` | `XRSession.frameRate`, `supportedFrameRates`, `updateTargetFrameRate()` and `frameratechange`, from `XR_FB_display_refresh_rate`, on every OpenXR platform | `--enable-blink-features=WebXRFrameRate` |
+| `0001` | Scope OpenXR's indirect-call CFI exemptions to runtime dispatch and use generated Vulkan bindings for imported-fence calls | No flag needed |
 | `0002` | `XRFrame.predictedDisplayTime`, from OpenXR's predicted display time | `--enable-blink-features=WebXRSpecParity` |
 | `0003` | `XRSession.trackedSources` for input sources without a primary action, and `XRInputSource.skipRendering` | `WebXRSpecParity`, and the `tracked-sources` session feature |
 | `0004` | WebGPU sessions (`XRGPUBinding`) on Linux | `--enable-features=OpenXR,WebXRWebGPUBinding` |
@@ -85,6 +87,10 @@ Apply `0001` through `0006` in order, on the base in [Base commits](#base-commit
 
 How upstream WebXR Layers, `0004` and `0005` work is described under
 [Architecture](#architecture).
+
+The base also includes `XRSession.frameRate`, `supportedFrameRates`,
+`updateTargetFrameRate()` and `frameratechange` for OpenXR, behind
+`--enable-blink-features=WebXRFrameRate`.
 
 ## What works on Linux
 
@@ -398,8 +404,8 @@ Upstream Chromium runs WebXR over OpenXR on Linux from M157 (stable since
 2026-11-03), with `--enable-features=OpenXR`. M158 adds WebXR Layers.
 Current main also includes the M159 view-size fix, browser-test rendering
 fixes and WiVRn sandbox support; main also has NixOS and NVIDIA sandbox
-support. Frame rate, WebGPU and the in-headset overlay still need the patches
-here.
+support and OpenXR frame rate control. WebGPU and the in-headset overlay still
+need the patches here.
 
 Verified with the Chromium snapshot r1721517 (158.0.8111.0) against Monado,
 with Chromium's sandbox on: the OpenXR service ran in its own `xr_compositing`
@@ -472,7 +478,7 @@ which takes up to 5 s.
 
 | Component | Remote | Base |
 | --- | --- | --- |
-| Chromium | `https://chromium.googlesource.com/chromium/src.git` | `66d7a16eaca1989c919f2f9a68e3ba2bd2741c82` (main, 2026-11-14 UTC, r1744878, 160.0.8162.0) |
+| Chromium | `https://chromium.googlesource.com/chromium/src.git` | `172b31e58f65601307232c6ca0753d819e8039a9` (main, 2026-11-14 UTC, r1744932, 160.0.8162.0) |
 | Monado | `https://gitlab.freedesktop.org/monado/monado.git` | `v25.1.0` or newer (verified at `v25.1.0-849-gded98428a`) |
 
 The series targets this base, which already includes the merged changes
@@ -533,7 +539,7 @@ must come from the same build, or clients get `XR_ERROR_RUNTIME_UNAVAILABLE`.
 mkdir chromium && cd chromium
 fetch --nohooks chromium
 cd src
-git checkout 66d7a16eaca1989c919f2f9a68e3ba2bd2741c82
+git checkout 172b31e58f65601307232c6ca0753d819e8039a9
 gclient sync
 ./build/install-build-deps.sh
 ```

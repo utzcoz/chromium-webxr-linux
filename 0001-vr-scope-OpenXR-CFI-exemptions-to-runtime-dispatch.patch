@@ -1,0 +1,502 @@
+From 7c2b91207f8ed2a8c0e64315e670411d553c552a Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sat, 14 Nov 2026 15:59:23 +0800
+Subject: [PATCH 1/6] vr: scope OpenXR CFI exemptions to runtime dispatch
+
+Route OpenXR extension calls through a typed wrapper that disables
+indirect-call CFI only at the cross-library call. Keep CFI enabled in
+the callers and remove their file-level exemptions.
+
+Use the generated Vulkan bindings for imported-fence calls.
+
+Bug: 506004811
+Change-Id: I7f9540a6d351051e31a87f3fa3aedbc5293f926f
+---
+ device/vr/BUILD.gn                            |  1 +
+ .../openxr/fb/openxr_frame_rate_handler_fb.cc | 14 ++++---
+ .../vr/openxr/linux/openxr_vulkan_context.cc  | 33 ++++++++--------
+ .../vr/openxr/linux/openxr_vulkan_context.h   |  4 +-
+ device/vr/openxr/openxr_extension_handle.h    |  5 ++-
+ device/vr/openxr/openxr_extension_helper.cc   | 22 ++++-------
+ device/vr/openxr/openxr_extension_helper.h    |  5 ++-
+ device/vr/openxr/openxr_function.h            | 38 +++++++++++++++++++
+ device/vr/openxr/openxr_spatial_utils.cc      | 19 ++++++----
+ .../openxr/openxr_visibility_mask_handler.cc  |  2 +-
+ gpu/vulkan/generate_bindings.py               |  7 ++++
+ gpu/vulkan/vulkan_function_pointers.cc        | 17 +++++++++
+ gpu/vulkan/vulkan_function_pointers.h         | 13 +++++++
+ tools/cfi/ignores.txt                         | 26 +++----------
+ 14 files changed, 132 insertions(+), 74 deletions(-)
+ create mode 100644 device/vr/openxr/openxr_function.h
+
+diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
+index f27400c4bc32a..a1f7fa9c70d86 100644
+--- a/device/vr/BUILD.gn
++++ b/device/vr/BUILD.gn
+@@ -192,6 +192,7 @@ if (enable_vr) {
+         "openxr/openxr_extension_handler_factory.h",
+         "openxr/openxr_extension_helper.cc",
+         "openxr/openxr_extension_helper.h",
++        "openxr/openxr_function.h",
+         "openxr/openxr_graphics_binding.cc",
+         "openxr/openxr_graphics_binding.h",
+         "openxr/openxr_hand_tracker.cc",
+diff --git a/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc b/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+index 21f01b4b26e1b..532764a4b8c33 100644
+--- a/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
++++ b/device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+@@ -61,13 +61,13 @@ OpenXrFrameRateHandlerFb::OpenXrFrameRateHandlerFb(const Methods& methods,
+   ReadFrameRate();
+ 
+   uint32_t count = 0;
+-  if (XR_FAILED(methods_.enumerate_display_refresh_rates(session_, 0, &count,
+-                                                         nullptr))) {
++  OpenXrFunction<PFN_xrEnumerateDisplayRefreshRatesFB> enumerate(
++      methods_.enumerate_display_refresh_rates);
++  if (XR_FAILED(enumerate(session_, 0, &count, nullptr))) {
+     return;
+   }
+   std::vector<float> rates(count);
+-  if (XR_FAILED(methods_.enumerate_display_refresh_rates(
+-          session_, rates.size(), &count, rates.data()))) {
++  if (XR_FAILED(enumerate(session_, rates.size(), &count, rates.data()))) {
+     return;
+   }
+   std::erase_if(rates, [](float rate) { return !IsValidRate(rate); });
+@@ -83,7 +83,8 @@ OpenXrFrameRateHandlerFb::~OpenXrFrameRateHandlerFb() = default;
+ void OpenXrFrameRateHandlerFb::RequestFrameRate(float rate) {
+   CHECK(std::ranges::contains(supported_frame_rates_, rate));
+   // Errors are ignored: the runtime may ignore requests anyway.
+-  methods_.request_display_refresh_rate(session_, rate);
++  OpenXrFunction<PFN_xrRequestDisplayRefreshRateFB>{
++      methods_.request_display_refresh_rate}(session_, rate);
+ }
+ 
+ void OpenXrFrameRateHandlerFb::OnSessionBegin() {
+@@ -92,7 +93,8 @@ void OpenXrFrameRateHandlerFb::OnSessionBegin() {
+ 
+ void OpenXrFrameRateHandlerFb::ReadFrameRate() {
+   float frame_rate = 0;
+-  if (XR_SUCCEEDED(methods_.get_display_refresh_rate(session_, &frame_rate)) &&
++  if (XR_SUCCEEDED(OpenXrFunction<PFN_xrGetDisplayRefreshRateFB>{
++          methods_.get_display_refresh_rate}(session_, &frame_rate)) &&
+       IsValidRate(frame_rate)) {
+     frame_rate_ = frame_rate;
+   }
+diff --git a/device/vr/openxr/linux/openxr_vulkan_context.cc b/device/vr/openxr/linux/openxr_vulkan_context.cc
+index e788b9ad18b60..5b3c6aed344e1 100644
+--- a/device/vr/openxr/linux/openxr_vulkan_context.cc
++++ b/device/vr/openxr/linux/openxr_vulkan_context.cc
+@@ -17,6 +17,7 @@
+ #include "base/logging.h"
+ #include "base/native_library.h"
+ #include "base/posix/eintr_wrapper.h"
++#include "device/vr/openxr/openxr_function.h"
+ #include "device/vr/openxr/openxr_util.h"
+ #include "gpu/vulkan/vulkan_function_pointers.h"
+ #include "third_party/openxr/src/include/openxr/openxr.h"
+@@ -64,6 +65,7 @@ void OpenXrVulkanContext::DestroyVulkanState() {
+     vk_instance_ = VK_NULL_HANDLE;
+   }
+   binding_ = {XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
++  has_external_fence_fd_ = false;
+   initialized_ = false;
+ }
+ 
+@@ -94,15 +96,15 @@ bool OpenXrVulkanContext::Initialize(XrInstance instance, XrSystemId system) {
+   }
+ 
+   // --- Step 2: Resolve XR function pointers ---------------------------------
+-  // Declares and resolves `PFN_<fn> <fn>`. All four come from the required
+-  // XR_KHR_vulkan_enable2, so a missing one is fatal.
+-#define OPENXR_LOAD_FN(fn)                                               \
+-  PFN_##fn fn = nullptr;                                                 \
+-  if (XR_FAILED(xrGetInstanceProcAddr(                                   \
+-          instance, #fn, reinterpret_cast<PFN_xrVoidFunction*>(&fn))) || \
+-      !fn) {                                                             \
+-    DVLOG(1) << __func__ << " Failed to resolve " << #fn;                \
+-    return false;                                                        \
++  // All four functions come from the required XR_KHR_vulkan_enable2 extension.
++#define OPENXR_LOAD_FN(fn)                                         \
++  OpenXrFunction<PFN_##fn> fn;                                     \
++  if (XR_FAILED(xrGetInstanceProcAddr(                             \
++          instance, #fn,                                           \
++          reinterpret_cast<PFN_xrVoidFunction*>(fn.receive()))) || \
++      !fn) {                                                       \
++    DVLOG(1) << __func__ << " Failed to resolve " << #fn;          \
++    return false;                                                  \
+   }
+ 
+   OPENXR_LOAD_FN(xrGetVulkanGraphicsRequirements2KHR);
+@@ -249,8 +251,7 @@ bool OpenXrVulkanContext::Initialize(XrInstance instance, XrSystemId system) {
+   has_external_semaphore_fd_ =
+       MaybeAdd(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+   MaybeAdd(VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME);
+-  const bool has_external_fence_fd =
+-      MaybeAdd(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
++  has_external_fence_fd_ = MaybeAdd(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
+ 
+   float queue_priority = 1.0f;
+   VkDeviceQueueCreateInfo queue_ci{};
+@@ -298,11 +299,6 @@ bool OpenXrVulkanContext::Initialize(XrInstance instance, XrSystemId system) {
+     DestroyVulkanState();
+     return false;
+   }
+-  if (has_external_fence_fd) {
+-    import_fence_fd_ = reinterpret_cast<PFN_vkImportFenceFdKHR>(
+-        vkGetDeviceProcAddr(vk_device_, "vkImportFenceFdKHR"));
+-  }
+-
+   // --- Step 8: Retrieve the VkQueue and create a command pool ---------------
+   // Only needed when has_external_memory_fd_ is true; without it the copy and
+   // sync methods early-return, so there is no blit/sync to set up.
+@@ -631,9 +627,10 @@ void OpenXrVulkanContext::DestroyIntermediateImage(IntermediateImage& image) {
+ }
+ 
+ bool OpenXrVulkanContext::WaitOnWriteFence(const IntermediateImage& image) {
+-  if (!import_fence_fd_) {
++  if (!has_external_fence_fd_) {
+     return false;
+   }
++  CHECK(gpu::GetVulkanFunctionPointers()->vkImportFenceFdKHR);
+ 
+   // What a reader has to wait for is the writes.
+   struct dma_buf_export_sync_file request;
+@@ -661,7 +658,7 @@ bool OpenXrVulkanContext::WaitOnWriteFence(const IntermediateImage& image) {
+   // A signaled fence says nothing: the writes may be done, or their driver may
+   // not attach its fences to the DMA-BUF at all.
+   bool pending = false;
+-  if (import_fence_fd_(vk_device_, &import_info) != VK_SUCCESS) {
++  if (vkImportFenceFdKHR(vk_device_, &import_info) != VK_SUCCESS) {
+     close(import_info.fd);
+   } else {
+     pending = vkGetFenceStatus(vk_device_, fence) == VK_NOT_READY;
+diff --git a/device/vr/openxr/linux/openxr_vulkan_context.h b/device/vr/openxr/linux/openxr_vulkan_context.h
+index f07e64eb200e8..25e43b56c2487 100644
+--- a/device/vr/openxr/linux/openxr_vulkan_context.h
++++ b/device/vr/openxr/linux/openxr_vulkan_context.h
+@@ -131,8 +131,8 @@ class DEVICE_VR_EXPORT OpenXrVulkanContext {
+   // creation.
+   bool has_external_semaphore_fd_ = false;
+ 
+-  // From VK_KHR_external_fence_fd; null without it.
+-  PFN_vkImportFenceFdKHR import_fence_fd_ = nullptr;
++  // True if VK_KHR_external_fence_fd was enabled at VkDevice creation.
++  bool has_external_fence_fd_ = false;
+ 
+   // Queue, command pool, command buffer, and submit fence for
+   // CopyToSwapchainImage blits.
+diff --git a/device/vr/openxr/openxr_extension_handle.h b/device/vr/openxr/openxr_extension_handle.h
+index 0e2343d9c9d7e..4d6df8100f82c 100644
+--- a/device/vr/openxr/openxr_extension_handle.h
++++ b/device/vr/openxr/openxr_extension_handle.h
+@@ -5,6 +5,7 @@
+ #define DEVICE_VR_OPENXR_OPENXR_EXTENSION_HANDLE_H_
+ 
+ #include "base/scoped_generic.h"
++#include "device/vr/openxr/openxr_function.h"
+ #include "third_party/openxr/src/include/openxr/openxr.h"
+ 
+ namespace device {
+@@ -16,7 +17,9 @@ struct OpenXrExtensionHandleTraits {
+       const PFN_DestroyFunction destroy_function)
+       : destroyer_(destroy_function) {}
+   static HandleType InvalidValue() { return XR_NULL_HANDLE; }
+-  void Free(HandleType value) { destroyer_(value); }
++  void Free(HandleType value) {
++    OpenXrFunction<PFN_DestroyFunction>{destroyer_}(value);
++  }
+ 
+  private:
+   const PFN_DestroyFunction destroyer_;
+diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
+index a79f6ce2da1e7..026a4ac2d5bfd 100644
+--- a/device/vr/openxr/openxr_extension_helper.cc
++++ b/device/vr/openxr/openxr_extension_helper.cc
+@@ -22,21 +22,13 @@
+ namespace device {
+ 
+ namespace {
+-// A helper macro to avoid the repetitive boilerplate required to load a
+-// function from OpenXR. Note that these are typically extension functions and
+-// that the name of the method is repeated several times throughout the
+-// declaration. For a function named "xrCreateHandTrackerEXT" this will exapnd
+-// to the following:
+-// std::ignore = xrGetInstanceProcAddr(
+-//     instance, "xrCreateHandTrackerEXT",
+-//     reinterpret_cast<PFN_xrVoidFunction*>(
+-//         const_cast<PFN_xrCreateHandTrackerEXT*>(
+-//             &extension_methods_.xrCreateHandTrackerEXT)));
+-#define OPENXR_LOAD_FN(name)                 \
+-  std::ignore = xrGetInstanceProcAddr(       \
+-      instance, #name,                       \
+-      reinterpret_cast<PFN_xrVoidFunction*>( \
+-          const_cast<PFN_##name*>(&extension_methods_.name)))
++// Load an extension function from OpenXR.
++#define OPENXR_LOAD_FN(name)                                               \
++  std::ignore = xrGetInstanceProcAddr(                                     \
++      instance, #name,                                                     \
++      reinterpret_cast<PFN_xrVoidFunction*>(                               \
++          const_cast<OpenXrFunction<PFN_##name>&>(extension_methods_.name) \
++              .receive()))
+ 
+ // The ExtensionHandlers are all created/checked in very similar ways, with the
+ // only difference really being what method they need called on the
+diff --git a/device/vr/openxr/openxr_extension_helper.h b/device/vr/openxr/openxr_extension_helper.h
+index d512f9d6bee3b..eb21a41da7f88 100644
+--- a/device/vr/openxr/openxr_extension_helper.h
++++ b/device/vr/openxr/openxr_extension_helper.h
+@@ -14,6 +14,7 @@
+ #include "build/buildflag.h"
+ #include "device/vr/openxr/openxr_anchor_manager.h"
+ #include "device/vr/openxr/openxr_depth_sensor.h"
++#include "device/vr/openxr/openxr_function.h"
+ #include "device/vr/openxr/openxr_hand_tracker.h"
+ #include "device/vr/openxr/openxr_light_estimator.h"
+ #include "device/vr/openxr/openxr_platform.h"
+@@ -29,8 +30,8 @@ namespace device {
+ // Helper macro to facilitate declaring the method names of functions that will
+ // be loaded from the OpenXR Runtime.
+ // Expands to e.g.
+-// PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT{nullptr};
+-#define OPENXR_DECLARE_FN(name) PFN_##name name = nullptr
++// OpenXrFunction<PFN_xrCreateHandTrackerEXT> xrCreateHandTrackerEXT;
++#define OPENXR_DECLARE_FN(name) OpenXrFunction<PFN_##name> name
+ 
+ struct OpenXrExtensionMethods {
+   OpenXrExtensionMethods();
+diff --git a/device/vr/openxr/openxr_function.h b/device/vr/openxr/openxr_function.h
+new file mode 100644
+index 0000000000000..c77e4bc9d50c4
+--- /dev/null
++++ b/device/vr/openxr/openxr_function.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DEVICE_VR_OPENXR_OPENXR_FUNCTION_H_
++#define DEVICE_VR_OPENXR_OPENXR_FUNCTION_H_
++
++#include "third_party/openxr/src/include/openxr/openxr.h"
++
++namespace device {
++
++template <typename T>
++class OpenXrFunction;
++
++template <typename R, typename... Args>
++class OpenXrFunction<R(XRAPI_PTR*)(Args...)> {
++ public:
++  using Fn = R(XRAPI_PTR*)(Args...);
++
++  OpenXrFunction() = default;
++  OpenXrFunction(Fn fn) : fn_(fn) {}
++
++  explicit operator bool() const { return !!fn_; }
++  // Calls through the raw pointer fail CFI checks.
++  operator Fn() const { return fn_; }
++
++  // The runtime is not built with Chromium's CFI; see tools/cfi/ignores.txt.
++  R operator()(Args... args) const { return fn_(args...); }
++
++  Fn* receive() { return &fn_; }
++
++ private:
++  Fn fn_ = nullptr;
++};
++
++}  // namespace device
++
++#endif  // DEVICE_VR_OPENXR_OPENXR_FUNCTION_H_
+diff --git a/device/vr/openxr/openxr_spatial_utils.cc b/device/vr/openxr/openxr_spatial_utils.cc
+index 594f36f408250..501d6a5594e36 100644
+--- a/device/vr/openxr/openxr_spatial_utils.cc
++++ b/device/vr/openxr/openxr_spatial_utils.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "device/vr/openxr/openxr_spatial_utils.h"
+ 
++#include "device/vr/openxr/openxr_function.h"
++
+ namespace device {
+ 
+ std::vector<XrSpatialCapabilityEXT> GetCapabilities(
+@@ -12,15 +14,16 @@ std::vector<XrSpatialCapabilityEXT> GetCapabilities(
+     XrSystemId system) {
+   std::vector<XrSpatialCapabilityEXT> capabilities;
+   uint32_t count;
+-  if (XR_FAILED(xrEnumerateSpatialCapabilitiesEXT(instance, system, 0, &count,
+-                                                  nullptr)) ||
++  OpenXrFunction<PFN_xrEnumerateSpatialCapabilitiesEXT> enumerate(
++      xrEnumerateSpatialCapabilitiesEXT);
++  if (XR_FAILED(enumerate(instance, system, 0, &count, nullptr)) ||
+       count == 0) {
+     return capabilities;
+   }
+ 
+   capabilities.resize(count);
+-  if (XR_FAILED(xrEnumerateSpatialCapabilitiesEXT(
+-          instance, system, count, &count, capabilities.data()))) {
++  if (XR_FAILED(
++          enumerate(instance, system, count, &count, capabilities.data()))) {
+     capabilities.clear();
+   }
+ 
+@@ -36,8 +39,9 @@ std::vector<XrSpatialComponentTypeEXT> GetSupportedComponentTypes(
+   std::vector<XrSpatialComponentTypeEXT> supported_components;
+   XrSpatialCapabilityComponentTypesEXT component_types{
+       XR_TYPE_SPATIAL_CAPABILITY_COMPONENT_TYPES_EXT};
+-  if (XR_FAILED(xrEnumerateSpatialCapabilityComponentTypesEXT(
+-          instance, system, capability, &component_types))) {
++  OpenXrFunction<PFN_xrEnumerateSpatialCapabilityComponentTypesEXT> enumerate(
++      xrEnumerateSpatialCapabilityComponentTypesEXT);
++  if (XR_FAILED(enumerate(instance, system, capability, &component_types))) {
+     return supported_components;
+   }
+ 
+@@ -46,8 +50,7 @@ std::vector<XrSpatialComponentTypeEXT> GetSupportedComponentTypes(
+       component_types.componentTypeCountOutput;
+   component_types.componentTypes = supported_components.data();
+ 
+-  if (XR_FAILED(xrEnumerateSpatialCapabilityComponentTypesEXT(
+-          instance, system, capability, &component_types))) {
++  if (XR_FAILED(enumerate(instance, system, capability, &component_types))) {
+     supported_components.clear();
+   }
+ 
+diff --git a/device/vr/openxr/openxr_visibility_mask_handler.cc b/device/vr/openxr/openxr_visibility_mask_handler.cc
+index bc45d9395a208..32098f3bb2f08 100644
+--- a/device/vr/openxr/openxr_visibility_mask_handler.cc
++++ b/device/vr/openxr/openxr_visibility_mask_handler.cc
+@@ -83,7 +83,7 @@ void OpenXrVisibilityMaskHandler::UpdateVisibilityMask(
+     CachedMask& visibility_mask) {
+   // This object shouldn't have been created unless our extension is supported,
+   // and if our extension is supported this function pointer should exist.
+-  PFN_xrGetVisibilityMaskKHR xrGetVisibilityMaskKHR =
++  auto xrGetVisibilityMaskKHR =
+       extension_helper_->ExtensionMethods().xrGetVisibilityMaskKHR;
+   CHECK(xrGetVisibilityMaskKHR);
+ 
+diff --git a/gpu/vulkan/generate_bindings.py b/gpu/vulkan/generate_bindings.py
+index 4bfae10936d35..1c76615bc3aae 100755
+--- a/gpu/vulkan/generate_bindings.py
++++ b/gpu/vulkan/generate_bindings.py
+@@ -207,6 +207,13 @@ VULKAN_DEVICE_FUNCTIONS = [
+       'vkGetAndroidHardwareBufferPropertiesANDROID',
+     ],
+   },
++  {
++    'ifdef': 'BUILDFLAG(IS_LINUX)',
++    'extension': 'VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME',
++    'functions': [
++      'vkImportFenceFdKHR',
++    ],
++  },
+   {
+     'ifdef': 'BUILDFLAG(IS_POSIX)',
+     'extension': 'VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME',
+diff --git a/gpu/vulkan/vulkan_function_pointers.cc b/gpu/vulkan/vulkan_function_pointers.cc
+index e74b595e1bc9a..61f50238e64eb 100644
+--- a/gpu/vulkan/vulkan_function_pointers.cc
++++ b/gpu/vulkan/vulkan_function_pointers.cc
+@@ -1075,6 +1075,19 @@ bool VulkanFunctionPointers::BindDeviceFunctionPointers(
+   }
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++#if BUILDFLAG(IS_LINUX)
++  if (gfx::HasExtension(enabled_extensions,
++                        VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME)) {
++    constexpr char kvkImportFenceFdKHR[] = "vkImportFenceFdKHR";
++    vkImportFenceFdKHR = reinterpret_cast<PFN_vkImportFenceFdKHR>(
++        vkGetDeviceProcAddr(vk_device, kvkImportFenceFdKHR));
++    if (!vkImportFenceFdKHR) {
++      LogGetProcError(kvkImportFenceFdKHR);
++      return false;
++    }
++  }
++#endif  // BUILDFLAG(IS_LINUX)
++
+ #if BUILDFLAG(IS_POSIX)
+   if (gfx::HasExtension(enabled_extensions,
+                         VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
+@@ -1461,6 +1474,10 @@ void VulkanFunctionPointers::ResetForTesting() {
+   vkGetAndroidHardwareBufferPropertiesANDROID = nullptr;
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++#if BUILDFLAG(IS_LINUX)
++  vkImportFenceFdKHR = nullptr;
++#endif  // BUILDFLAG(IS_LINUX)
++
+ #if BUILDFLAG(IS_POSIX)
+   vkGetSemaphoreFdKHR = nullptr;
+   vkImportSemaphoreFdKHR = nullptr;
+diff --git a/gpu/vulkan/vulkan_function_pointers.h b/gpu/vulkan/vulkan_function_pointers.h
+index a89b6a89892d6..b65095886b4ae 100644
+--- a/gpu/vulkan/vulkan_function_pointers.h
++++ b/gpu/vulkan/vulkan_function_pointers.h
+@@ -342,6 +342,10 @@ struct COMPONENT_EXPORT(VULKAN) VulkanFunctionPointers {
+       vkGetAndroidHardwareBufferPropertiesANDROID;
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++#if BUILDFLAG(IS_LINUX)
++  VulkanFunction<PFN_vkImportFenceFdKHR> vkImportFenceFdKHR;
++#endif  // BUILDFLAG(IS_LINUX)
++
+ #if BUILDFLAG(IS_POSIX)
+   VulkanFunction<PFN_vkGetSemaphoreFdKHR> vkGetSemaphoreFdKHR;
+   VulkanFunction<PFN_vkImportSemaphoreFdKHR> vkImportSemaphoreFdKHR;
+@@ -1236,6 +1240,15 @@ ALWAYS_INLINE VkResult vkGetAndroidHardwareBufferPropertiesANDROID(
+ }
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++#if BUILDFLAG(IS_LINUX)
++ALWAYS_INLINE VkResult
++vkImportFenceFdKHR(VkDevice device,
++                   const VkImportFenceFdInfoKHR* pImportFenceFdInfo) {
++  return gpu::GetVulkanFunctionPointers()->vkImportFenceFdKHR(
++      device, pImportFenceFdInfo);
++}
++#endif  // BUILDFLAG(IS_LINUX)
++
+ #if BUILDFLAG(IS_POSIX)
+ ALWAYS_INLINE VkResult
+ vkGetSemaphoreFdKHR(VkDevice device,
+diff --git a/tools/cfi/ignores.txt b/tools/cfi/ignores.txt
+index 361c8ba696a9d..d2d1fa1a0c46a 100644
+--- a/tools/cfi/ignores.txt
++++ b/tools/cfi/ignores.txt
+@@ -232,28 +232,12 @@ src:*third_party/angle/src/common/vulkan/vulkan_icd.cpp
+ 
+ # The OpenXR loader and Chromium's OpenXR code call into the dlopen'd OpenXR
+ # runtime through function pointers, like the vulkan loader above: the loader
+-# and its generated dispatch table, and the Chromium files that call extension
+-# entry points resolved with xrGetInstanceProcAddr (directly, through the
+-# destroy function an OpenXrExtensionHandle/ScopedOpenXrObject stores, or as a
+-# PFN parameter in openxr_spatial_utils.cc). The unittests' mock runtime and
+-# its trampoline dispatch through the same kind of pointers, and the mock's
+-# Vulkan calls go through vkGetInstanceProcAddr.
++# and its generated dispatch table. The unittests' mock runtime and its
++# trampoline dispatch through the same kind of pointers, and the mock's Vulkan
++# calls go through vkGetInstanceProcAddr.
+ src:*third_party/openxr/src/src/*
+-src:*device/vr/openxr/fb/openxr_frame_rate_handler_fb.cc
+-src:*device/vr/openxr/linux/openxr_vulkan_context.cc
+-src:*device/vr/openxr/msft/openxr_anchor_manager_msft.cc
+-src:*device/vr/openxr/msft/openxr_scene_msft.cc
+-src:*device/vr/openxr/msft/openxr_scene_observer_msft.cc
+-src:*device/vr/openxr/openxr_api_wrapper.cc
+-src:*device/vr/openxr/openxr_extension_handle.h
+-src:*device/vr/openxr/openxr_hand_tracker.cc
+-src:*device/vr/openxr/openxr_spatial_anchor_manager.cc
+-src:*device/vr/openxr/openxr_spatial_framework_manager.cc
+-src:*device/vr/openxr/openxr_spatial_hit_test_manager.cc
+-src:*device/vr/openxr/openxr_spatial_plane_manager.cc
+-src:*device/vr/openxr/openxr_spatial_utils.cc
+-src:*device/vr/openxr/openxr_visibility_mask_handler.cc
+-src:*device/vr/openxr/scoped_openxr_object.h
++# Dispatch through OpenXR runtime function pointers.
++src:*device/vr/openxr/openxr_function.h
+ src:*device/vr/openxr/test/fake_openxr_impl_api.cc
+ src:*device/vr/openxr/test/openxr_mock_helper.cc
+ src:*device/vr/openxr/test/openxr_test_helper.cc

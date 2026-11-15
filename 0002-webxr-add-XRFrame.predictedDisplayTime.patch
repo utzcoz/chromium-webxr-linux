@@ -1,4 +1,4 @@
-From bc894fd9eba3046f51865a62e0dd3e735024d9fd Mon Sep 17 00:00:00 2001
+From b56cfbad0294d79afc810cf6f22b90821ed396db Mon Sep 17 00:00:00 2001
 From: utzcoz <utzcoz@outlook.com>
 Date: Sun, 27 Sep 2026 17:43:58 +0800
 Subject: [PATCH 2/6] webxr: add XRFrame.predictedDisplayTime
@@ -176,10 +176,10 @@ index 351c9bc19cbde..e239393fdb68f 100644
 +
  }  // namespace device
 diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
-index a79f6ce2da1e7..76d0c25e0741f 100644
+index 026a4ac2d5bfd..28d7cd3b00c88 100644
 --- a/device/vr/openxr/openxr_extension_helper.cc
 +++ b/device/vr/openxr/openxr_extension_helper.cc
-@@ -181,6 +181,9 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
+@@ -173,6 +173,9 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
  
  #if BUILDFLAG(IS_WIN)
    OPENXR_LOAD_FN(xrConvertWin32PerformanceCounterToTimeKHR);
@@ -190,10 +190,10 @@ index a79f6ce2da1e7..76d0c25e0741f 100644
  
  #if BUILDFLAG(IS_ANDROID)
 diff --git a/device/vr/openxr/openxr_extension_helper.h b/device/vr/openxr/openxr_extension_helper.h
-index d512f9d6bee3b..6f4775f5ce0d0 100644
+index eb21a41da7f88..864f55cc1ea5f 100644
 --- a/device/vr/openxr/openxr_extension_helper.h
 +++ b/device/vr/openxr/openxr_extension_helper.h
-@@ -92,6 +92,9 @@ struct OpenXrExtensionMethods {
+@@ -93,6 +93,9 @@ struct OpenXrExtensionMethods {
  #if BUILDFLAG(IS_WIN)
    // Time
    OPENXR_DECLARE_FN(xrConvertWin32PerformanceCounterToTimeKHR);
